@@ -1,0 +1,8 @@
+﻿---
+BasedOnStyle: Mozilla
+AlignConsecutiveDeclarations: 'true'
+AlwaysBreakAfterDefinitionReturnType: None
+AlwaysBreakAfterReturnType: None
+IndentWidth: '4'
+TabWidth: '4'
+...

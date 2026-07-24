@@ -1,0 +1,9 @@
+device NRF52832_XXAA
+si SWD
+speed 2000
+r
+h
+loadfile D:\AIOT\majiang\tx_projects\archive\tx_ble_test\_build\nrf52832_xxaa_lfrc_rx.hex
+r
+g
+exit

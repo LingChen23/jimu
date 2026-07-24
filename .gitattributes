@@ -1,0 +1,16 @@
+* text=auto
+
+*.c text
+*.h text
+*.s text
+*.py text
+*.md text
+*.jlink text
+*.uvprojx text
+*.uvoptx text
+
+*.lib binary
+*.a binary
+*.exe binary
+*.zip binary
+

@@ -1,0 +1,44 @@
+# Keil build products
+**/_build/
+**/Objects/
+**/Listings/
+**/output/
+*.o
+*.d
+*.crf
+*.dep
+*.axf
+*.map
+*.lst
+*.lnp
+*.build_log.htm
+tx_device/lib_nRF/components/softdevice/*/hex/*.sct
+
+# Keil per-user state and backups
+*.uvgui.*
+*.uvguix.*
+*.saved_uv4
+*.orig
+*.bak
+*.tmp
+
+# Debugger and generated logs
+*.log
+JLinkLog.txt
+JLinkSettings.ini
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Keys and credentials must never enter source control
+*.pem
+*.key
+*.p12
+*.pfx

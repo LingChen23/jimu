@@ -6,7 +6,7 @@
  * Valid values are 1..255. Value 0 is reserved and must not be used.
  */
 #ifndef TX_DEVICE_ID
-#define TX_DEVICE_ID 4U
+#define TX_DEVICE_ID 1U
 #endif
 
 #if (TX_DEVICE_ID < 1U) || (TX_DEVICE_ID > 255U)

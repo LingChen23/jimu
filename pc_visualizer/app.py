@@ -79,7 +79,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
             if self.path == "/api/serial/open":
                 result = SERIAL.open(
                     str(body.get("port", "")),
-                    int(body.get("baud", 460800)),
+                    int(body.get("baud", 921600)),
                 )
                 self._json_response(result)
                 return

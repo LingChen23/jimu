@@ -7,6 +7,10 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 
+#include "driver/uart.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
 #include "nimble/nimble_port.h"
@@ -20,6 +24,13 @@
 #define CONNECT_TIMEOUT_MS       30000
 #define MAX_MAHJONG_CONNECTIONS  1U
 #define INVALID_PEER_INDEX       UINT8_MAX
+#define GATEWAY_ID               0U
+#define GATEWAY_FRAME_VERSION    1U
+#define GATEWAY_FRAME_MOTION     0x10U
+#define GATEWAY_RAW_FRAME_SIZE   114U
+#define GATEWAY_COBS_MAX_SIZE    115U
+#define GATEWAY_UART_BAUD        921600
+#define GATEWAY_TX_QUEUE_DEPTH   128U
 
 #define MAHJONG_COMPANY_ID_LSB   0xcd
 #define MAHJONG_COMPANY_ID_MSB   0xab
@@ -29,7 +40,6 @@
 #define MAHJONG_CONFIG_TYPE_OFFSET 7
 
 static const char *TAG = "motion_gateway";
-static const char *DATA_TAG = "motion_data";
 
 typedef struct {
     ble_addr_t addr;
@@ -110,6 +120,14 @@ static uint8_t s_own_addr_type;
 static bool s_scanning;
 static uint8_t s_connecting_peer = INVALID_PEER_INDEX;
 static mahjong_peer_t s_peers[MAX_MAHJONG_CONNECTIONS];
+static QueueHandle_t s_gateway_tx_queue;
+static uint32_t s_gateway_sequence;
+static volatile uint32_t s_gateway_queue_drops;
+
+typedef struct {
+    uint32_t gateway_sequence;
+    uint8_t payload[MOTION_PACKET_SIZE];
+} gateway_tx_item_t;
 
 static int gap_event_handler(struct ble_gap_event *event, void *arg);
 static void start_scan(void);
@@ -120,6 +138,139 @@ static int service_discovery_cb(uint16_t conn_handle,
                                 const struct ble_gatt_error *error,
                                 const struct ble_gatt_svc *service,
                                 void *arg);
+
+static void gateway_put_le16(uint8_t *dst, uint16_t value)
+{
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+}
+
+static void gateway_put_le32(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+    dst[2] = (uint8_t)(value >> 16);
+    dst[3] = (uint8_t)(value >> 24);
+}
+
+static uint32_t gateway_crc32(const uint8_t *data, size_t length)
+{
+    uint32_t crc = 0xffffffffU;
+    size_t index;
+    uint8_t bit;
+
+    for (index = 0; index < length; index++) {
+        crc ^= data[index];
+        for (bit = 0; bit < 8U; bit++) {
+            crc = (crc >> 1) ^
+                  ((crc & 1U) ? 0xedb88320U : 0U);
+        }
+    }
+    return crc ^ 0xffffffffU;
+}
+
+static size_t cobs_encode(const uint8_t *input,
+                          size_t input_length,
+                          uint8_t *output)
+{
+    size_t read_index = 0U;
+    size_t write_index = 1U;
+    size_t code_index = 0U;
+    uint8_t code = 1U;
+
+    while (read_index < input_length) {
+        if (input[read_index] == 0U) {
+            output[code_index] = code;
+            code = 1U;
+            code_index = write_index++;
+            read_index++;
+        } else {
+            output[write_index++] = input[read_index++];
+            code++;
+            if (code == 0xffU) {
+                output[code_index] = code;
+                code = 1U;
+                code_index = write_index++;
+            }
+        }
+    }
+    output[code_index] = code;
+    return write_index;
+}
+
+static void gateway_uart_tx_task(void *param)
+{
+    gateway_tx_item_t item;
+    uint8_t raw[GATEWAY_RAW_FRAME_SIZE];
+    uint8_t encoded[GATEWAY_COBS_MAX_SIZE + 1U];
+    uint32_t crc;
+    size_t encoded_length;
+
+    (void)param;
+    for (;;) {
+        if (xQueueReceive(s_gateway_tx_queue, &item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        raw[0] = GATEWAY_FRAME_VERSION;
+        raw[1] = GATEWAY_ID;
+        raw[2] = GATEWAY_FRAME_MOTION;
+        raw[3] = 0U;
+        gateway_put_le32(&raw[4], item.gateway_sequence);
+        gateway_put_le16(&raw[8], MOTION_PACKET_SIZE);
+        memcpy(&raw[10], item.payload, MOTION_PACKET_SIZE);
+        crc = gateway_crc32(raw, GATEWAY_RAW_FRAME_SIZE - 4U);
+        gateway_put_le32(&raw[GATEWAY_RAW_FRAME_SIZE - 4U], crc);
+
+        encoded_length = cobs_encode(raw, sizeof(raw), encoded);
+        encoded[encoded_length++] = 0U;
+        uart_write_bytes(UART_NUM_0, encoded, encoded_length);
+    }
+}
+
+static void gateway_uart_init(void)
+{
+    const uart_config_t config = {
+        .baud_rate = GATEWAY_UART_BAUD,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    const uint8_t delimiter = 0U;
+
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &config));
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_0,
+                                 UART_PIN_NO_CHANGE,
+                                 UART_PIN_NO_CHANGE,
+                                 UART_PIN_NO_CHANGE,
+                                 UART_PIN_NO_CHANGE));
+    if (!uart_is_driver_installed(UART_NUM_0)) {
+        ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0,
+                                            4096,
+                                            32768,
+                                            0,
+                                            NULL,
+                                            0));
+    }
+    uart_flush(UART_NUM_0);
+    uart_write_bytes(UART_NUM_0, &delimiter, 1U);
+
+    s_gateway_tx_queue =
+        xQueueCreate(GATEWAY_TX_QUEUE_DEPTH, sizeof(gateway_tx_item_t));
+    ESP_ERROR_CHECK(s_gateway_tx_queue != NULL
+                        ? ESP_OK
+                        : ESP_ERR_NO_MEM);
+    if (xTaskCreate(gateway_uart_tx_task,
+                    "gateway_uart_tx",
+                    4096,
+                    NULL,
+                    8,
+                    NULL) != pdPASS) {
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
+}
 
 static void format_addr(const ble_addr_t *addr, char *buffer, size_t buffer_size)
 {
@@ -246,12 +397,12 @@ static bool has_available_target(void)
 static void consume_notification(mahjong_peer_t *peer, struct os_mbuf *om)
 {
     uint8_t packet_bytes[MOTION_PACKET_SIZE];
-    char addr[18];
     uint16_t packet_len = OS_MBUF_PKTLEN(om);
     motion_packet_t packet;
     uint16_t expected_sequence;
     uint16_t sequence_gap;
     uint8_t expected_device_id = TARGETS[peer->target_index].expected_device_id;
+    gateway_tx_item_t tx_item;
 
     if (packet_len != sizeof(packet_bytes)) {
         peer->invalid_frames++;
@@ -307,36 +458,12 @@ static void consume_notification(mahjong_peer_t *peer, struct os_mbuf *om)
     peer->has_sequence = true;
     peer->last_sequence = packet.packet_sequence;
     peer->received_frames++;
-    if (peer->received_frames > 5U &&
-        (peer->received_frames % 25U) != 0U) {
-        return;
-    }
 
-    format_addr(&peer->addr, addr, sizeof(addr));
-    ESP_LOGI(DATA_TAG,
-             "[addr=%s conn=%u id=%u pkt=%u sample=%lu tick=%llu "
-             "flags=0x%02X] "
-             "s0 a=%d,%d,%d g=%d,%d,%d s3dt=%u "
-             "coord_seq=%lu xyz=%ld,%ld,%ld cflags=0x%04X",
-             addr,
-             peer->conn_handle,
-             packet.device_id,
-             packet.packet_sequence,
-             (unsigned long)packet.first_sample_sequence,
-             (unsigned long long)packet.first_sample_tick_32k,
-             packet.flags,
-             packet.samples[0].accel[0],
-             packet.samples[0].accel[1],
-             packet.samples[0].accel[2],
-             packet.samples[0].gyro[0],
-             packet.samples[0].gyro[1],
-             packet.samples[0].gyro[2],
-             packet.samples[3].tick_offset_32k,
-             (unsigned long)packet.coordinate_source_sequence,
-             (long)packet.position_mm[0],
-             (long)packet.position_mm[1],
-             (long)packet.position_mm[2],
-             packet.coordinate_flags);
+    tx_item.gateway_sequence = s_gateway_sequence++;
+    memcpy(tx_item.payload, packet_bytes, sizeof(tx_item.payload));
+    if (xQueueSend(s_gateway_tx_queue, &tx_item, 0) != pdTRUE) {
+        s_gateway_queue_drops++;
+    }
 }
 
 static int mtu_exchange_cb(uint16_t conn_handle,
@@ -832,7 +959,8 @@ void app_main(void)
     esp_err_t err;
     int rc;
 
-    setvbuf(stdout, NULL, _IONBF, 0);
+    esp_log_level_set("*", ESP_LOG_NONE);
+    gateway_uart_init();
 
     err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES ||

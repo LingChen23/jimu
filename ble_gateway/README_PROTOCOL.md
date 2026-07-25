@@ -1,28 +1,28 @@
-# ESP32-S3 Multi Trajectory Receiver
+# Gateway UART Protocol
 
-Each configured TX uses an independent Nordic UART Service client. The fixed
-20-byte trajectory frame is unchanged:
-
-```text
-0       0xA5
-1       device_id
-2..3    sequence (uint16 little-endian)
-4..7    x_mm (int32 little-endian)
-8..11   y_mm (int32 little-endian)
-12..15  z_mm (int32 little-endian)
-16..17  sample_tick_10ms (uint16 little-endian)
-18      flags
-19      0x5A
-```
-
-Frames are routed by BLE connection handle and then checked against the
-`expected_device_id` configured for that address. Sequence-loss counters are
-therefore independent for every TX.
-
-The serial line remains compatible with the existing parser:
+The ESP32-S3 forwards every valid nRF52832 Motion V1 packet without modifying
+its 100-byte payload. The business UART uses `921600 8N1` and emits:
 
 ```text
-I (...) mahjong_data: [addr=E0:CF:E0:E7:F7:4B conn=1 id=1 seq=42 tick=84 flags=0x04] x=12 y=-3 z=45
+COBS(raw_gateway_frame) + 0x00
 ```
 
-Use `460800` baud for multi-device operation.
+The decoded raw gateway frame is 114 bytes, little-endian:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 1 | frame version = 1 |
+| 1 | 1 | gateway ID = 0 |
+| 2 | 1 | frame type = `0x10` Motion Data |
+| 3 | 1 | reserved = 0 |
+| 4 | 4 | gateway sequence |
+| 8 | 2 | payload length = 100 |
+| 10 | 100 | original nRF Motion V1 payload |
+| 110 | 4 | CRC-32/IEEE of bytes 0..109 |
+
+CRC uses reflected polynomial `0xEDB88320`, initial value `0xFFFFFFFF`, and
+final XOR `0xFFFFFFFF`. This is compatible with Python `zlib.crc32`.
+
+UART0 is a binary-only business channel after application startup. Runtime
+text logs are disabled. The PC decoder uses the zero delimiter, COBS length,
+frame header and CRC to recover after reset or malformed input.

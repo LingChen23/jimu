@@ -1,4 +1,4 @@
-"""Serial-port ownership and background Motion line ingestion."""
+"""Serial-port ownership and binary gateway-frame ingestion."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import serial
 from serial.tools import list_ports
 
 from motion_model import MotionStore
-from motion_protocol import parse_serial_line
+from motion_protocol import GatewayStreamDecoder
 
 
 class SerialService:
@@ -20,10 +20,13 @@ class SerialService:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._port = ""
-        self._baud = 460800
+        self._baud = 921600
         self._error = ""
-        self._line_count = 0
+        self._byte_count = 0
         self._frame_count = 0
+        self._gateway_lost_frames = 0
+        self._last_gateway_sequence: dict[int, int] = {}
+        self._decoder = GatewayStreamDecoder()
 
     @staticmethod
     def ports() -> list[dict[str, str]]:
@@ -42,16 +45,24 @@ class SerialService:
         if baud <= 0:
             raise ValueError("波特率必须大于 0")
 
-        connection = serial.Serial(port=port, baudrate=baud, timeout=0.2)
+        connection = serial.Serial()
+        connection.port = port
+        connection.baudrate = baud
+        connection.timeout = 0.2
         connection.dtr = False
         connection.rts = False
+        connection.open()
+        connection.reset_input_buffer()
         with self._lock:
             self._serial = connection
             self._port = port
             self._baud = baud
             self._error = ""
-            self._line_count = 0
+            self._byte_count = 0
             self._frame_count = 0
+            self._gateway_lost_frames = 0
+            self._last_gateway_sequence = {}
+            self._decoder = GatewayStreamDecoder()
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._reader_loop,
@@ -85,8 +96,14 @@ class SerialService:
                 "port": self._port,
                 "baud": self._baud,
                 "error": self._error,
-                "line_count": self._line_count,
+                "byte_count": self._byte_count,
                 "frame_count": self._frame_count,
+                "encoded_frame_count": self._decoder.encoded_frame_count,
+                "gateway_lost_frames": self._gateway_lost_frames,
+                "cobs_error_count": self._decoder.cobs_error_count,
+                "crc_error_count": self._decoder.crc_error_count,
+                "frame_error_count": self._decoder.frame_error_count,
+                "overflow_count": self._decoder.overflow_count,
             }
 
     def _reader_loop(self) -> None:
@@ -96,17 +113,33 @@ class SerialService:
             if connection is None:
                 return
             try:
-                raw = connection.readline()
+                raw = connection.read(4096)
                 if not raw:
                     continue
-                line = raw.decode("utf-8", errors="ignore")
-                frame = parse_serial_line(line)
                 with self._lock:
-                    self._line_count += 1
-                if frame is not None and self._store.process(frame):
+                    self._byte_count += len(raw)
+                for gateway_frame in self._decoder.feed(raw):
+                    previous = self._last_gateway_sequence.get(
+                        gateway_frame.gateway_id
+                    )
+                    if previous is not None:
+                        expected = (previous + 1) & 0xFFFFFFFF
+                        gap = (
+                            gateway_frame.gateway_sequence - expected
+                        ) & 0xFFFFFFFF
+                        if 0 < gap < 0x80000000:
+                            with self._lock:
+                                self._gateway_lost_frames += gap
+                    self._last_gateway_sequence[gateway_frame.gateway_id] = (
+                        gateway_frame.gateway_sequence
+                    )
+                    if not self._store.process(gateway_frame.motion):
+                        continue
                     with self._lock:
                         self._frame_count += 1
             except (serial.SerialException, OSError) as error:
+                if self._stop.is_set():
+                    return
                 with self._lock:
                     self._error = str(error)
                 self._stop.set()

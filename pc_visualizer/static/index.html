@@ -189,7 +189,7 @@
         <select id="portSelect" aria-label="串口"></select>
       </label>
       <label>波特率
-        <input id="baudInput" type="number" value="460800" min="9600" step="1">
+        <input id="baudInput" type="number" value="921600" min="9600" step="1">
       </label>
       <div class="actions">
         <button id="refreshPorts" type="button">刷新串口</button>
@@ -339,7 +339,9 @@
       const open = Boolean(status?.open);
       elements.dot.classList.toggle("open", open);
       elements.connection.textContent = open
-        ? `${status.port} · ${status.baud} · 已解析 ${status.frame_count} 帧`
+        ? `${status.port} · ${status.baud} · ${status.frame_count} 帧`
+          + ` · GW丢 ${status.gateway_lost_frames || 0}`
+          + ` · CRC错 ${status.crc_error_count || 0}`
         : "串口未打开";
       elements.open.disabled = open;
       elements.close.disabled = !open;

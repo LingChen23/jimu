@@ -86,6 +86,18 @@ class ApiHandler(SimpleHTTPRequestHandler):
             if self.path == "/api/serial/close":
                 self._json_response(SERIAL.close())
                 return
+            if self.path == "/api/device/reset":
+                device_id = max(1, min(12, int(body.get("device", 1))))
+                if not STORE.reset_analysis(device_id):
+                    raise ValueError("设备不存在")
+                self._json_response(
+                    {
+                        "ok": True,
+                        "device_id": device_id,
+                        "snapshot": STORE.snapshot(device_id),
+                    }
+                )
+                return
             self._json_response(
                 {"error": "unknown endpoint"}, HTTPStatus.NOT_FOUND
             )

@@ -115,6 +115,49 @@
     .stat { padding: 13px 15px; }
     .stat-label { color: var(--muted); font-size: 12px; }
     .stat-value { margin-top: 3px; font-size: 18px; font-variant-numeric: tabular-nums; }
+    .movement-panel { padding: 14px; margin-bottom: 14px; }
+    .movement-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .movement-metrics {
+      display: grid;
+      grid-template-columns: repeat(8, minmax(90px, 1fr));
+      gap: 8px;
+    }
+    .metric {
+      min-width: 0;
+      padding: 10px;
+      border-radius: 9px;
+      background: var(--panel-2);
+    }
+    .metric-label { color: var(--muted); font-size: 11px; }
+    .metric-value {
+      margin-top: 3px;
+      font-size: 16px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .movement-table-wrap { margin-top: 12px; overflow-x: auto; }
+    .movement-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .movement-table th, .movement-table td {
+      padding: 8px 10px;
+      border-top: 1px solid var(--border);
+      text-align: right;
+    }
+    .movement-table th:first-child, .movement-table td:first-child {
+      text-align: left;
+    }
+    .movement-table th { color: var(--muted); font-size: 11px; font-weight: 500; }
+    .movement-empty { color: var(--muted); text-align: center !important; }
     .charts {
       display: grid;
       grid-template-columns: 1.2fr 1fr;
@@ -129,6 +172,18 @@
       gap: 12px;
       padding: 13px 15px 0;
     }
+    .chart-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .view-buttons { display: flex; gap: 5px; }
+    .view-buttons button {
+      min-height: 30px;
+      padding: 0 9px;
+      font-size: 12px;
+    }
+    .view-buttons button.active {
+      color: #07101e;
+      background: var(--primary);
+      border-color: transparent;
+    }
     .legend { display: flex; gap: 12px; color: var(--muted); font-size: 12px; }
     .legend span::before {
       content: "";
@@ -141,6 +196,11 @@
     }
     canvas { display: block; width: 100%; height: 280px; }
     .trajectory canvas { height: 600px; }
+    .trajectory-note {
+      padding: 0 15px 10px;
+      color: var(--muted);
+      font-size: 11px;
+    }
     .error {
       min-height: 22px;
       padding-top: 6px;
@@ -162,12 +222,16 @@
       .chart-panel.trajectory { grid-row: auto; }
       .trajectory canvas { height: 380px; }
     }
+    @media (max-width: 1200px) {
+      .movement-metrics { grid-template-columns: repeat(4, 1fr); }
+    }
     @media (max-width: 620px) {
       .app { padding: 12px; }
       header { flex-direction: column; }
       .serial-panel { grid-template-columns: 1fr; }
       .actions { align-items: center; }
       .status-row { grid-template-columns: repeat(2, 1fr); }
+      .movement-metrics { grid-template-columns: repeat(2, 1fr); }
     }
   </style>
 </head>
@@ -220,16 +284,55 @@
       </div>
     </section>
 
+    <section class="panel movement-panel" aria-label="完整移动统计">
+      <div class="movement-head">
+        <div>
+          <h2>完整移动统计</h2>
+          <div id="movementCaption" class="muted">等待“静止 → 移动 → 稳定静止”</div>
+        </div>
+        <button id="resetAnalysis" class="danger" type="button">清零轨迹与统计</button>
+      </div>
+      <div class="movement-metrics">
+        <div class="metric"><div class="metric-label">状态</div><div id="movementState" class="metric-value">等待</div></div>
+        <div class="metric"><div class="metric-label">移动时间</div><div id="movementTime" class="metric-value">0.00 s</div></div>
+        <div class="metric"><div class="metric-label">动态加速度均值</div><div id="accelMean" class="metric-value">0.00 m/s²</div></div>
+        <div class="metric"><div class="metric-label">最大 / 最小</div><div id="accelRange" class="metric-value">0.00 / 0.00</div></div>
+        <div class="metric"><div class="metric-label">剧烈晃动</div><div id="shakeCount" class="metric-value">0 次</div></div>
+        <div class="metric"><div class="metric-label">翻转</div><div id="flipCount" class="metric-value">0 次</div></div>
+        <div class="metric"><div class="metric-label">完整旋转</div><div id="rotationCount" class="metric-value">0 次</div></div>
+        <div class="metric"><div class="metric-label">停顿</div><div id="pauseCount" class="metric-value">0 次</div></div>
+      </div>
+      <div class="movement-table-wrap">
+        <table class="movement-table">
+          <thead>
+            <tr><th>移动</th><th>时间(s)</th><th>加速度均值</th><th>最大</th><th>最小</th><th>晃动</th><th>翻转</th><th>旋转</th><th>停顿</th></tr>
+          </thead>
+          <tbody id="movementRows">
+            <tr><td colspan="9" class="movement-empty">尚无完整移动</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="charts">
       <article class="panel chart-panel trajectory">
         <div class="chart-head">
-          <h2>轨迹对照（XY，单位 m）</h2>
-          <div class="legend">
-            <span style="--legend:var(--received)">设备坐标</span>
-            <span style="--legend:var(--calculated)">PC 惯导</span>
+          <h2>轨迹对照（X/Y/Z 三维，单位 m）</h2>
+          <div class="chart-actions">
+            <div class="legend">
+              <span style="--legend:var(--received)">设备坐标</span>
+              <span style="--legend:var(--calculated)">PC 惯导</span>
+            </div>
+            <div id="viewButtons" class="view-buttons" aria-label="轨迹视角">
+              <button type="button" class="active" data-view="iso">三维</button>
+              <button type="button" data-view="xy">XY</button>
+              <button type="button" data-view="xz">XZ</button>
+              <button type="button" data-view="yz">YZ</button>
+            </div>
           </div>
         </div>
-        <canvas id="trajectoryCanvas" aria-label="设备坐标轨迹与PC计算轨迹"></canvas>
+        <canvas id="trajectoryCanvas" aria-label="设备坐标与PC计算的三维轨迹"></canvas>
+        <div class="trajectory-note">每次新移动自动清空当前轨迹，两条轨迹都从 (0, 0, 0) 开始。</div>
       </article>
 
       <article class="panel chart-panel">
@@ -273,6 +376,18 @@
       packet: document.getElementById("packetValue"),
       sample: document.getElementById("sampleValue"),
       source: document.getElementById("sourceValue"),
+      reset: document.getElementById("resetAnalysis"),
+      movementCaption: document.getElementById("movementCaption"),
+      movementState: document.getElementById("movementState"),
+      movementTime: document.getElementById("movementTime"),
+      accelMean: document.getElementById("accelMean"),
+      accelRange: document.getElementById("accelRange"),
+      shakeCount: document.getElementById("shakeCount"),
+      flipCount: document.getElementById("flipCount"),
+      rotationCount: document.getElementById("rotationCount"),
+      pauseCount: document.getElementById("pauseCount"),
+      movementRows: document.getElementById("movementRows"),
+      views: document.getElementById("viewButtons"),
       trajectory: document.getElementById("trajectoryCanvas"),
       accel: document.getElementById("accelCanvas"),
       gyro: document.getElementById("gyroCanvas")
@@ -280,6 +395,7 @@
     let selectedDevice = 1;
     let polling = false;
     let latestSnapshot = null;
+    let trajectoryView = "iso";
 
     function css(name) {
       return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -459,64 +575,200 @@
       const calculated = snapshot.calculated_path || [];
       const all = [...received, ...calculated];
       if (all.length < 2) {
-        drawEmpty(context, width, height, "等待坐标或 IMU 轨迹数据");
+        drawEmpty(context, width, height, "等待一次新的移动");
         return;
       }
-      const margin = {left: 58, right: 18, top: 22, bottom: 42};
+      const projectRaw = point => {
+        const [x, y, z] = point;
+        if (trajectoryView === "xy") return [x, -y];
+        if (trajectoryView === "xz") return [x, -z];
+        if (trajectoryView === "yz") return [y, -z];
+        return [0.8660254 * (x - y), 0.42 * (x + y) - z];
+      };
+      const projected = all.map(projectRaw);
+      const margin = {left: 46, right: 30, top: 30, bottom: 44};
       const plotWidth = width - margin.left - margin.right;
       const plotHeight = height - margin.top - margin.bottom;
-      let xMin = Math.min(...all.map(point => point[0]));
-      let xMax = Math.max(...all.map(point => point[0]));
-      let yMin = Math.min(...all.map(point => point[1]));
-      let yMax = Math.max(...all.map(point => point[1]));
-      const span = Math.max(xMax - xMin, yMax - yMin, 0.1);
-      const xMid = (xMin + xMax) / 2;
-      const yMid = (yMin + yMax) / 2;
-      xMin = xMid - span * 0.58;
-      xMax = xMid + span * 0.58;
-      yMin = yMid - span * 0.58;
-      yMax = yMid + span * 0.58;
-      drawGrid(context, margin.left, margin.top, plotWidth, plotHeight);
-      context.font = "11px system-ui";
-      context.fillStyle = css("--muted");
-      context.textAlign = "center";
-      context.fillText("X (m)", margin.left + plotWidth / 2, height - 14);
-      context.save();
-      context.translate(16, margin.top + plotHeight / 2);
-      context.rotate(-Math.PI / 2);
-      context.fillText("Y (m)", 0, 0);
-      context.restore();
+      let uMin = Math.min(...projected.map(point => point[0]), 0);
+      let uMax = Math.max(...projected.map(point => point[0]), 0);
+      let vMin = Math.min(...projected.map(point => point[1]), 0);
+      let vMax = Math.max(...projected.map(point => point[1]), 0);
+      const uSpan = Math.max(uMax - uMin, 0.08);
+      const vSpan = Math.max(vMax - vMin, 0.08);
+      uMin -= uSpan * 0.12;
+      uMax += uSpan * 0.12;
+      vMin -= vSpan * 0.12;
+      vMax += vSpan * 0.12;
+      const scale = Math.min(
+        plotWidth / (uMax - uMin),
+        plotHeight / (vMax - vMin)
+      );
+      const centerU = (uMin + uMax) / 2;
+      const centerV = (vMin + vMax) / 2;
+      const project = point => {
+        const [u, v] = projectRaw(point);
+        return [
+          margin.left + plotWidth / 2 + (u - centerU) * scale,
+          margin.top + plotHeight / 2 + (v - centerV) * scale
+        ];
+      };
 
-      const drawPath = (points, color) => {
+      const coordinateMagnitude = Math.max(
+        ...all.flatMap(point => point.map(value => Math.abs(value))),
+        0.05
+      );
+      const axisExtent = coordinateMagnitude * 1.15;
+      const axes = trajectoryView === "iso"
+        ? [
+            {label: "X", end: [axisExtent, 0, 0], color: css("--x")},
+            {label: "Y", end: [0, axisExtent, 0], color: css("--y")},
+            {label: "Z", end: [0, 0, axisExtent], color: css("--z")}
+          ]
+        : trajectoryView === "xy"
+          ? [
+              {label: "X", end: [axisExtent, 0, 0], color: css("--x")},
+              {label: "Y", end: [0, axisExtent, 0], color: css("--y")}
+            ]
+          : trajectoryView === "xz"
+            ? [
+                {label: "X", end: [axisExtent, 0, 0], color: css("--x")},
+                {label: "Z", end: [0, 0, axisExtent], color: css("--z")}
+              ]
+            : [
+                {label: "Y", end: [0, axisExtent, 0], color: css("--y")},
+                {label: "Z", end: [0, 0, axisExtent], color: css("--z")}
+              ];
+      const origin = project([0, 0, 0]);
+      context.font = "12px system-ui";
+      context.textBaseline = "middle";
+      axes.forEach(axis => {
+        const end = project(axis.end);
+        context.strokeStyle = axis.color;
+        context.globalAlpha = 0.55;
+        context.lineWidth = 1.2;
+        context.beginPath();
+        context.moveTo(origin[0], origin[1]);
+        context.lineTo(end[0], end[1]);
+        context.stroke();
+        context.globalAlpha = 1;
+        context.fillStyle = axis.color;
+        context.textAlign = "center";
+        context.fillText(axis.label, end[0], end[1] - 10);
+      });
+      context.fillStyle = css("--muted");
+      context.textAlign = "left";
+      context.fillText("0", origin[0] + 6, origin[1] + 10);
+      context.textAlign = "right";
+      context.fillText(
+        `范围 ±${coordinateMagnitude.toFixed(2)} m`,
+        width - 18,
+        height - 16
+      );
+
+      const drawPath = (points, color, marker) => {
         if (points.length < 2) return;
         context.strokeStyle = color;
         context.lineWidth = 2;
         context.beginPath();
         points.forEach((point, index) => {
-          const x = margin.left + (point[0] - xMin) / (xMax - xMin) * plotWidth;
-          const y = margin.top + (yMax - point[1]) / (yMax - yMin) * plotHeight;
-          if (index === 0) context.moveTo(x, y);
-          else context.lineTo(x, y);
+          const [screenX, screenY] = project(point);
+          if (index === 0) context.moveTo(screenX, screenY);
+          else context.lineTo(screenX, screenY);
         });
         context.stroke();
-        const last = points[points.length - 1];
+        const [lastX, lastY] = project(points[points.length - 1]);
         context.fillStyle = color;
         context.beginPath();
-        context.arc(
-          margin.left + (last[0] - xMin) / (xMax - xMin) * plotWidth,
-          margin.top + (yMax - last[1]) / (yMax - yMin) * plotHeight,
-          4, 0, Math.PI * 2
-        );
+        context.arc(lastX, lastY, marker, 0, Math.PI * 2);
         context.fill();
       };
-      drawPath(received, css("--received"));
-      drawPath(calculated, css("--calculated"));
+      drawPath(received, css("--received"), 4.5);
+      drawPath(calculated, css("--calculated"), 3.5);
     }
 
     function sourceLabel(source) {
       if (source === "motion-v1-100b") return "完整 100B";
       if (source === "esp32-diagnostic-s0") return "诊断 S0";
       return "等待数据";
+    }
+
+    function movementValue(snapshot) {
+      return snapshot.current_movement
+        || snapshot.completed_movements?.[0]
+        || null;
+    }
+
+    function renderMovement(snapshot) {
+      const movement = movementValue(snapshot);
+      elements.movementState.textContent = snapshot.motion_state || "等待";
+      if (!movement) {
+        elements.movementCaption.textContent =
+          "等待“静止 → 移动 → 稳定静止”";
+        elements.movementTime.textContent = "0.00 s";
+        elements.accelMean.textContent = "0.00 m/s²";
+        elements.accelRange.textContent = "0.00 / 0.00";
+        elements.shakeCount.textContent = "0 次";
+        elements.flipCount.textContent = "0 次";
+        elements.rotationCount.textContent = "0 次";
+        elements.pauseCount.textContent = "0 次";
+      } else {
+        const live = Boolean(snapshot.current_movement);
+        elements.movementCaption.textContent =
+          `第 ${movement.movement_id} 次移动 · ${live ? "实时统计" : "最近完成"}`;
+        elements.movementTime.textContent =
+          `${movement.moving_seconds.toFixed(2)} s`;
+        elements.accelMean.textContent =
+          `${movement.accel_mean.toFixed(2)} m/s²`;
+        elements.accelRange.textContent =
+          `${movement.accel_max.toFixed(2)} / ${movement.accel_min.toFixed(2)}`;
+        elements.shakeCount.textContent = `${movement.shake_count} 次`;
+        elements.flipCount.textContent = `${movement.flip_count} 次`;
+        elements.rotationCount.textContent = `${movement.rotation_count} 次`;
+        elements.pauseCount.textContent = `${movement.pause_count} 次`;
+      }
+
+      const completed = snapshot.completed_movements || [];
+      elements.movementRows.replaceChildren();
+      if (!completed.length) {
+        const row = document.createElement("tr");
+        row.innerHTML =
+          '<td colspan="9" class="movement-empty">尚无完整移动</td>';
+        elements.movementRows.appendChild(row);
+        return;
+      }
+      completed.slice(0, 10).forEach(item => {
+        const row = document.createElement("tr");
+        const values = [
+          `第 ${item.movement_id} 次`,
+          item.moving_seconds.toFixed(2),
+          item.accel_mean.toFixed(2),
+          item.accel_max.toFixed(2),
+          item.accel_min.toFixed(2),
+          item.shake_count,
+          item.flip_count,
+          item.rotation_count,
+          item.pause_count
+        ];
+        values.forEach(value => {
+          const cell = document.createElement("td");
+          cell.textContent = String(value);
+          row.appendChild(cell);
+        });
+        elements.movementRows.appendChild(row);
+      });
+    }
+
+    async function resetAnalysis() {
+      elements.error.textContent = "";
+      try {
+        const result = await api("/api/device/reset", {
+          method: "POST",
+          body: JSON.stringify({device: selectedDevice})
+        });
+        render({...result.snapshot, serial: latestSnapshot?.serial});
+      } catch (error) {
+        elements.error.textContent = error.message;
+      }
     }
 
     function render(snapshot) {
@@ -534,6 +786,7 @@
           `选择设备 ${device.device_id}，${device.online ? "在线" : "离线"}`
         );
       });
+      renderMovement(snapshot);
       drawTrajectory(snapshot);
       drawTimeSeries(elements.accel, snapshot.accel || [], "m/s²");
       drawTimeSeries(elements.gyro, snapshot.gyro || [], "°/s");
@@ -555,6 +808,16 @@
     elements.refresh.addEventListener("click", loadPorts);
     elements.open.addEventListener("click", () => setSerial(true));
     elements.close.addEventListener("click", () => setSerial(false));
+    elements.reset.addEventListener("click", resetAnalysis);
+    elements.views.querySelectorAll("button").forEach(button => {
+      button.addEventListener("click", () => {
+        trajectoryView = button.dataset.view;
+        elements.views.querySelectorAll("button").forEach(candidate => {
+          candidate.classList.toggle("active", candidate === button);
+        });
+        if (latestSnapshot) drawTrajectory(latestSnapshot);
+      });
+    });
     window.addEventListener("resize", () => {
       if (latestSnapshot) render(latestSnapshot);
     });

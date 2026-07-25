@@ -13,12 +13,12 @@
 #include "nimble/nimble_port_freertos.h"
 #include "os/os_mbuf.h"
 #include "services/gap/ble_svc_gap.h"
-#include "trajectory_protocol.h"
+#include "motion_protocol.h"
 
 #define TARGET_DEVICE_NAME       "Mahjong"
 #define SCAN_DURATION_MS         BLE_HS_FOREVER
 #define CONNECT_TIMEOUT_MS       30000
-#define MAX_MAHJONG_CONNECTIONS  4U
+#define MAX_MAHJONG_CONNECTIONS  1U
 #define INVALID_PEER_INDEX       UINT8_MAX
 
 #define MAHJONG_COMPANY_ID_LSB   0xcd
@@ -28,15 +28,15 @@
 #define MAHJONG_CONFIG_NO_OFFSET 6
 #define MAHJONG_CONFIG_TYPE_OFFSET 7
 
-static const char *TAG = "mahjong_nus";
-static const char *DATA_TAG = "mahjong_data";
+static const char *TAG = "motion_gateway";
+static const char *DATA_TAG = "motion_data";
 
 typedef struct {
     ble_addr_t addr;
     uint8_t expected_device_id;
 } mahjong_target_t;
 
-/* Add each approved TX address and its unique frame device_id here. */
+/* Single-node closure target: nRF52832 device 1. */
 static const mahjong_target_t TARGETS[] = {
     {
         .addr = {
@@ -45,27 +45,6 @@ static const mahjong_target_t TARGETS[] = {
         },
         .expected_device_id = 1,
     },
-    {
-        .addr = {
-            .type = BLE_ADDR_RANDOM,
-            .val = {0x27, 0x17, 0xe7, 0xf9, 0xf1, 0xff},
-        },
-        .expected_device_id = 2,
-    },
-    {
-        .addr = {
-            .type = BLE_ADDR_RANDOM,
-            .val = {0xf1, 0x03, 0x67, 0xf3, 0xcb, 0xdc},
-        },
-        .expected_device_id = 3,
-    },
-    {
-        .addr = {
-            .type = BLE_ADDR_RANDOM,
-            .val = {0xf0, 0xe3, 0x27, 0x25, 0x8e, 0xfd},
-        },
-        .expected_device_id = 4,
-    },
 };
 
 #define TARGET_COUNT (sizeof(TARGETS) / sizeof(TARGETS[0]))
@@ -73,7 +52,7 @@ static const mahjong_target_t TARGETS[] = {
 _Static_assert(TARGET_COUNT <= MAX_MAHJONG_CONNECTIONS,
                "TARGETS exceeds MAX_MAHJONG_CONNECTIONS");
 
-/* Four 50 Hz links fit comfortably at a 20 ms connection interval. */
+/* One 25 packet/s motion stream fits comfortably at a 20 ms interval. */
 static const struct ble_gap_conn_params TARGET_CONN_PARAMS = {
     .scan_itvl = BLE_GAP_SCAN_FAST_INTERVAL_MIN,
     .scan_window = BLE_GAP_SCAN_FAST_WINDOW,
@@ -86,13 +65,12 @@ static const struct ble_gap_conn_params TARGET_CONN_PARAMS = {
 };
 
 /* NimBLE stores 128-bit UUID bytes in little-endian order. */
-static const ble_uuid_t *NUS_SERVICE_UUID =
+static const ble_uuid_t *MOTION_SERVICE_UUID =
     BLE_UUID128_DECLARE(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
-                        0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e);
-/* tx_device sends notifications on its RX-named 0x0003 characteristic. */
-static const ble_uuid_t *NUS_NOTIFY_UUID =
+                        0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x41, 0x6e);
+static const ble_uuid_t *MOTION_DATA_UUID =
     BLE_UUID128_DECLARE(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
-                        0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x6e);
+                        0x93, 0xf3, 0xa3, 0xb5, 0x02, 0x00, 0x41, 0x6e);
 static const ble_uuid_t *CCCD_UUID = BLE_UUID16_DECLARE(0x2902);
 
 typedef enum {
@@ -135,6 +113,13 @@ static mahjong_peer_t s_peers[MAX_MAHJONG_CONNECTIONS];
 
 static int gap_event_handler(struct ble_gap_event *event, void *arg);
 static void start_scan(void);
+static void restart_after_discovery_error(mahjong_peer_t *peer,
+                                          const char *stage,
+                                          int status);
+static int service_discovery_cb(uint16_t conn_handle,
+                                const struct ble_gatt_error *error,
+                                const struct ble_gatt_svc *service,
+                                void *arg);
 
 static void format_addr(const ble_addr_t *addr, char *buffer, size_t buffer_size)
 {
@@ -260,79 +245,130 @@ static bool has_available_target(void)
 
 static void consume_notification(mahjong_peer_t *peer, struct os_mbuf *om)
 {
-    uint8_t packet[TRAJECTORY_FRAME_SIZE];
+    uint8_t packet_bytes[MOTION_PACKET_SIZE];
     char addr[18];
     uint16_t packet_len = OS_MBUF_PKTLEN(om);
-    trajectory_frame_t frame;
+    motion_packet_t packet;
     uint16_t expected_sequence;
     uint16_t sequence_gap;
     uint8_t expected_device_id = TARGETS[peer->target_index].expected_device_id;
 
-    if (packet_len != sizeof(packet)) {
+    if (packet_len != sizeof(packet_bytes)) {
         peer->invalid_frames++;
         ESP_LOGW(TAG, "Invalid notification length: conn=%u length=%u",
                  peer->conn_handle, packet_len);
         return;
     }
 
-    if (os_mbuf_copydata(om, 0, packet_len, packet) != 0) {
+    if (os_mbuf_copydata(om, 0, packet_len, packet_bytes) != 0) {
         ESP_LOGE(TAG, "Failed to copy notification payload: conn=%u",
                  peer->conn_handle);
         return;
     }
 
-    if (!trajectory_frame_decode(packet, packet_len, &frame)) {
+    if (!motion_packet_decode(packet_bytes, packet_len, &packet)) {
         peer->invalid_frames++;
-        ESP_LOGW(TAG, "Invalid trajectory frame markers: conn=%u",
+        ESP_LOGW(TAG, "Invalid Motion V1 packet header: conn=%u",
                  peer->conn_handle);
         return;
     }
 
-    if (frame.device_id != expected_device_id) {
+    if (packet.device_id != expected_device_id) {
         peer->invalid_frames++;
         ESP_LOGW(TAG,
                  "Unexpected device id: conn=%u expected=%u actual=%u",
-                 peer->conn_handle, expected_device_id, frame.device_id);
+                 peer->conn_handle, expected_device_id, packet.device_id);
         return;
     }
 
     if (peer->has_sequence) {
         expected_sequence = (uint16_t)(peer->last_sequence + 1U);
-        if (frame.sequence != expected_sequence) {
-            sequence_gap = (uint16_t)(frame.sequence - expected_sequence);
+        if (packet.packet_sequence != expected_sequence) {
+            sequence_gap =
+                (uint16_t)(packet.packet_sequence - expected_sequence);
             if (sequence_gap < 0x8000U) {
                 peer->lost_frames += sequence_gap;
                 ESP_LOGW(TAG,
                          "Sequence gap: conn=%u id=%u expected=%u actual=%u "
                          "lost=%u total_lost=%lu",
-                         peer->conn_handle, frame.device_id, expected_sequence,
-                         frame.sequence, sequence_gap,
+                         peer->conn_handle, packet.device_id,
+                         expected_sequence, packet.packet_sequence,
+                         sequence_gap,
                          (unsigned long)peer->lost_frames);
             } else {
                 ESP_LOGW(TAG,
                          "Sequence restarted: conn=%u id=%u previous=%u actual=%u",
-                         peer->conn_handle, frame.device_id,
-                         peer->last_sequence, frame.sequence);
+                         peer->conn_handle, packet.device_id,
+                         peer->last_sequence, packet.packet_sequence);
             }
         }
     }
 
     peer->has_sequence = true;
-    peer->last_sequence = frame.sequence;
+    peer->last_sequence = packet.packet_sequence;
     peer->received_frames++;
+    if (peer->received_frames > 5U &&
+        (peer->received_frames % 25U) != 0U) {
+        return;
+    }
+
     format_addr(&peer->addr, addr, sizeof(addr));
     ESP_LOGI(DATA_TAG,
-             "[addr=%s conn=%u id=%u seq=%u tick=%u flags=0x%02X] "
-             "x=%ld y=%ld z=%ld",
+             "[addr=%s conn=%u id=%u pkt=%u sample=%lu tick=%llu "
+             "flags=0x%02X] "
+             "s0 a=%d,%d,%d g=%d,%d,%d s3dt=%u "
+             "coord_seq=%lu xyz=%ld,%ld,%ld cflags=0x%04X",
              addr,
              peer->conn_handle,
-             frame.device_id,
-             frame.sequence,
-             frame.sample_tick_10ms,
-             frame.flags,
-             (long)frame.position_mm[0],
-             (long)frame.position_mm[1],
-             (long)frame.position_mm[2]);
+             packet.device_id,
+             packet.packet_sequence,
+             (unsigned long)packet.first_sample_sequence,
+             (unsigned long long)packet.first_sample_tick_32k,
+             packet.flags,
+             packet.samples[0].accel[0],
+             packet.samples[0].accel[1],
+             packet.samples[0].accel[2],
+             packet.samples[0].gyro[0],
+             packet.samples[0].gyro[1],
+             packet.samples[0].gyro[2],
+             packet.samples[3].tick_offset_32k,
+             (unsigned long)packet.coordinate_source_sequence,
+             (long)packet.position_mm[0],
+             (long)packet.position_mm[1],
+             (long)packet.position_mm[2],
+             packet.coordinate_flags);
+}
+
+static int mtu_exchange_cb(uint16_t conn_handle,
+                           const struct ble_gatt_error *error,
+                           uint16_t mtu,
+                           void *arg)
+{
+    mahjong_peer_t *peer = arg;
+    int rc;
+
+    if (peer == NULL || peer->state == PEER_FREE ||
+        peer->conn_handle != conn_handle) {
+        return 0;
+    }
+    if (error->status != 0 || mtu < (MOTION_PACKET_SIZE + 3U)) {
+        restart_after_discovery_error(peer, "MTU exchange",
+                                      error->status != 0
+                                          ? error->status
+                                          : BLE_HS_EMSGSIZE);
+        return 0;
+    }
+
+    ESP_LOGI(TAG, "MTU ready: conn=%u mtu=%u", conn_handle, mtu);
+    rc = ble_gattc_disc_svc_by_uuid(conn_handle,
+                                    MOTION_SERVICE_UUID,
+                                    service_discovery_cb,
+                                    peer);
+    if (rc != 0) {
+        restart_after_discovery_error(peer,
+                                      "Motion service discovery start", rc);
+    }
+    return 0;
 }
 
 static void restart_after_discovery_error(mahjong_peer_t *peer,
@@ -388,7 +424,7 @@ static int subscribe_write_cb(uint16_t conn_handle,
     peer->state = PEER_READY;
     format_addr(&peer->addr, addr, sizeof(addr));
     ESP_LOGI(TAG,
-             "NUS notifications enabled: addr=%s conn=%u id=%u ready=%u/%u",
+             "Motion notifications enabled: addr=%s conn=%u id=%u ready=%u/%u",
              addr, conn_handle,
              TARGETS[peer->target_index].expected_device_id,
              ready_peer_count(), (unsigned int)TARGET_COUNT);
@@ -425,7 +461,7 @@ static int descriptor_discovery_cb(uint16_t conn_handle,
     }
 
     if (peer->notify_cccd_handle == 0) {
-        restart_after_discovery_error(peer, "NUS notify CCCD not found",
+            restart_after_discovery_error(peer, "Motion data CCCD not found",
                                       BLE_HS_ENOENT);
         return 0;
     }
@@ -454,7 +490,8 @@ static int characteristic_discovery_cb(uint16_t conn_handle,
     }
 
     if (error->status == 0) {
-        if (chr != NULL && ble_uuid_cmp(&chr->uuid.u, NUS_NOTIFY_UUID) == 0) {
+        if (chr != NULL &&
+            ble_uuid_cmp(&chr->uuid.u, MOTION_DATA_UUID) == 0) {
             peer->notify_value_handle = chr->val_handle;
         }
         return 0;
@@ -468,7 +505,7 @@ static int characteristic_discovery_cb(uint16_t conn_handle,
 
     if (peer->notify_value_handle == 0) {
         restart_after_discovery_error(peer,
-                                      "NUS notify characteristic not found",
+                                      "Motion data characteristic not found",
                                       BLE_HS_ENOENT);
         return 0;
     }
@@ -511,7 +548,7 @@ static int service_discovery_cb(uint16_t conn_handle,
     }
 
     if (peer->service_start_handle == 0 || peer->service_end_handle == 0) {
-        restart_after_discovery_error(peer, "NUS service not found",
+        restart_after_discovery_error(peer, "Motion service not found",
                                       BLE_HS_ENOENT);
         return 0;
     }
@@ -519,7 +556,7 @@ static int service_discovery_cb(uint16_t conn_handle,
     rc = ble_gattc_disc_chrs_by_uuid(conn_handle,
                                      peer->service_start_handle,
                                      peer->service_end_handle,
-                                     NUS_NOTIFY_UUID,
+                                     MOTION_DATA_UUID,
                                      characteristic_discovery_cb, peer);
     if (rc != 0) {
         restart_after_discovery_error(peer,
@@ -703,12 +740,12 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
                  active_peer_count(), (unsigned int)TARGET_COUNT);
 
         peer->state = PEER_DISCOVERING;
-        rc = ble_gattc_disc_svc_by_uuid(peer->conn_handle,
-                                        NUS_SERVICE_UUID,
-                                        service_discovery_cb, peer);
+        rc = ble_gattc_exchange_mtu(peer->conn_handle,
+                                    mtu_exchange_cb,
+                                    peer);
         if (rc != 0) {
             restart_after_discovery_error(peer,
-                                          "Service discovery start", rc);
+                                          "MTU exchange start", rc);
         }
         start_scan();
         return 0;
@@ -810,7 +847,7 @@ void app_main(void)
     ESP_ERROR_CHECK(nimble_port_init());
     ble_svc_gap_init();
 
-    rc = ble_svc_gap_device_name_set("ESP32S3-Mahjong-Multi-RX");
+    rc = ble_svc_gap_device_name_set("ESP32S3-Motion-Gateway");
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to set local BLE name: rc=%d", rc);
     }
@@ -819,7 +856,7 @@ void app_main(void)
     ble_hs_cfg.sync_cb = ble_on_sync;
 
     ESP_LOGI(TAG,
-             "ESP32-S3 multi NUS receiver started: targets=%u max_links=%u",
+             "ESP32-S3 Motion V1 gateway started: targets=%u max_links=%u",
              (unsigned int)TARGET_COUNT, MAX_MAHJONG_CONNECTIONS);
     nimble_port_freertos_init(nimble_host_task);
 }

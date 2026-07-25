@@ -299,8 +299,8 @@
               </OCR_RVCT8>
               <OCR_RVCT9>
                 <Type>0</Type>
-                <StartAddress>0x20002138</StartAddress>
-                <Size>0xdec8</Size>
+                <StartAddress>0x20003000</StartAddress>
+                <Size>0xd000</Size>
               </OCR_RVCT9>
               <OCR_RVCT10>
                 <Type>0</Type>
@@ -386,6 +386,16 @@
               <FileName>main.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\src\main.c</FilePath>
+            </File>
+            <File>
+              <FileName>motion_packet.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\src\motion_packet.c</FilePath>
+            </File>
+            <File>
+              <FileName>motion_service.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\src\motion_service.c</FilePath>
             </File>
             <File>
               <FileName>custom_board.h</FileName>
@@ -2517,6 +2527,16 @@
               <FileName>main.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\src\main.c</FilePath>
+            </File>
+            <File>
+              <FileName>motion_packet.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\src\motion_packet.c</FilePath>
+            </File>
+            <File>
+              <FileName>motion_service.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\src\motion_service.c</FilePath>
             </File>
             <File>
               <FileName>custom_board.h</FileName>

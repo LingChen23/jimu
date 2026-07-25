@@ -7,6 +7,8 @@
 #include "ble_hci.h"
 #include "ble_nus.h"
 #include "boards.h"
+#include "motion_packet.h"
+#include "motion_service.h"
 #include "realtime_traj.h"
 #include "nordic_common.h"
 #include "nrf.h"
@@ -51,86 +53,87 @@ volatile uint8_t sync_traj_data_flag;
 volatile uint8_t m_ble_tx_complete;
 
 static ble_nus_t  m_nus;
+static motion_service_t m_motion_service;
 static uint16_t   m_conn_handle = BLE_CONN_HANDLE_INVALID;
 static ble_uuid_t m_adv_uuids[] = { { BLE_UUID_NUS_SERVICE,
                                       NUS_SERVICE_UUID_TYPE } };
 
-#define FRAME_QUEUE_CAPACITY          64U
+#define MOTION_QUEUE_CAPACITY         16U
 #define TRAJ_POWER_OFF_DISCHARGE_MS   10U
 #define TRAJ_POWER_ON_SETTLE_MS       20U
 
 typedef struct
 {
-    uint8_t data[TRAJECTORY_FRAME_SIZE];
-} trajectory_queue_entry_t;
+    uint8_t data[MOTION_PACKET_SIZE];
+} motion_queue_entry_t;
 
-static trajectory_queue_entry_t m_frame_queue[FRAME_QUEUE_CAPACITY];
-static uint8_t m_frame_queue_head;
-static uint8_t m_frame_queue_tail;
-static uint8_t m_frame_queue_count;
-static uint32_t m_frame_queue_drops;
+static motion_queue_entry_t m_motion_queue[MOTION_QUEUE_CAPACITY];
+static uint8_t m_motion_queue_head;
+static uint8_t m_motion_queue_tail;
+static uint8_t m_motion_queue_count;
+static uint32_t m_motion_queue_drops;
 static volatile uint8_t m_sample_pending;
 static volatile uint32_t m_sample_timestamp_ticks;
 static volatile uint32_t m_sample_overruns;
 static realtime_traj_t m_realtime_traj;
 
 static void realtime_sample_interrupt_init(void);
+static void sample_clock_init(void);
 static uint8_t take_sample_pending(uint32_t* timestamp_ticks);
 
-static void frame_queue_clear(void)
+static void motion_queue_clear(void)
 {
-    m_frame_queue_head = 0;
-    m_frame_queue_tail = 0;
-    m_frame_queue_count = 0;
+    m_motion_queue_head = 0;
+    m_motion_queue_tail = 0;
+    m_motion_queue_count = 0;
 }
 
-static void frame_queue_push(uint8_t frame[TRAJECTORY_FRAME_SIZE])
+static void motion_queue_push(uint8_t packet[MOTION_PACKET_SIZE])
 {
-    if (m_frame_queue_count == FRAME_QUEUE_CAPACITY) {
-        m_frame_queue_head =
-          (uint8_t)((m_frame_queue_head + 1U) % FRAME_QUEUE_CAPACITY);
-        m_frame_queue_count--;
-        m_frame_queue_drops++;
-        frame[TRAJECTORY_OFFSET_FLAGS] |= TRAJECTORY_FLAG_QUEUE_DROP;
+    if (m_motion_queue_count == MOTION_QUEUE_CAPACITY) {
+        m_motion_queue_head =
+          (uint8_t)((m_motion_queue_head + 1U) % MOTION_QUEUE_CAPACITY);
+        m_motion_queue_count--;
+        m_motion_queue_drops++;
+        packet[MOTION_PACKET_FLAGS_OFFSET] |= MOTION_PACKET_FLAG_QUEUE_DROP;
     }
 
-    memcpy(m_frame_queue[m_frame_queue_tail].data,
-           frame,
-           TRAJECTORY_FRAME_SIZE);
-    m_frame_queue_tail =
-      (uint8_t)((m_frame_queue_tail + 1U) % FRAME_QUEUE_CAPACITY);
-    m_frame_queue_count++;
+    memcpy(m_motion_queue[m_motion_queue_tail].data,
+           packet,
+           MOTION_PACKET_SIZE);
+    m_motion_queue_tail =
+      (uint8_t)((m_motion_queue_tail + 1U) % MOTION_QUEUE_CAPACITY);
+    m_motion_queue_count++;
 }
 
-static void frame_queue_pop(void)
+static void motion_queue_pop(void)
 {
-    if (m_frame_queue_count == 0U) {
+    if (m_motion_queue_count == 0U) {
         return;
     }
 
-    m_frame_queue_head =
-      (uint8_t)((m_frame_queue_head + 1U) % FRAME_QUEUE_CAPACITY);
-    m_frame_queue_count--;
+    m_motion_queue_head =
+      (uint8_t)((m_motion_queue_head + 1U) % MOTION_QUEUE_CAPACITY);
+    m_motion_queue_count--;
 }
 
-static void trajectory_send_pump(void)
+static void motion_send_pump(void)
 {
     uint32_t err_code;
 
     if ((m_conn_handle == BLE_CONN_HANDLE_INVALID) ||
-        (!m_nus.is_notification_enabled)) {
-        frame_queue_clear();
+        (!m_motion_service.notification_enabled)) {
+        motion_queue_clear();
         return;
     }
 
-    while (m_frame_queue_count > 0U) {
-        err_code = ble_nus_string_send(
-          &m_nus,
-          m_frame_queue[m_frame_queue_head].data,
-          TRAJECTORY_FRAME_SIZE);
+    while (m_motion_queue_count > 0U) {
+        err_code = motion_service_notify(
+          &m_motion_service,
+          m_motion_queue[m_motion_queue_head].data);
 
         if (err_code == NRF_SUCCESS) {
-            frame_queue_pop();
+            motion_queue_pop();
             continue;
         }
 
@@ -140,7 +143,7 @@ static void trajectory_send_pump(void)
         }
 
         if (err_code == NRF_ERROR_INVALID_STATE) {
-            frame_queue_clear();
+            motion_queue_clear();
             return;
         }
 
@@ -425,6 +428,9 @@ static void services_init(void)
 
     err_code = ble_nus_init(&m_nus, &nus_init);
     APP_ERROR_CHECK(err_code);
+
+    err_code = motion_service_init(&m_motion_service);
+    APP_ERROR_CHECK(err_code);
 }
 
 static void on_conn_params_evt(ble_conn_params_evt_t* p_evt)
@@ -494,7 +500,7 @@ static void on_ble_evt(ble_evt_t* p_ble_evt)
             m_conn_handle = BLE_CONN_HANDLE_INVALID;
             sync_traj_data_flag = 0;
             m_nus.is_notification_enabled = false;
-            frame_queue_clear();
+            motion_queue_clear();
             break; // BLE_GAP_EVT_DISCONNECTED
 
         case BLE_EVT_TX_COMPLETE:
@@ -579,6 +585,7 @@ static void ble_evt_dispatch(ble_evt_t* p_ble_evt)
 {
     ble_conn_params_on_ble_evt(p_ble_evt);
     ble_nus_on_ble_evt(&m_nus, p_ble_evt);
+    motion_service_on_ble_evt(&m_motion_service, p_ble_evt);
     on_ble_evt(p_ble_evt);
     ble_advertising_on_ble_evt(p_ble_evt);
 }
@@ -1183,24 +1190,35 @@ static int32_t position_m_to_mm(float position_m)
 int main(void)
 {
     uint32_t err_code;
-    uint16_t sequence = 0;
+    uint32_t sample_sequence = 0U;
+    uint16_t packet_sequence = 0U;
     uint16_t sample_tick_10ms = 0;
     uint16_t output_tick_10ms = 0;
-    uint8_t frame[TRAJECTORY_FRAME_SIZE];
-    uint8_t flags;
+    uint8_t packet[MOTION_PACKET_SIZE];
+    uint8_t trajectory_flags;
     uint8_t device_id;
     int16_t raw[6];
-    int32_t position_mm[3];
+    int32_t position_mm[3] = { 0, 0, 0 };
     float position_m[3] = { 0.0f, 0.0f, 0.0f };
     float dt_seconds = 1.0f / (float)REALTIME_TRAJ_SAMPLE_HZ;
     uint32_t sample_timestamp_ticks;
     uint32_t last_sample_timestamp_ticks = 0U;
     uint32_t elapsed_ticks;
     uint32_t elapsed_10ms;
+    uint32_t observed_sample_overruns = 0U;
+    uint32_t coordinate_source_sequence = 0U;
+    uint32_t session_id;
+    uint64_t sample_tick_32k = 0U;
     uint32_t rtc_frequency =
       APP_TIMER_CLOCK_FREQ / (APP_TIMER_PRESCALER + 1U);
     uint8_t has_sample_timestamp = 0U;
+    uint8_t batch_sample_count = 0U;
+    uint8_t sensor_error_pending = 0U;
+    uint8_t coordinate_valid = 0U;
     uint8_t axis;
+    uint16_t coordinate_flags = MOTION_COORD_FLAG_CALIBRATING;
+    uint16_t coordinate_lag;
+    motion_packet_fields_t packet_fields;
     realtime_traj_event_t trajectory_event;
 
     /*
@@ -1222,6 +1240,11 @@ int main(void)
         sync_sys_config_to_flash();
     }
     device_id = (uint8_t)TX_DEVICE_ID;
+    memset(&packet_fields, 0, sizeof(packet_fields));
+    packet_fields.device_id = device_id;
+    session_id =
+      NRF_FICR->DEVICEID[0] ^ NRF_FICR->DEVICEID[1] ^
+      app_timer_cnt_get() ^ 0x4d4f544eUL;
     advertising_init();
     conn_params_init();
 
@@ -1236,6 +1259,7 @@ int main(void)
     if (icm_20689_init() < 0) {
         APP_ERROR_HANDLER(NRF_ERROR_INTERNAL);
     }
+    sample_clock_init();
     realtime_sample_interrupt_init();
     if (icm_20689_set_mode(ICM_20689_WORK_MODE_INT) < 0) {
         APP_ERROR_HANDLER(NRF_ERROR_INTERNAL);
@@ -1246,6 +1270,7 @@ int main(void)
 
         if (take_sample_pending(&sample_timestamp_ticks)) {
             if (icm_20689_int_read_data(sizeof(raw), raw) != sizeof(raw)) {
+                sensor_error_pending = 1U;
                 continue;
             }
 
@@ -1256,6 +1281,7 @@ int main(void)
                   &elapsed_ticks);
                 APP_ERROR_CHECK(err_code);
                 dt_seconds = (float)elapsed_ticks / (float)rtc_frequency;
+                sample_tick_32k += elapsed_ticks;
                 elapsed_10ms =
                   (elapsed_ticks * 100U + rtc_frequency / 2U) /
                   rtc_frequency;
@@ -1266,6 +1292,7 @@ int main(void)
                   (uint16_t)(sample_tick_10ms + elapsed_10ms);
             } else {
                 has_sample_timestamp = 1U;
+                sample_tick_32k = sample_timestamp_ticks;
             }
             last_sample_timestamp_ticks = sample_timestamp_ticks;
 
@@ -1277,44 +1304,127 @@ int main(void)
                                      position_m,
                                      &output_tick_10ms);
 
-            if (trajectory_event != REALTIME_TRAJ_NO_OUTPUT) {
-                flags = realtime_traj_take_quality_flags(&m_realtime_traj);
-                if (trajectory_event == REALTIME_TRAJ_ABORT) {
-                    flags |= TRAJECTORY_FLAG_STATIONARY |
-                             TRAJECTORY_FLAG_STOP |
-                             TRAJECTORY_FLAG_UNRELIABLE;
-                } else if (trajectory_event == REALTIME_TRAJ_STOP) {
-                    flags |= TRAJECTORY_FLAG_STATIONARY |
-                             TRAJECTORY_FLAG_STOP;
-                } else {
-                    flags |= TRAJECTORY_FLAG_MOVING;
-                    if (trajectory_event == REALTIME_TRAJ_ORIGIN) {
-                        flags |= TRAJECTORY_FLAG_ORIGIN;
+            if (trajectory_event == REALTIME_TRAJ_NO_OUTPUT) {
+                if (m_realtime_traj.state == REALTIME_TRAJ_CALIBRATING) {
+                    coordinate_flags = MOTION_COORD_FLAG_CALIBRATING;
+                } else if (m_realtime_traj.state ==
+                           REALTIME_TRAJ_STATIONARY) {
+                    coordinate_flags = MOTION_COORD_FLAG_STATIONARY;
+                    if (coordinate_valid) {
+                        coordinate_flags |= MOTION_COORD_FLAG_HELD;
                     }
+                } else {
+                    coordinate_flags = MOTION_COORD_FLAG_MOVING;
+                }
+            }
+
+            if (trajectory_event != REALTIME_TRAJ_NO_OUTPUT) {
+                trajectory_flags =
+                  realtime_traj_take_quality_flags(&m_realtime_traj);
+                coordinate_flags = 0U;
+                if (trajectory_event == REALTIME_TRAJ_ABORT) {
+                    coordinate_flags = MOTION_COORD_FLAG_STATIONARY |
+                                       MOTION_COORD_FLAG_STOP |
+                                       MOTION_COORD_FLAG_UNRELIABLE |
+                                       MOTION_COORD_FLAG_ABORTED;
+                } else if (trajectory_event == REALTIME_TRAJ_STOP) {
+                    coordinate_flags = MOTION_COORD_FLAG_STATIONARY |
+                                       MOTION_COORD_FLAG_STOP;
+                } else {
+                    coordinate_flags = MOTION_COORD_FLAG_MOVING;
+                    if (trajectory_event == REALTIME_TRAJ_ORIGIN) {
+                        coordinate_flags |= MOTION_COORD_FLAG_ORIGIN;
+                    }
+                }
+                if ((trajectory_flags & TRAJECTORY_FLAG_UNRELIABLE) != 0U) {
+                    coordinate_flags |= MOTION_COORD_FLAG_UNRELIABLE;
                 }
 
                 for (axis = 0; axis < 3; axis++) {
                     position_mm[axis] = position_m_to_mm(position_m[axis]);
                 }
-                trajectory_frame_encode(frame,
-                                        device_id,
-                                        sequence,
-                                        position_mm,
-                                        output_tick_10ms,
-                                        flags);
-                sequence++;
+                coordinate_lag =
+                  (uint16_t)(sample_tick_10ms - output_tick_10ms);
+                if (sample_sequence >= coordinate_lag) {
+                    coordinate_source_sequence =
+                      sample_sequence - coordinate_lag;
+                } else {
+                    coordinate_source_sequence = 0U;
+                }
+                coordinate_valid = 1U;
+            }
 
-                if ((m_conn_handle != BLE_CONN_HANDLE_INVALID) &&
-                    m_nus.is_notification_enabled) {
-                    frame_queue_push(frame);
+            if (batch_sample_count == 0U) {
+                memset(&packet_fields, 0, sizeof(packet_fields));
+                packet_fields.device_id = device_id;
+                packet_fields.session_id = session_id;
+                packet_fields.first_sample_sequence = sample_sequence;
+                packet_fields.first_sample_tick_32k = sample_tick_32k;
+                packet_fields.packet_sequence = packet_sequence;
+            }
+
+            packet_fields.samples[batch_sample_count].tick_offset_32k =
+              (uint16_t)(sample_tick_32k -
+                         packet_fields.first_sample_tick_32k);
+            for (axis = 0; axis < 6U; axis++) {
+                packet_fields.samples[batch_sample_count].axes[axis] =
+                  raw[axis];
+            }
+
+            if (m_realtime_traj.state != REALTIME_TRAJ_CALIBRATING) {
+                packet_fields.flags |= MOTION_PACKET_FLAG_CALIBRATED;
+            }
+            if (m_sample_overruns != observed_sample_overruns) {
+                packet_fields.flags |= MOTION_PACKET_FLAG_SAMPLE_GAP;
+                observed_sample_overruns = m_sample_overruns;
+            }
+            if (sensor_error_pending) {
+                packet_fields.flags |= MOTION_PACKET_FLAG_SENSOR_ERROR;
+                sensor_error_pending = 0U;
+            }
+            for (axis = 0; axis < 3U; axis++) {
+                if ((raw[axis] > 32000) || (raw[axis] < -32000)) {
+                    packet_fields.flags |=
+                      MOTION_PACKET_FLAG_ACCEL_SATURATED;
+                }
+                if ((raw[axis + 3U] > 32000) ||
+                    (raw[axis + 3U] < -32000)) {
+                    packet_fields.flags |=
+                      MOTION_PACKET_FLAG_GYRO_SATURATED;
                 }
             }
 
-            trajectory_send_pump();
+            batch_sample_count++;
+            sample_sequence++;
+
+            if (batch_sample_count == MOTION_SAMPLE_COUNT) {
+                if (coordinate_valid) {
+                    packet_fields.flags |= MOTION_PACKET_FLAG_COORD_VALID;
+                }
+                if ((coordinate_flags & MOTION_COORD_FLAG_UNRELIABLE) != 0U) {
+                    packet_fields.flags |= MOTION_PACKET_FLAG_UNRELIABLE;
+                }
+                packet_fields.coordinate_source_sequence =
+                  coordinate_source_sequence;
+                for (axis = 0; axis < 3U; axis++) {
+                    packet_fields.position_mm[axis] = position_mm[axis];
+                }
+                packet_fields.coordinate_flags = coordinate_flags;
+                motion_packet_encode(packet, &packet_fields);
+                packet_sequence++;
+                batch_sample_count = 0U;
+
+                if ((m_conn_handle != BLE_CONN_HANDLE_INVALID) &&
+                    m_motion_service.notification_enabled) {
+                    motion_queue_push(packet);
+                }
+            }
+
+            motion_send_pump();
         } else {
             if (m_ble_tx_complete) {
                 m_ble_tx_complete = 0;
-                trajectory_send_pump();
+                motion_send_pump();
             }
             power_manage();
         }
@@ -1327,12 +1437,21 @@ static void realtime_sample_handler(nrf_drv_gpiote_pin_t pin,
     (void)pin;
     (void)action;
 
-    m_sample_timestamp_ticks = app_timer_cnt_get();
+    m_sample_timestamp_ticks = NRF_RTC2->COUNTER;
     if (!m_sample_pending) {
         m_sample_pending = 1;
     } else {
         m_sample_overruns++;
     }
+}
+
+static void sample_clock_init(void)
+{
+    NRF_RTC2->TASKS_STOP = 1U;
+    NRF_RTC2->PRESCALER = 0U;
+    NRF_RTC2->TASKS_CLEAR = 1U;
+    NRF_RTC2->EVENTS_OVRFLW = 0U;
+    NRF_RTC2->TASKS_START = 1U;
 }
 
 static uint8_t take_sample_pending(uint32_t* timestamp_ticks)

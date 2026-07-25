@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>运动积木数据监视器</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: #131a2d;
+      --panel-2: #182139;
+      --text: #eef3ff;
+      --muted: #91a0bf;
+      --border: #293552;
+      --primary: #67a8ff;
+      --good: #55d6a5;
+      --warn: #ffbf69;
+      --bad: #ff7185;
+      --x: #67a8ff;
+      --y: #55d6a5;
+      --z: #ffbf69;
+      --received: #67a8ff;
+      --calculated: #ff8c69;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 20% 0%, #18264a 0, transparent 32rem),
+        var(--bg);
+      color: var(--text);
+      font: 14px/1.45 system-ui, "Microsoft YaHei", sans-serif;
+    }
+    button, select, input { font: inherit; }
+    button:focus-visible, select:focus-visible, input:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
+    }
+    .app { width: min(1500px, 100%); margin: 0 auto; padding: 20px; }
+    header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 20px;
+      margin-bottom: 16px;
+    }
+    h1 { margin: 0 0 4px; font-size: 23px; font-weight: 600; }
+    h2 { margin: 0; font-size: 15px; font-weight: 600; }
+    .subtitle, .muted { color: var(--muted); }
+    .panel {
+      background: color-mix(in srgb, var(--panel) 94%, transparent);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: 0 12px 36px rgba(0, 0, 0, .16);
+    }
+    .serial-panel {
+      display: grid;
+      grid-template-columns: minmax(160px, 1fr) 120px auto;
+      gap: 10px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+    label { display: grid; gap: 5px; color: var(--muted); }
+    select, input {
+      width: 100%;
+      height: 38px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel-2);
+      color: var(--text);
+      padding: 0 10px;
+    }
+    .actions { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; }
+    button {
+      min-height: 38px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0 13px;
+      background: var(--panel-2);
+      color: var(--text);
+      cursor: pointer;
+    }
+    button.primary { background: var(--primary); color: #07101e; border-color: transparent; }
+    button.danger { color: var(--bad); }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .device-strip {
+      display: grid;
+      grid-template-columns: repeat(12, minmax(58px, 1fr));
+      gap: 7px;
+      margin-bottom: 14px;
+    }
+    .device {
+      position: relative;
+      padding: 9px 4px;
+      min-height: 42px;
+    }
+    .device.selected { border-color: var(--primary); background: #1d3153; }
+    .device.online::after {
+      content: "";
+      position: absolute;
+      right: 7px;
+      top: 7px;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--good);
+    }
+    .status-row {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .stat { padding: 13px 15px; }
+    .stat-label { color: var(--muted); font-size: 12px; }
+    .stat-value { margin-top: 3px; font-size: 18px; font-variant-numeric: tabular-nums; }
+    .charts {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      gap: 14px;
+    }
+    .chart-panel { min-width: 0; overflow: hidden; }
+    .chart-panel.trajectory { grid-row: span 2; }
+    .chart-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 13px 15px 0;
+    }
+    .legend { display: flex; gap: 12px; color: var(--muted); font-size: 12px; }
+    .legend span::before {
+      content: "";
+      display: inline-block;
+      width: 9px;
+      height: 3px;
+      margin-right: 5px;
+      vertical-align: middle;
+      background: var(--legend);
+    }
+    canvas { display: block; width: 100%; height: 280px; }
+    .trajectory canvas { height: 600px; }
+    .error {
+      min-height: 22px;
+      padding-top: 6px;
+      color: var(--bad);
+      grid-column: 1 / -1;
+    }
+    .connection {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); }
+    .dot.open { background: var(--good); }
+    @media (max-width: 900px) {
+      .device-strip { grid-template-columns: repeat(6, 1fr); }
+      .charts { grid-template-columns: 1fr; }
+      .chart-panel.trajectory { grid-row: auto; }
+      .trajectory canvas { height: 380px; }
+    }
+    @media (max-width: 620px) {
+      .app { padding: 12px; }
+      header { flex-direction: column; }
+      .serial-panel { grid-template-columns: 1fr; }
+      .actions { align-items: center; }
+      .status-row { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <div>
+        <h1>运动积木数据监视器</h1>
+        <div class="subtitle">Motion V1 · 接收坐标与 PC 端惯导轨迹对照</div>
+      </div>
+      <div class="connection">
+        <span id="connectionDot" class="dot" aria-hidden="true"></span>
+        <span id="connectionText">串口未打开</span>
+      </div>
+    </header>
+
+    <section class="panel serial-panel" aria-label="串口控制">
+      <label>串口
+        <select id="portSelect" aria-label="串口"></select>
+      </label>
+      <label>波特率
+        <input id="baudInput" type="number" value="460800" min="9600" step="1">
+      </label>
+      <div class="actions">
+        <button id="refreshPorts" type="button">刷新串口</button>
+        <button id="openPort" class="primary" type="button">打开</button>
+        <button id="closePort" class="danger" type="button">关闭</button>
+      </div>
+      <div id="errorText" class="error" role="alert"></div>
+    </section>
+
+    <nav id="deviceStrip" class="device-strip" aria-label="选择设备"></nav>
+
+    <section class="status-row" aria-label="当前设备状态">
+      <div class="panel stat">
+        <div class="stat-label">选中设备</div>
+        <div id="deviceValue" class="stat-value">设备 1</div>
+      </div>
+      <div class="panel stat">
+        <div class="stat-label">解析数据包 / 丢包</div>
+        <div id="packetValue" class="stat-value">0 / 0</div>
+      </div>
+      <div class="panel stat">
+        <div class="stat-label">最新样本序号</div>
+        <div id="sampleValue" class="stat-value">—</div>
+      </div>
+      <div class="panel stat">
+        <div class="stat-label">数据源</div>
+        <div id="sourceValue" class="stat-value">等待数据</div>
+      </div>
+    </section>
+
+    <section class="charts">
+      <article class="panel chart-panel trajectory">
+        <div class="chart-head">
+          <h2>轨迹对照（XY，单位 m）</h2>
+          <div class="legend">
+            <span style="--legend:var(--received)">设备坐标</span>
+            <span style="--legend:var(--calculated)">PC 惯导</span>
+          </div>
+        </div>
+        <canvas id="trajectoryCanvas" aria-label="设备坐标轨迹与PC计算轨迹"></canvas>
+      </article>
+
+      <article class="panel chart-panel">
+        <div class="chart-head">
+          <h2>加速度（m/s²）</h2>
+          <div class="legend">
+            <span style="--legend:var(--x)">X</span>
+            <span style="--legend:var(--y)">Y</span>
+            <span style="--legend:var(--z)">Z</span>
+          </div>
+        </div>
+        <canvas id="accelCanvas" aria-label="三轴加速度曲线"></canvas>
+      </article>
+
+      <article class="panel chart-panel">
+        <div class="chart-head">
+          <h2>角速度（°/s）</h2>
+          <div class="legend">
+            <span style="--legend:var(--x)">X</span>
+            <span style="--legend:var(--y)">Y</span>
+            <span style="--legend:var(--z)">Z</span>
+          </div>
+        </div>
+        <canvas id="gyroCanvas" aria-label="三轴角速度曲线"></canvas>
+      </article>
+    </section>
+  </main>
+
+  <script>
+    const elements = {
+      ports: document.getElementById("portSelect"),
+      baud: document.getElementById("baudInput"),
+      open: document.getElementById("openPort"),
+      close: document.getElementById("closePort"),
+      refresh: document.getElementById("refreshPorts"),
+      error: document.getElementById("errorText"),
+      strip: document.getElementById("deviceStrip"),
+      dot: document.getElementById("connectionDot"),
+      connection: document.getElementById("connectionText"),
+      device: document.getElementById("deviceValue"),
+      packet: document.getElementById("packetValue"),
+      sample: document.getElementById("sampleValue"),
+      source: document.getElementById("sourceValue"),
+      trajectory: document.getElementById("trajectoryCanvas"),
+      accel: document.getElementById("accelCanvas"),
+      gyro: document.getElementById("gyroCanvas")
+    };
+    let selectedDevice = 1;
+    let polling = false;
+    let latestSnapshot = null;
+
+    function css(name) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    }
+
+    function makeDeviceButtons() {
+      for (let id = 1; id <= 12; id += 1) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "device" + (id === selectedDevice ? " selected" : "");
+        button.textContent = String(id);
+        button.setAttribute("aria-label", `选择设备 ${id}`);
+        button.addEventListener("click", () => {
+          selectedDevice = id;
+          [...elements.strip.children].forEach((child, index) => {
+            child.classList.toggle("selected", index + 1 === id);
+          });
+          pollSnapshot();
+        });
+        elements.strip.appendChild(button);
+      }
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        headers: {"Content-Type": "application/json"},
+        ...options
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `请求失败 ${response.status}`);
+      return data;
+    }
+
+    async function loadPorts() {
+      try {
+        const previous = elements.ports.value;
+        const data = await api("/api/ports");
+        elements.ports.replaceChildren();
+        data.ports.forEach((port) => {
+          const option = document.createElement("option");
+          option.value = port.device;
+          option.textContent = `${port.device} — ${port.description}`;
+          elements.ports.appendChild(option);
+        });
+        if ([...elements.ports.options].some(option => option.value === previous)) {
+          elements.ports.value = previous;
+        } else if ([...elements.ports.options].some(option => option.value === "COM14")) {
+          elements.ports.value = "COM14";
+        }
+        updateSerialStatus(data.serial);
+      } catch (error) {
+        elements.error.textContent = error.message;
+      }
+    }
+
+    function updateSerialStatus(status) {
+      const open = Boolean(status?.open);
+      elements.dot.classList.toggle("open", open);
+      elements.connection.textContent = open
+        ? `${status.port} · ${status.baud} · 已解析 ${status.frame_count} 帧`
+        : "串口未打开";
+      elements.open.disabled = open;
+      elements.close.disabled = !open;
+      if (status?.error) elements.error.textContent = status.error;
+    }
+
+    async function setSerial(open) {
+      elements.error.textContent = "";
+      try {
+        const data = await api(open ? "/api/serial/open" : "/api/serial/close", {
+          method: "POST",
+          body: JSON.stringify(open ? {
+            port: elements.ports.value,
+            baud: Number(elements.baud.value)
+          } : {})
+        });
+        updateSerialStatus(data);
+      } catch (error) {
+        elements.error.textContent = error.message;
+      }
+    }
+
+    function configureCanvas(canvas) {
+      const rect = canvas.getBoundingClientRect();
+      const ratio = window.devicePixelRatio || 1;
+      const width = Math.max(1, Math.round(rect.width * ratio));
+      const height = Math.max(1, Math.round(rect.height * ratio));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+      const context = canvas.getContext("2d");
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      return {context, width: rect.width, height: rect.height};
+    }
+
+    function drawEmpty(context, width, height, text) {
+      context.fillStyle = css("--muted");
+      context.textAlign = "center";
+      context.textBaseline = "middle";
+      context.font = "13px system-ui";
+      context.fillText(text, width / 2, height / 2);
+    }
+
+    function drawGrid(context, left, top, width, height) {
+      context.strokeStyle = css("--border");
+      context.lineWidth = 1;
+      context.beginPath();
+      for (let index = 0; index <= 4; index += 1) {
+        const x = left + width * index / 4;
+        const y = top + height * index / 4;
+        context.moveTo(x, top);
+        context.lineTo(x, top + height);
+        context.moveTo(left, y);
+        context.lineTo(left + width, y);
+      }
+      context.stroke();
+    }
+
+    function drawTimeSeries(canvas, rows, unit) {
+      const {context, width, height} = configureCanvas(canvas);
+      context.clearRect(0, 0, width, height);
+      const data = rows.slice(-300);
+      if (data.length < 2) {
+        drawEmpty(context, width, height, "等待串口数据");
+        return;
+      }
+      const margin = {left: 52, right: 14, top: 16, bottom: 30};
+      const plotWidth = width - margin.left - margin.right;
+      const plotHeight = height - margin.top - margin.bottom;
+      const tMin = data[0][0];
+      const tMax = Math.max(tMin + 0.001, data[data.length - 1][0]);
+      const values = data.flatMap(row => row.slice(1));
+      let yMin = Math.min(...values);
+      let yMax = Math.max(...values);
+      const padding = Math.max((yMax - yMin) * 0.12, unit === "m/s²" ? 0.2 : 1);
+      yMin -= padding;
+      yMax += padding;
+      drawGrid(context, margin.left, margin.top, plotWidth, plotHeight);
+
+      context.font = "11px system-ui";
+      context.fillStyle = css("--muted");
+      context.textAlign = "right";
+      context.textBaseline = "middle";
+      for (let index = 0; index <= 4; index += 1) {
+        const value = yMax - (yMax - yMin) * index / 4;
+        context.fillText(value.toFixed(1), margin.left - 7,
+          margin.top + plotHeight * index / 4);
+      }
+      context.textAlign = "center";
+      context.textBaseline = "top";
+      context.fillText(`${(tMax - tMin).toFixed(1)} s`, width - 34, height - 22);
+      context.fillText(unit, 24, 4);
+
+      const colors = [css("--x"), css("--y"), css("--z")];
+      colors.forEach((color, axis) => {
+        context.strokeStyle = color;
+        context.lineWidth = 1.7;
+        context.beginPath();
+        data.forEach((row, index) => {
+          const x = margin.left + (row[0] - tMin) / (tMax - tMin) * plotWidth;
+          const y = margin.top + (yMax - row[axis + 1]) /
+            (yMax - yMin) * plotHeight;
+          if (index === 0) context.moveTo(x, y);
+          else context.lineTo(x, y);
+        });
+        context.stroke();
+      });
+    }
+
+    function drawTrajectory(snapshot) {
+      const {context, width, height} = configureCanvas(elements.trajectory);
+      context.clearRect(0, 0, width, height);
+      const received = snapshot.received_path || [];
+      const calculated = snapshot.calculated_path || [];
+      const all = [...received, ...calculated];
+      if (all.length < 2) {
+        drawEmpty(context, width, height, "等待坐标或 IMU 轨迹数据");
+        return;
+      }
+      const margin = {left: 58, right: 18, top: 22, bottom: 42};
+      const plotWidth = width - margin.left - margin.right;
+      const plotHeight = height - margin.top - margin.bottom;
+      let xMin = Math.min(...all.map(point => point[0]));
+      let xMax = Math.max(...all.map(point => point[0]));
+      let yMin = Math.min(...all.map(point => point[1]));
+      let yMax = Math.max(...all.map(point => point[1]));
+      const span = Math.max(xMax - xMin, yMax - yMin, 0.1);
+      const xMid = (xMin + xMax) / 2;
+      const yMid = (yMin + yMax) / 2;
+      xMin = xMid - span * 0.58;
+      xMax = xMid + span * 0.58;
+      yMin = yMid - span * 0.58;
+      yMax = yMid + span * 0.58;
+      drawGrid(context, margin.left, margin.top, plotWidth, plotHeight);
+      context.font = "11px system-ui";
+      context.fillStyle = css("--muted");
+      context.textAlign = "center";
+      context.fillText("X (m)", margin.left + plotWidth / 2, height - 14);
+      context.save();
+      context.translate(16, margin.top + plotHeight / 2);
+      context.rotate(-Math.PI / 2);
+      context.fillText("Y (m)", 0, 0);
+      context.restore();
+
+      const drawPath = (points, color) => {
+        if (points.length < 2) return;
+        context.strokeStyle = color;
+        context.lineWidth = 2;
+        context.beginPath();
+        points.forEach((point, index) => {
+          const x = margin.left + (point[0] - xMin) / (xMax - xMin) * plotWidth;
+          const y = margin.top + (yMax - point[1]) / (yMax - yMin) * plotHeight;
+          if (index === 0) context.moveTo(x, y);
+          else context.lineTo(x, y);
+        });
+        context.stroke();
+        const last = points[points.length - 1];
+        context.fillStyle = color;
+        context.beginPath();
+        context.arc(
+          margin.left + (last[0] - xMin) / (xMax - xMin) * plotWidth,
+          margin.top + (yMax - last[1]) / (yMax - yMin) * plotHeight,
+          4, 0, Math.PI * 2
+        );
+        context.fill();
+      };
+      drawPath(received, css("--received"));
+      drawPath(calculated, css("--calculated"));
+    }
+
+    function sourceLabel(source) {
+      if (source === "motion-v1-100b") return "完整 100B";
+      if (source === "esp32-diagnostic-s0") return "诊断 S0";
+      return "等待数据";
+    }
+
+    function render(snapshot) {
+      latestSnapshot = snapshot;
+      updateSerialStatus(snapshot.serial);
+      elements.device.textContent = `设备 ${snapshot.device_id}`;
+      elements.packet.textContent = `${snapshot.packet_count} / ${snapshot.lost_packets}`;
+      elements.sample.textContent = snapshot.last_sample_sequence ?? "—";
+      elements.source.textContent = sourceLabel(snapshot.source);
+      snapshot.devices.forEach((device, index) => {
+        const button = elements.strip.children[index];
+        button.classList.toggle("online", device.online);
+        button.setAttribute(
+          "aria-label",
+          `选择设备 ${device.device_id}，${device.online ? "在线" : "离线"}`
+        );
+      });
+      drawTrajectory(snapshot);
+      drawTimeSeries(elements.accel, snapshot.accel || [], "m/s²");
+      drawTimeSeries(elements.gyro, snapshot.gyro || [], "°/s");
+    }
+
+    async function pollSnapshot() {
+      if (polling) return;
+      polling = true;
+      try {
+        const snapshot = await api(`/api/snapshot?device=${selectedDevice}`);
+        render(snapshot);
+      } catch (error) {
+        elements.error.textContent = error.message;
+      } finally {
+        polling = false;
+      }
+    }
+
+    elements.refresh.addEventListener("click", loadPorts);
+    elements.open.addEventListener("click", () => setSerial(true));
+    elements.close.addEventListener("click", () => setSerial(false));
+    window.addEventListener("resize", () => {
+      if (latestSnapshot) render(latestSnapshot);
+    });
+
+    makeDeviceButtons();
+    loadPorts();
+    pollSnapshot();
+    setInterval(pollSnapshot, 250);
+  </script>
+</body>
+</html>

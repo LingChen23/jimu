@@ -456,6 +456,16 @@
         <div class="command-value"><div class="label">采样 / 坐标频率</div><div id="sampleRates" class="value">—</div></div>
         <div class="command-value"><div class="label">异常计数（间隙/传感器/队列/BLE）</div><div id="deviceErrors" class="value">—</div></div>
         <div class="command-value"><div class="label">复位原因 / 会话 / 当前队列</div><div id="resetSession" class="value">—</div></div>
+        <div class="command-value"><div class="label">ESP连接 / 实际连接间隔</div><div id="linkStatusInterval" class="value">—</div></div>
+        <div class="command-value"><div class="label">实际ATT MTU / DLE请求</div><div id="linkMtuDleRequest" class="value">—</div></div>
+        <div class="command-value"><div class="label">DLE TX / RX（字节/时间）</div><div id="linkDleLengths" class="value">—</div></div>
+        <div class="command-value"><div class="label">PHY TX / RX</div><div id="linkPhy" class="value">—</div></div>
+        <div class="command-value"><div class="label">RSSI / 接收速率（1秒/10秒）</div><div id="linkRssiRate" class="value">—</div></div>
+        <div class="command-value"><div class="label">ESP累计接收 / 序号缺口</div><div id="linkFramesLoss" class="value">—</div></div>
+        <div class="command-value"><div class="label">连接 / 断连 / 参数更新</div><div id="linkConnectionCounts" class="value">—</div></div>
+        <div class="command-value"><div class="label">无效包 / 最后断连原因</div><div id="linkInvalidDisconnect" class="value">—</div></div>
+        <div class="command-value"><div class="label">链路层真实重传</div><div id="linkRetransmissions" class="value">不可直接读取</div></div>
+        <div class="command-value"><div class="label">ESP发送队列丢弃 / 诊断龄</div><div id="linkGatewayQueue" class="value">—</div></div>
       </div>
       <div id="commandResult" class="command-result">打开串口后可查询当前设备。</div>
     </section>
@@ -631,6 +641,16 @@
       sampleRates: document.getElementById("sampleRates"),
       deviceErrors: document.getElementById("deviceErrors"),
       resetSession: document.getElementById("resetSession"),
+      linkStatusInterval: document.getElementById("linkStatusInterval"),
+      linkMtuDleRequest: document.getElementById("linkMtuDleRequest"),
+      linkDleLengths: document.getElementById("linkDleLengths"),
+      linkPhy: document.getElementById("linkPhy"),
+      linkRssiRate: document.getElementById("linkRssiRate"),
+      linkFramesLoss: document.getElementById("linkFramesLoss"),
+      linkConnectionCounts: document.getElementById("linkConnectionCounts"),
+      linkInvalidDisconnect: document.getElementById("linkInvalidDisconnect"),
+      linkRetransmissions: document.getElementById("linkRetransmissions"),
+      linkGatewayQueue: document.getElementById("linkGatewayQueue"),
       reset: document.getElementById("resetAnalysis"),
       toggleMode: document.getElementById("toggleAnalysisMode"),
       analysisModeLabel: document.getElementById("analysisModeLabel"),
@@ -1738,6 +1758,7 @@
       const control = snapshot.control || {};
       const status = control.status || {};
       const info = control.info || {};
+      const link = control.link || {};
       const serialOpen = Boolean(snapshot.serial?.open);
       elements.commandButtons.querySelectorAll("button").forEach(button => {
         button.disabled = !serialOpen;
@@ -1767,6 +1788,49 @@
         status.reset_reason === undefined
           ? "—"
           : `${status.reset_reason_text} / ${status.session_id} / ${status.queue_depth}`;
+      elements.linkStatusInterval.textContent =
+        link.connected === undefined
+          ? "—"
+          : `${link.connected ? (link.ready ? "已就绪" : "连接中") : "已断开"} / `
+            + `${optionalFixed(link.connection_interval_ms, 2, " ms")}`;
+      elements.linkMtuDleRequest.textContent =
+        link.connected === undefined
+          ? "—"
+          : `${link.att_mtu ?? "MTU未知"} / `
+            + `${link.dle_request_result_text || "未请求"}`;
+      elements.linkDleLengths.textContent =
+        !link.dle_valid
+          ? "未协商"
+          : `${link.max_tx_octets} B / ${link.max_tx_time_us} μs · `
+            + `${link.max_rx_octets} B / ${link.max_rx_time_us} μs`;
+      elements.linkPhy.textContent =
+        !link.phy_valid
+          ? "未知"
+          : `${link.tx_phy_text || "未知"} / ${link.rx_phy_text || "未知"}`;
+      elements.linkRssiRate.textContent =
+        link.connected === undefined
+          ? "—"
+          : `${link.rssi_valid ? `${link.rssi_dbm} dBm` : "RSSI不可用"} / `
+            + `${optionalFixed(link.receive_rate_1s_pps, 2)} / `
+            + `${optionalFixed(link.receive_rate_10s_pps, 2)} 包/s`;
+      elements.linkFramesLoss.textContent =
+        link.received_frames === undefined
+          ? "—"
+          : `${link.received_frames} / ${link.sequence_gap_frames}`;
+      elements.linkConnectionCounts.textContent =
+        link.connect_count === undefined
+          ? "—"
+          : `${link.connect_count} / ${link.disconnect_count} / ${link.connection_update_count}`;
+      elements.linkInvalidDisconnect.textContent =
+        link.invalid_frames === undefined
+          ? "—"
+          : `${link.invalid_frames} / ${link.last_disconnect_reason_text || "无"}`;
+      elements.linkRetransmissions.textContent =
+        link.link_layer_retransmissions_note || "不可直接读取";
+      elements.linkGatewayQueue.textContent =
+        link.gateway_queue_drops === undefined
+          ? "—"
+          : `${link.gateway_queue_drops} / ${optionalFixed(link.age_seconds, 1, " s")}`;
       if (control.last_command) {
         elements.commandResult.textContent =
           `最近命令：${control.last_command} · ${control.last_result || "—"}`;

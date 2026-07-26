@@ -21,11 +21,15 @@ GATEWAY_FRAME_VERSION = 1
 GATEWAY_FRAME_MOTION_DATA = 0x10
 GATEWAY_FRAME_CONTROL_REQUEST = 0x20
 GATEWAY_FRAME_CONTROL_RESPONSE = 0x21
+GATEWAY_FRAME_LINK_DIAGNOSTIC = 0x30
 GATEWAY_HEADER_SIZE = 10
 GATEWAY_CRC_SIZE = 4
 GATEWAY_MAX_RAW_FRAME_SIZE = 114
 GATEWAY_MAX_ENCODED_SIZE = 115
 MOTION_CONTROL_VERSION = 1
+LINK_DIAGNOSTIC_VERSION = 2
+LINK_DIAGNOSTIC_V1_PAYLOAD_SIZE = 44
+LINK_DIAGNOSTIC_PAYLOAD_SIZE = 64
 
 
 class MotionCommand(IntEnum):
@@ -86,6 +90,7 @@ class GatewayFrame:
     frame_type: int
     motion: MotionFrame | None = None
     control_response: "ControlResponse | None" = None
+    link_diagnostic: "LinkDiagnostic | None" = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +100,41 @@ class ControlResponse:
     request_id: int
     result: int
     payload: bytes
+
+
+@dataclass(frozen=True)
+class LinkDiagnostic:
+    device_id: int
+    connected: bool
+    ready: bool
+    rssi_valid: bool
+    rssi_dbm: int | None
+    connection_interval_units: int
+    connection_interval_ms: float | None
+    last_disconnect_reason: int
+    receive_rate_1s_pps: float
+    receive_rate_10s_pps: float
+    received_frames: int
+    sequence_gap_frames: int
+    invalid_frames: int
+    connect_count: int
+    disconnect_count: int
+    connection_update_count: int
+    gateway_uptime_ms: int
+    gateway_queue_drops: int
+    att_mtu: int | None
+    dle_requested: bool
+    dle_valid: bool
+    max_tx_octets: int | None
+    max_tx_time_us: int | None
+    max_rx_octets: int | None
+    max_rx_time_us: int | None
+    phy_valid: bool
+    tx_phy: int | None
+    rx_phy: int | None
+    dle_request_result: int | None
+    phy_read_result: int | None
+    dle_update_count: int
 
 
 class CobsDecodeError(ValueError):
@@ -243,6 +283,7 @@ def decode_gateway_frame(raw: bytes) -> GatewayFrame:
     if frame_type not in {
         GATEWAY_FRAME_MOTION_DATA,
         GATEWAY_FRAME_CONTROL_RESPONSE,
+        GATEWAY_FRAME_LINK_DIAGNOSTIC,
     }:
         raise GatewayFrameError("unsupported gateway frame type")
     if reserved != 0:
@@ -268,6 +309,133 @@ def decode_gateway_frame(raw: bytes) -> GatewayFrame:
             gateway_sequence=gateway_sequence,
             frame_type=frame_type,
             motion=decode_motion_packet(payload),
+        )
+
+    if frame_type == GATEWAY_FRAME_LINK_DIAGNOSTIC:
+        if payload_length not in (
+            LINK_DIAGNOSTIC_V1_PAYLOAD_SIZE,
+            LINK_DIAGNOSTIC_PAYLOAD_SIZE,
+        ):
+            raise GatewayFrameError(
+                "unexpected link diagnostic payload length"
+            )
+        (
+            diagnostic_version,
+            device_id,
+            flags,
+            rssi_dbm,
+            connection_interval_units,
+            last_disconnect_reason,
+            receive_rate_1s_centi,
+            receive_rate_10s_centi,
+            received_frames,
+            sequence_gap_frames,
+            invalid_frames,
+            connect_count,
+            disconnect_count,
+            connection_update_count,
+            gateway_uptime_ms,
+            gateway_queue_drops,
+        ) = struct.unpack(
+            "<BBBbHHHHIIIIIIII",
+            payload[:LINK_DIAGNOSTIC_V1_PAYLOAD_SIZE],
+        )
+        if diagnostic_version == 1:
+            if payload_length != LINK_DIAGNOSTIC_V1_PAYLOAD_SIZE:
+                raise GatewayFrameError(
+                    "unexpected v1 link diagnostic payload length"
+                )
+            att_mtu = None
+            dle_requested = False
+            dle_valid = False
+            max_tx_octets = None
+            max_tx_time_us = None
+            max_rx_octets = None
+            max_rx_time_us = None
+            phy_valid = False
+            tx_phy = None
+            rx_phy = None
+            dle_request_result = None
+            phy_read_result = None
+            dle_update_count = 0
+        elif diagnostic_version == LINK_DIAGNOSTIC_VERSION:
+            if payload_length != LINK_DIAGNOSTIC_PAYLOAD_SIZE:
+                raise GatewayFrameError(
+                    "unexpected v2 link diagnostic payload length"
+                )
+            (
+                raw_att_mtu,
+                raw_max_tx_octets,
+                raw_max_tx_time_us,
+                raw_max_rx_octets,
+                raw_max_rx_time_us,
+                raw_tx_phy,
+                raw_rx_phy,
+                raw_dle_request_result,
+                raw_phy_read_result,
+                dle_update_count,
+            ) = struct.unpack("<HHHHHBBhhI", payload[44:])
+            mtu_valid = bool(flags & 0x08)
+            dle_requested = bool(flags & 0x10)
+            dle_valid = bool(flags & 0x20)
+            phy_valid = bool(flags & 0x40)
+            att_mtu = raw_att_mtu if mtu_valid else None
+            max_tx_octets = raw_max_tx_octets if dle_valid else None
+            max_tx_time_us = raw_max_tx_time_us if dle_valid else None
+            max_rx_octets = raw_max_rx_octets if dle_valid else None
+            max_rx_time_us = raw_max_rx_time_us if dle_valid else None
+            tx_phy = raw_tx_phy if phy_valid else None
+            rx_phy = raw_rx_phy if phy_valid else None
+            dle_request_result = (
+                raw_dle_request_result if dle_requested else None
+            )
+            phy_read_result = raw_phy_read_result
+        else:
+            raise GatewayFrameError(
+                "unsupported link diagnostic version"
+            )
+        rssi_valid = bool(flags & 0x04)
+        return GatewayFrame(
+            gateway_id=gateway_id,
+            gateway_sequence=gateway_sequence,
+            frame_type=frame_type,
+            link_diagnostic=LinkDiagnostic(
+                device_id=device_id,
+                connected=bool(flags & 0x01),
+                ready=bool(flags & 0x02),
+                rssi_valid=rssi_valid,
+                rssi_dbm=rssi_dbm if rssi_valid else None,
+                connection_interval_units=connection_interval_units,
+                connection_interval_ms=(
+                    connection_interval_units * 1.25
+                    if connection_interval_units
+                    else None
+                ),
+                last_disconnect_reason=last_disconnect_reason,
+                receive_rate_1s_pps=receive_rate_1s_centi / 100.0,
+                receive_rate_10s_pps=receive_rate_10s_centi / 100.0,
+                received_frames=received_frames,
+                sequence_gap_frames=sequence_gap_frames,
+                invalid_frames=invalid_frames,
+                connect_count=connect_count,
+                disconnect_count=disconnect_count,
+                connection_update_count=connection_update_count,
+                gateway_uptime_ms=gateway_uptime_ms,
+                gateway_queue_drops=gateway_queue_drops,
+                att_mtu=att_mtu,
+                dle_requested=dle_requested,
+                dle_valid=dle_valid,
+                max_tx_octets=max_tx_octets,
+                max_tx_time_us=max_tx_time_us,
+                max_rx_octets=max_rx_octets,
+                max_rx_time_us=max_rx_time_us,
+                phy_valid=phy_valid,
+                tx_phy=tx_phy,
+                rx_phy=rx_phy,
+                dle_request_result=dle_request_result,
+                phy_read_result=phy_read_result,
+                dle_update_count=dle_update_count,
+            ),
         )
 
     if payload_length < 6:

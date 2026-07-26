@@ -5,6 +5,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 
 #include "driver/usb_serial_jtag.h"
@@ -22,13 +23,14 @@
 #define TARGET_DEVICE_NAME       "SmartBlock"
 #define SCAN_DURATION_MS         BLE_HS_FOREVER
 #define CONNECT_TIMEOUT_MS       30000
-#define MAX_MAHJONG_CONNECTIONS  1U
+#define MAX_MAHJONG_CONNECTIONS  4U
 #define INVALID_PEER_INDEX       UINT8_MAX
 #define GATEWAY_ID               0U
 #define GATEWAY_FRAME_VERSION    1U
 #define GATEWAY_FRAME_MOTION     0x10U
 #define GATEWAY_FRAME_CONTROL_REQUEST  0x20U
 #define GATEWAY_FRAME_CONTROL_RESPONSE 0x21U
+#define GATEWAY_FRAME_LINK_DIAGNOSTIC  0x30U
 #define GATEWAY_HEADER_SIZE      10U
 #define GATEWAY_CRC_SIZE         4U
 #define GATEWAY_MAX_PAYLOAD_SIZE MOTION_PACKET_SIZE
@@ -39,11 +41,27 @@
 #define GATEWAY_USB_RX_BUFFER    256U
 #define GATEWAY_USB_TX_BUFFER    32768U
 #define GATEWAY_USB_WRITE_WAIT_MS 1000U
+#define LINK_DIAGNOSTIC_VERSION  2U
+#define LINK_DIAGNOSTIC_PAYLOAD_SIZE 64U
+#define LINK_DIAGNOSTIC_PERIOD_MS 1000U
+#define LINK_RATE_WINDOW_SIZE    10U
+#define LINK_FLAG_CONNECTED      0x01U
+#define LINK_FLAG_READY          0x02U
+#define LINK_FLAG_RSSI_VALID     0x04U
+#define LINK_FLAG_MTU_VALID      0x08U
+#define LINK_FLAG_DLE_REQUESTED  0x10U
+#define LINK_FLAG_DLE_VALID      0x20U
+#define LINK_FLAG_PHY_VALID      0x40U
+#define LINK_DLE_TX_OCTETS       251U
+#define LINK_DLE_TX_TIME_US      2120U
 #define MOTION_CONTROL_VERSION   1U
 #define MOTION_CONTROL_HEADER_SIZE 4U
 #define MOTION_RESPONSE_HEADER_SIZE 5U
 #define MOTION_CONTROL_MAX_SIZE  20U
 #define MOTION_RESPONSE_MAX_SIZE 53U
+#define MOTION_CMD_START_STREAM  0x01U
+#define MOTION_CMD_STOP_STREAM   0x02U
+#define MOTION_RESULT_SUCCESS    0U
 #define MOTION_RESULT_BUSY       3U
 #define MOTION_RESULT_DEVICE_OFFLINE 5U
 #define MOTION_RESULT_GATEWAY_ERROR 6U
@@ -62,7 +80,7 @@ typedef struct {
     uint8_t expected_device_id;
 } mahjong_target_t;
 
-/* Single-node closure target: nRF52832 device 1. */
+/* Gateway A fixed targets: nRF52832 devices 1 through 4. */
 static const mahjong_target_t TARGETS[] = {
     {
         .addr = {
@@ -71,6 +89,27 @@ static const mahjong_target_t TARGETS[] = {
         },
         .expected_device_id = 1,
     },
+    {
+        .addr = {
+            .type = BLE_ADDR_RANDOM,
+            .val = {0x27, 0x17, 0xe7, 0xf9, 0xf1, 0xff},
+        },
+        .expected_device_id = 2,
+    },
+    {
+        .addr = {
+            .type = BLE_ADDR_RANDOM,
+            .val = {0xf1, 0x03, 0x67, 0xf3, 0xcb, 0xdc},
+        },
+        .expected_device_id = 3,
+    },
+    {
+        .addr = {
+            .type = BLE_ADDR_RANDOM,
+            .val = {0xf0, 0xe3, 0x27, 0x25, 0x8e, 0xfd},
+        },
+        .expected_device_id = 4,
+    },
 };
 
 #define TARGET_COUNT (sizeof(TARGETS) / sizeof(TARGETS[0]))
@@ -78,17 +117,37 @@ static const mahjong_target_t TARGETS[] = {
 _Static_assert(TARGET_COUNT <= MAX_MAHJONG_CONNECTIONS,
                "TARGETS exceeds MAX_MAHJONG_CONNECTIONS");
 
-/* One 25 packet/s motion stream fits comfortably at a 20 ms interval. */
-static const struct ble_gap_conn_params TARGET_CONN_PARAMS = {
-    .scan_itvl = BLE_GAP_SCAN_FAST_INTERVAL_MIN,
-    .scan_window = BLE_GAP_SCAN_FAST_WINDOW,
-    .itvl_min = BLE_GAP_CONN_ITVL_MS(20),
-    .itvl_max = BLE_GAP_CONN_ITVL_MS(20),
-    .latency = 0,
-    .supervision_timeout = BLE_GAP_SUPERVISION_TIMEOUT_MS(4000),
-    .min_ce_len = 0,
-    .max_ce_len = 0,
+/*
+ * Seed the four connection anchors with different initial intervals.  Each
+ * nRF requests its 30 ms preferred interval after five seconds, so the steady
+ * state is still 30 ms on every link without creating four coincident anchors
+ * during initial connection establishment.
+ *
+ * A 100-byte notification plus weak-signal retries fits in the 5 ms
+ * connection-event cap after the 189-octet DLE negotiation. Four links still
+ * consume at most 20 ms of each 30 ms scheduling period.
+ */
+#define TARGET_CONN_PARAMS_ENTRY(interval_ms)                 \
+    {                                                         \
+        .scan_itvl = BLE_GAP_SCAN_FAST_INTERVAL_MIN,          \
+        .scan_window = BLE_GAP_SCAN_FAST_WINDOW,               \
+        .itvl_min = BLE_GAP_CONN_ITVL_MS(interval_ms),         \
+        .itvl_max = BLE_GAP_CONN_ITVL_MS(interval_ms),         \
+        .latency = 0,                                          \
+        .supervision_timeout =                                 \
+            BLE_GAP_SUPERVISION_TIMEOUT_MS(4000),              \
+        .min_ce_len = 0,                                       \
+        .max_ce_len = 8,                                       \
+    }
+
+static const struct ble_gap_conn_params TARGET_CONN_PARAMS[TARGET_COUNT] = {
+    TARGET_CONN_PARAMS_ENTRY(30),
+    TARGET_CONN_PARAMS_ENTRY(32.5),
+    TARGET_CONN_PARAMS_ENTRY(35),
+    TARGET_CONN_PARAMS_ENTRY(37.5),
 };
+
+#undef TARGET_CONN_PARAMS_ENTRY
 
 /* NimBLE stores 128-bit UUID bytes in little-endian order. */
 static const ble_uuid_t *MOTION_SERVICE_UUID =
@@ -141,6 +200,36 @@ typedef struct {
 } mahjong_peer_t;
 
 typedef struct {
+    bool connected;
+    bool ready;
+    uint16_t conn_handle;
+    uint16_t conn_interval_units;
+    int8_t rssi;
+    bool rssi_valid;
+    uint16_t last_disconnect_reason;
+    uint32_t received_frames;
+    uint32_t lost_frames;
+    uint32_t invalid_frames;
+    uint32_t connect_count;
+    uint32_t disconnect_count;
+    uint32_t conn_update_count;
+    uint16_t att_mtu;
+    bool mtu_valid;
+    bool dle_requested;
+    bool dle_valid;
+    uint16_t max_tx_octets;
+    uint16_t max_tx_time;
+    uint16_t max_rx_octets;
+    uint16_t max_rx_time;
+    uint8_t tx_phy;
+    uint8_t rx_phy;
+    bool phy_valid;
+    int16_t dle_request_result;
+    int16_t phy_read_result;
+    uint32_t dle_update_count;
+} link_diagnostic_stats_t;
+
+typedef struct {
     uint8_t target_index;
     bool has_board_info;
     uint8_t board_no;
@@ -154,6 +243,8 @@ static mahjong_peer_t s_peers[MAX_MAHJONG_CONNECTIONS];
 static QueueHandle_t s_gateway_tx_queue;
 static uint32_t s_gateway_sequence;
 static volatile uint32_t s_gateway_queue_drops;
+static link_diagnostic_stats_t s_link_stats[TARGET_COUNT];
+static portMUX_TYPE s_link_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct {
     uint8_t frame_type;
@@ -171,6 +262,7 @@ static int service_discovery_cb(uint16_t conn_handle,
                                 const struct ble_gatt_svc *service,
                                 void *arg);
 static void gateway_usb_rx_task(void *param);
+static void link_diagnostic_task(void *param);
 
 static void gateway_put_le16(uint8_t *dst, uint16_t value)
 {
@@ -197,6 +289,143 @@ static uint32_t gateway_get_le32(const uint8_t *src)
            ((uint32_t)src[1] << 8) |
            ((uint32_t)src[2] << 16) |
            ((uint32_t)src[3] << 24);
+}
+
+static void link_stats_snapshot(uint8_t target_index,
+                                link_diagnostic_stats_t *snapshot)
+{
+    portENTER_CRITICAL(&s_link_stats_mux);
+    *snapshot = s_link_stats[target_index];
+    portEXIT_CRITICAL(&s_link_stats_mux);
+}
+
+static void link_stats_on_connect(uint8_t target_index,
+                                  uint16_t conn_handle,
+                                  uint16_t conn_interval_units)
+{
+    portENTER_CRITICAL(&s_link_stats_mux);
+    s_link_stats[target_index].connected = true;
+    s_link_stats[target_index].ready = false;
+    s_link_stats[target_index].conn_handle = conn_handle;
+    s_link_stats[target_index].conn_interval_units = conn_interval_units;
+    s_link_stats[target_index].rssi_valid = false;
+    s_link_stats[target_index].att_mtu = 0U;
+    s_link_stats[target_index].mtu_valid = false;
+    s_link_stats[target_index].dle_requested = false;
+    s_link_stats[target_index].dle_valid = false;
+    s_link_stats[target_index].max_tx_octets = 0U;
+    s_link_stats[target_index].max_tx_time = 0U;
+    s_link_stats[target_index].max_rx_octets = 0U;
+    s_link_stats[target_index].max_rx_time = 0U;
+    s_link_stats[target_index].tx_phy = 0U;
+    s_link_stats[target_index].rx_phy = 0U;
+    s_link_stats[target_index].phy_valid = false;
+    s_link_stats[target_index].dle_request_result = 0;
+    s_link_stats[target_index].phy_read_result = 0;
+    s_link_stats[target_index].connect_count++;
+    portEXIT_CRITICAL(&s_link_stats_mux);
+}
+
+static void link_stats_on_ready(uint8_t target_index)
+{
+    portENTER_CRITICAL(&s_link_stats_mux);
+    s_link_stats[target_index].ready = true;
+    portEXIT_CRITICAL(&s_link_stats_mux);
+}
+
+static void link_stats_on_disconnect(uint8_t target_index, int reason)
+{
+    portENTER_CRITICAL(&s_link_stats_mux);
+    s_link_stats[target_index].connected = false;
+    s_link_stats[target_index].ready = false;
+    s_link_stats[target_index].rssi_valid = false;
+    s_link_stats[target_index].last_disconnect_reason = (uint16_t)reason;
+    s_link_stats[target_index].disconnect_count++;
+    portEXIT_CRITICAL(&s_link_stats_mux);
+}
+
+static void link_stats_on_conn_update(uint8_t target_index,
+                                      uint16_t conn_interval_units)
+{
+    portENTER_CRITICAL(&s_link_stats_mux);
+    s_link_stats[target_index].conn_interval_units = conn_interval_units;
+    s_link_stats[target_index].conn_update_count++;
+    portEXIT_CRITICAL(&s_link_stats_mux);
+}
+
+static void link_stats_on_mtu(uint8_t target_index, uint16_t att_mtu)
+{
+    portENTER_CRITICAL(&s_link_stats_mux);
+    s_link_stats[target_index].att_mtu = att_mtu;
+    s_link_stats[target_index].mtu_valid = true;
+    portEXIT_CRITICAL(&s_link_stats_mux);
+}
+
+static void link_stats_on_dle_request(uint8_t target_index, int result)
+{
+    portENTER_CRITICAL(&s_link_stats_mux);
+    s_link_stats[target_index].dle_requested = true;
+    s_link_stats[target_index].dle_request_result = (int16_t)result;
+    portEXIT_CRITICAL(&s_link_stats_mux);
+}
+
+static void link_stats_on_dle_update(uint8_t target_index,
+                                     uint16_t max_tx_octets,
+                                     uint16_t max_tx_time,
+                                     uint16_t max_rx_octets,
+                                     uint16_t max_rx_time)
+{
+    portENTER_CRITICAL(&s_link_stats_mux);
+    s_link_stats[target_index].dle_valid = true;
+    s_link_stats[target_index].max_tx_octets = max_tx_octets;
+    s_link_stats[target_index].max_tx_time = max_tx_time;
+    s_link_stats[target_index].max_rx_octets = max_rx_octets;
+    s_link_stats[target_index].max_rx_time = max_rx_time;
+    s_link_stats[target_index].dle_update_count++;
+    portEXIT_CRITICAL(&s_link_stats_mux);
+}
+
+static void link_stats_on_phy(uint8_t target_index,
+                              int result,
+                              uint8_t tx_phy,
+                              uint8_t rx_phy)
+{
+    portENTER_CRITICAL(&s_link_stats_mux);
+    s_link_stats[target_index].phy_read_result = (int16_t)result;
+    s_link_stats[target_index].phy_valid = (result == 0);
+    if (result == 0) {
+        s_link_stats[target_index].tx_phy = tx_phy;
+        s_link_stats[target_index].rx_phy = rx_phy;
+    }
+    portEXIT_CRITICAL(&s_link_stats_mux);
+}
+
+static void link_stats_on_motion(uint8_t target_index,
+                                 uint32_t sequence_gap)
+{
+    portENTER_CRITICAL(&s_link_stats_mux);
+    s_link_stats[target_index].received_frames++;
+    s_link_stats[target_index].lost_frames += sequence_gap;
+    portEXIT_CRITICAL(&s_link_stats_mux);
+}
+
+static void link_stats_on_invalid(uint8_t target_index)
+{
+    portENTER_CRITICAL(&s_link_stats_mux);
+    s_link_stats[target_index].invalid_frames++;
+    portEXIT_CRITICAL(&s_link_stats_mux);
+}
+
+static void link_stats_set_rssi(uint8_t target_index,
+                                bool valid,
+                                int8_t rssi)
+{
+    portENTER_CRITICAL(&s_link_stats_mux);
+    s_link_stats[target_index].rssi_valid = valid;
+    if (valid) {
+        s_link_stats[target_index].rssi = rssi;
+    }
+    portEXIT_CRITICAL(&s_link_stats_mux);
 }
 
 static uint32_t gateway_crc32(const uint8_t *data, size_t length)
@@ -352,6 +581,150 @@ static void gateway_usb_tx_task(void *param)
     }
 }
 
+static uint16_t link_rate_centi_packets(uint32_t frame_count,
+                                        uint32_t elapsed_ms)
+{
+    uint64_t rate;
+
+    if (elapsed_ms == 0U) {
+        return 0U;
+    }
+    rate = ((uint64_t)frame_count * 100000ULL +
+            (uint64_t)elapsed_ms / 2ULL) /
+           (uint64_t)elapsed_ms;
+    return rate > UINT16_MAX ? UINT16_MAX : (uint16_t)rate;
+}
+
+static void link_diagnostic_task(void *param)
+{
+    uint32_t last_received[TARGET_COUNT] = {0};
+    uint32_t frame_window[TARGET_COUNT][LINK_RATE_WINDOW_SIZE] = {{0}};
+    uint32_t time_window_ms[TARGET_COUNT][LINK_RATE_WINDOW_SIZE] = {{0}};
+    uint8_t window_index[TARGET_COUNT] = {0};
+    uint8_t window_count[TARGET_COUNT] = {0};
+    TickType_t last_tick = xTaskGetTickCount();
+    TickType_t wake_tick = last_tick;
+    link_diagnostic_stats_t stats;
+    uint8_t payload[LINK_DIAGNOSTIC_PAYLOAD_SIZE];
+    uint8_t target_index;
+    uint8_t slot;
+    uint8_t flags;
+    uint32_t elapsed_ms;
+    uint32_t received_delta;
+    uint32_t window_frames;
+    uint32_t window_ms;
+    uint16_t rate_1s_centi;
+    uint16_t rate_10s_centi;
+    int8_t rssi;
+    int rc;
+
+    (void)param;
+    for (;;) {
+        vTaskDelayUntil(&wake_tick,
+                        pdMS_TO_TICKS(LINK_DIAGNOSTIC_PERIOD_MS));
+        TickType_t current_tick = xTaskGetTickCount();
+        elapsed_ms = (uint32_t)((current_tick - last_tick) *
+                                portTICK_PERIOD_MS);
+        if (elapsed_ms == 0U) {
+            elapsed_ms = LINK_DIAGNOSTIC_PERIOD_MS;
+        }
+        last_tick = current_tick;
+
+        for (target_index = 0U; target_index < TARGET_COUNT;
+             target_index++) {
+            link_stats_snapshot(target_index, &stats);
+            if (stats.connected) {
+                rssi = 0;
+                rc = ble_gap_conn_rssi(stats.conn_handle, &rssi);
+                link_stats_set_rssi(target_index, rc == 0, rssi);
+            } else {
+                link_stats_set_rssi(target_index, false, 0);
+            }
+            link_stats_snapshot(target_index, &stats);
+
+            received_delta =
+                stats.received_frames - last_received[target_index];
+            last_received[target_index] = stats.received_frames;
+            slot = window_index[target_index];
+            frame_window[target_index][slot] = received_delta;
+            time_window_ms[target_index][slot] = elapsed_ms;
+            window_index[target_index] =
+                (uint8_t)((slot + 1U) % LINK_RATE_WINDOW_SIZE);
+            if (window_count[target_index] < LINK_RATE_WINDOW_SIZE) {
+                window_count[target_index]++;
+            }
+
+            window_frames = 0U;
+            window_ms = 0U;
+            for (slot = 0U; slot < window_count[target_index]; slot++) {
+                window_frames += frame_window[target_index][slot];
+                window_ms += time_window_ms[target_index][slot];
+            }
+            rate_1s_centi =
+                link_rate_centi_packets(received_delta, elapsed_ms);
+            rate_10s_centi =
+                link_rate_centi_packets(window_frames, window_ms);
+
+            flags = 0U;
+            if (stats.connected) {
+                flags |= LINK_FLAG_CONNECTED;
+            }
+            if (stats.ready) {
+                flags |= LINK_FLAG_READY;
+            }
+            if (stats.rssi_valid) {
+                flags |= LINK_FLAG_RSSI_VALID;
+            }
+            if (stats.mtu_valid) {
+                flags |= LINK_FLAG_MTU_VALID;
+            }
+            if (stats.dle_requested) {
+                flags |= LINK_FLAG_DLE_REQUESTED;
+            }
+            if (stats.dle_valid) {
+                flags |= LINK_FLAG_DLE_VALID;
+            }
+            if (stats.phy_valid) {
+                flags |= LINK_FLAG_PHY_VALID;
+            }
+
+            memset(payload, 0, sizeof(payload));
+            payload[0] = LINK_DIAGNOSTIC_VERSION;
+            payload[1] = TARGETS[target_index].expected_device_id;
+            payload[2] = flags;
+            payload[3] = (uint8_t)stats.rssi;
+            gateway_put_le16(&payload[4], stats.conn_interval_units);
+            gateway_put_le16(&payload[6], stats.last_disconnect_reason);
+            gateway_put_le16(&payload[8], rate_1s_centi);
+            gateway_put_le16(&payload[10], rate_10s_centi);
+            gateway_put_le32(&payload[12], stats.received_frames);
+            gateway_put_le32(&payload[16], stats.lost_frames);
+            gateway_put_le32(&payload[20], stats.invalid_frames);
+            gateway_put_le32(&payload[24], stats.connect_count);
+            gateway_put_le32(&payload[28], stats.disconnect_count);
+            gateway_put_le32(&payload[32], stats.conn_update_count);
+            gateway_put_le32(&payload[36],
+                             (uint32_t)(esp_timer_get_time() / 1000ULL));
+            gateway_put_le32(&payload[40], s_gateway_queue_drops);
+            gateway_put_le16(&payload[44], stats.att_mtu);
+            gateway_put_le16(&payload[46], stats.max_tx_octets);
+            gateway_put_le16(&payload[48], stats.max_tx_time);
+            gateway_put_le16(&payload[50], stats.max_rx_octets);
+            gateway_put_le16(&payload[52], stats.max_rx_time);
+            payload[54] = stats.tx_phy;
+            payload[55] = stats.rx_phy;
+            gateway_put_le16(&payload[56],
+                             (uint16_t)stats.dle_request_result);
+            gateway_put_le16(&payload[58],
+                             (uint16_t)stats.phy_read_result);
+            gateway_put_le32(&payload[60], stats.dle_update_count);
+            (void)gateway_queue_frame(GATEWAY_FRAME_LINK_DIAGNOSTIC,
+                                      payload,
+                                      sizeof(payload));
+        }
+    }
+}
+
 static void gateway_usb_init(void)
 {
     usb_serial_jtag_driver_config_t config = {
@@ -381,6 +754,14 @@ static void gateway_usb_init(void)
                     4096,
                     NULL,
                     8,
+                    NULL) != pdPASS) {
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
+    if (xTaskCreate(link_diagnostic_task,
+                    "link_diagnostic",
+                    4096,
+                    NULL,
+                    7,
                     NULL) != pdPASS) {
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
@@ -680,16 +1061,20 @@ static void consume_notification(mahjong_peer_t *peer, struct os_mbuf *om)
     motion_packet_t packet;
     uint16_t expected_sequence;
     uint16_t sequence_gap;
+    uint32_t link_sequence_gap = 0U;
     uint8_t expected_device_id = TARGETS[peer->target_index].expected_device_id;
 
     if (packet_len != sizeof(packet_bytes)) {
         peer->invalid_frames++;
+        link_stats_on_invalid(peer->target_index);
         ESP_LOGW(TAG, "Invalid notification length: conn=%u length=%u",
                  peer->conn_handle, packet_len);
         return;
     }
 
     if (os_mbuf_copydata(om, 0, packet_len, packet_bytes) != 0) {
+        peer->invalid_frames++;
+        link_stats_on_invalid(peer->target_index);
         ESP_LOGE(TAG, "Failed to copy notification payload: conn=%u",
                  peer->conn_handle);
         return;
@@ -697,6 +1082,7 @@ static void consume_notification(mahjong_peer_t *peer, struct os_mbuf *om)
 
     if (!motion_packet_decode(packet_bytes, packet_len, &packet)) {
         peer->invalid_frames++;
+        link_stats_on_invalid(peer->target_index);
         ESP_LOGW(TAG, "Invalid Motion V1 packet header: conn=%u",
                  peer->conn_handle);
         return;
@@ -704,6 +1090,7 @@ static void consume_notification(mahjong_peer_t *peer, struct os_mbuf *om)
 
     if (packet.device_id != expected_device_id) {
         peer->invalid_frames++;
+        link_stats_on_invalid(peer->target_index);
         ESP_LOGW(TAG,
                  "Unexpected device id: conn=%u expected=%u actual=%u",
                  peer->conn_handle, expected_device_id, packet.device_id);
@@ -717,6 +1104,7 @@ static void consume_notification(mahjong_peer_t *peer, struct os_mbuf *om)
                 (uint16_t)(packet.packet_sequence - expected_sequence);
             if (sequence_gap < 0x8000U) {
                 peer->lost_frames += sequence_gap;
+                link_sequence_gap = sequence_gap;
                 ESP_LOGW(TAG,
                          "Sequence gap: conn=%u id=%u expected=%u actual=%u "
                          "lost=%u total_lost=%lu",
@@ -736,6 +1124,7 @@ static void consume_notification(mahjong_peer_t *peer, struct os_mbuf *om)
     peer->has_sequence = true;
     peer->last_sequence = packet.packet_sequence;
     peer->received_frames++;
+    link_stats_on_motion(peer->target_index, link_sequence_gap);
 
     (void)gateway_queue_frame(GATEWAY_FRAME_MOTION,
                               packet_bytes,
@@ -753,15 +1142,19 @@ static void consume_status_notification(mahjong_peer_t *peer,
     if (response_length < MOTION_RESPONSE_HEADER_SIZE ||
         response_length > MOTION_RESPONSE_MAX_SIZE) {
         peer->invalid_frames++;
+        link_stats_on_invalid(peer->target_index);
         return;
     }
     if (os_mbuf_copydata(om, 0, response_length, &payload[1]) != 0) {
+        peer->invalid_frames++;
+        link_stats_on_invalid(peer->target_index);
         return;
     }
     if (payload[1] != MOTION_CONTROL_VERSION ||
         response_length !=
             (uint16_t)(MOTION_RESPONSE_HEADER_SIZE + payload[5])) {
         peer->invalid_frames++;
+        link_stats_on_invalid(peer->target_index);
         return;
     }
 
@@ -769,6 +1162,17 @@ static void consume_status_notification(mahjong_peer_t *peer,
     if (peer->command_in_flight &&
         payload[2] == (uint8_t)(peer->pending_command | 0x80U) &&
         payload[3] == peer->pending_request_id) {
+        if (payload[4] == MOTION_RESULT_SUCCESS &&
+            (peer->pending_command == MOTION_CMD_START_STREAM ||
+             peer->pending_command == MOTION_CMD_STOP_STREAM)) {
+            /*
+             * Sampling continues while streaming is stopped, so the next
+             * transmitted packet legitimately has a later sequence number.
+             * Establish a new baseline instead of reporting the intentional
+             * pause as an over-the-air sequence gap.
+             */
+            peer->has_sequence = false;
+        }
         peer->command_in_flight = false;
     }
     (void)gateway_queue_frame(GATEWAY_FRAME_CONTROL_RESPONSE,
@@ -796,6 +1200,7 @@ static int mtu_exchange_cb(uint16_t conn_handle,
         return 0;
     }
 
+    link_stats_on_mtu(peer->target_index, mtu);
     ESP_LOGI(TAG, "MTU ready: conn=%u mtu=%u", conn_handle, mtu);
     rc = ble_gattc_disc_svc_by_uuid(conn_handle,
                                     MOTION_SERVICE_UUID,
@@ -859,6 +1264,7 @@ static int status_subscribe_write_cb(uint16_t conn_handle,
     }
 
     peer->state = PEER_READY;
+    link_stats_on_ready(peer->target_index);
     format_addr(&peer->addr, addr, sizeof(addr));
     ESP_LOGI(TAG,
              "Motion/control notifications enabled: addr=%s conn=%u "
@@ -1157,7 +1563,8 @@ static void connect_target(const struct ble_gap_disc_desc *disc,
     s_scanning = false;
 
     rc = ble_gap_connect(s_own_addr_type, &peer->addr, CONNECT_TIMEOUT_MS,
-                         &TARGET_CONN_PARAMS, gap_event_handler, NULL);
+                         &TARGET_CONN_PARAMS[peer->target_index],
+                         gap_event_handler, peer);
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to start connection: addr=%s rc=%d", addr, rc);
         reset_peer(peer);
@@ -1201,6 +1608,10 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
     struct ble_gap_conn_desc desc;
     mahjong_peer_t *peer;
     char addr[18];
+    uint8_t tx_phy;
+    uint8_t rx_phy;
+    int dle_rc;
+    int phy_rc;
     int rc;
 
     (void)arg;
@@ -1235,6 +1646,24 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
         if (rc == 0) {
             peer->addr = desc.peer_ota_addr;
         }
+        link_stats_on_connect(peer->target_index,
+                              peer->conn_handle,
+                              rc == 0 ? desc.conn_itvl : 0U);
+        dle_rc = ble_gap_set_data_len(peer->conn_handle,
+                                      LINK_DLE_TX_OCTETS,
+                                      LINK_DLE_TX_TIME_US);
+        link_stats_on_dle_request(peer->target_index, dle_rc);
+        if (dle_rc != 0) {
+            ESP_LOGW(TAG,
+                     "DLE request failed: conn=%u id=%u rc=%d",
+                     peer->conn_handle,
+                     TARGETS[peer->target_index].expected_device_id,
+                     dle_rc);
+        }
+        tx_phy = 0U;
+        rx_phy = 0U;
+        phy_rc = ble_gap_read_le_phy(peer->conn_handle, &tx_phy, &rx_phy);
+        link_stats_on_phy(peer->target_index, phy_rc, tx_phy, rx_phy);
         format_addr(&peer->addr, addr, sizeof(addr));
         ESP_LOGI(TAG, "Connected: addr=%s conn=%u id=%u active=%u/%u",
                  addr, peer->conn_handle,
@@ -1277,8 +1706,55 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
                 peer->pending_request_id,
                 MOTION_RESULT_DEVICE_OFFLINE);
         }
+        link_stats_on_disconnect(peer->target_index,
+                                 event->disconnect.reason);
         reset_peer(peer);
         start_scan();
+        return 0;
+
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        peer = find_peer_by_conn_handle(event->conn_update.conn_handle);
+        if (peer != NULL && event->conn_update.status == 0 &&
+            ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
+            link_stats_on_conn_update(peer->target_index, desc.conn_itvl);
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_DATA_LEN_CHG:
+        /*
+         * ESP-IDF 5.2.3's NimBLE host dispatches the correct connection
+         * callback but does not populate data_len_chg.conn_handle for the
+         * controller event. Use the per-connection callback argument first.
+         */
+        peer = (mahjong_peer_t *)arg;
+        if (peer == NULL || peer->state == PEER_FREE) {
+            peer = find_peer_by_conn_handle(
+                event->data_len_chg.conn_handle);
+        }
+        if (peer != NULL && peer->state != PEER_FREE) {
+            link_stats_on_dle_update(peer->target_index,
+                                     event->data_len_chg.max_tx_octets,
+                                     event->data_len_chg.max_tx_time,
+                                     event->data_len_chg.max_rx_octets,
+                                     event->data_len_chg.max_rx_time);
+            ESP_LOGI(TAG,
+                     "DLE ready: conn=%u tx=%u/%uus rx=%u/%uus",
+                     peer->conn_handle,
+                     event->data_len_chg.max_tx_octets,
+                     event->data_len_chg.max_tx_time,
+                     event->data_len_chg.max_rx_octets,
+                     event->data_len_chg.max_rx_time);
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE:
+        peer = find_peer_by_conn_handle(event->phy_updated.conn_handle);
+        if (peer != NULL) {
+            link_stats_on_phy(peer->target_index,
+                              event->phy_updated.status,
+                              event->phy_updated.tx_phy,
+                              event->phy_updated.rx_phy);
+        }
         return 0;
 
     case BLE_GAP_EVENT_DISC_COMPLETE:
@@ -1300,6 +1776,10 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_MTU:
+        peer = find_peer_by_conn_handle(event->mtu.conn_handle);
+        if (peer != NULL) {
+            link_stats_on_mtu(peer->target_index, event->mtu.value);
+        }
         ESP_LOGI(TAG, "MTU updated: conn=%u mtu=%u",
                  event->mtu.conn_handle, event->mtu.value);
         return 0;
@@ -1311,7 +1791,16 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
 
 static void ble_on_reset(int reason)
 {
+    uint8_t target_index;
+    link_diagnostic_stats_t stats;
+
     ESP_LOGE(TAG, "NimBLE host reset: reason=%d", reason);
+    for (target_index = 0U; target_index < TARGET_COUNT; target_index++) {
+        link_stats_snapshot(target_index, &stats);
+        if (stats.connected) {
+            link_stats_on_disconnect(target_index, reason);
+        }
+    }
     reset_all_peers();
 }
 

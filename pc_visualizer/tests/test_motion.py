@@ -161,6 +161,98 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(control.request_id, 11)
         self.assertEqual(control.payload, status_payload)
 
+    def test_gateway_link_diagnostic_decoding(self) -> None:
+        payload = struct.pack(
+            "<BBBbHHHHIIIIIIII",
+            1,
+            3,
+            0x07,
+            -57,
+            16,
+            0x0208,
+            2498,
+            2501,
+            12345,
+            67,
+            2,
+            4,
+            3,
+            1,
+            98765,
+            5,
+        )
+        encoded = encode_gateway_payload(0x30, payload)
+        frames = GatewayStreamDecoder().feed(encoded)
+
+        self.assertEqual(len(frames), 1)
+        link = frames[0].link_diagnostic
+        self.assertIsNotNone(link)
+        assert link is not None
+        self.assertEqual(link.device_id, 3)
+        self.assertTrue(link.connected)
+        self.assertTrue(link.ready)
+        self.assertEqual(link.rssi_dbm, -57)
+        self.assertEqual(link.connection_interval_ms, 20.0)
+        self.assertEqual(link.receive_rate_1s_pps, 24.98)
+        self.assertEqual(link.receive_rate_10s_pps, 25.01)
+        self.assertEqual(link.sequence_gap_frames, 67)
+        self.assertEqual(link.disconnect_count, 3)
+        self.assertEqual(link.gateway_queue_drops, 5)
+        self.assertIsNone(link.att_mtu)
+        self.assertFalse(link.dle_valid)
+        self.assertIsNone(link.tx_phy)
+
+    def test_gateway_link_diagnostic_v2_decoding(self) -> None:
+        payload = struct.pack(
+            "<BBBbHHHHIIIIIIIIHHHHHBBhhI",
+            2,
+            1,
+            0x7F,
+            -61,
+            16,
+            0,
+            2500,
+            2499,
+            20000,
+            12,
+            0,
+            2,
+            1,
+            0,
+            456789,
+            0,
+            185,
+            251,
+            2120,
+            251,
+            2120,
+            1,
+            1,
+            0,
+            0,
+            1,
+        )
+        encoded = encode_gateway_payload(0x30, payload)
+        frames = GatewayStreamDecoder().feed(encoded)
+
+        self.assertEqual(len(frames), 1)
+        link = frames[0].link_diagnostic
+        self.assertIsNotNone(link)
+        assert link is not None
+        self.assertEqual(link.device_id, 1)
+        self.assertEqual(link.att_mtu, 185)
+        self.assertTrue(link.dle_requested)
+        self.assertTrue(link.dle_valid)
+        self.assertEqual(link.max_tx_octets, 251)
+        self.assertEqual(link.max_tx_time_us, 2120)
+        self.assertEqual(link.max_rx_octets, 251)
+        self.assertEqual(link.max_rx_time_us, 2120)
+        self.assertEqual(link.tx_phy, 1)
+        self.assertEqual(link.rx_phy, 1)
+        self.assertEqual(link.dle_request_result, 0)
+        self.assertEqual(link.phy_read_result, 0)
+        self.assertEqual(link.dle_update_count, 1)
+
     def test_parse_current_esp32_diagnostic_line(self) -> None:
         line = (
             "I motion_data: [addr=X conn=1 id=1 pkt=512 sample=2048 "

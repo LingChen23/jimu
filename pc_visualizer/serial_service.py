@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 import struct
 import threading
 import time
@@ -14,6 +15,7 @@ from motion_model import MotionStore
 from motion_protocol import (
     ControlResponse,
     GatewayStreamDecoder,
+    LinkDiagnostic,
     MotionCommand,
     encode_gateway_command,
 )
@@ -27,6 +29,12 @@ COMMAND_NAMES = {
     "RESET_STATS": MotionCommand.RESET_STATS,
     "RECALIBRATE": MotionCommand.RECALIBRATE,
     "REBOOT": MotionCommand.REBOOT,
+}
+
+PHY_NAMES = {
+    1: "1M",
+    2: "2M",
+    3: "Coded",
 }
 RESULT_NAMES = {
     0: "成功",
@@ -46,6 +54,14 @@ RESET_REASON_BITS = {
     17: "比较器唤醒",
     18: "调试接口唤醒",
     19: "NFC 唤醒",
+}
+
+DISCONNECT_REASON_NAMES = {
+    0x08: "连接监督超时",
+    0x13: "nRF 主动断开",
+    0x16: "ESP32 主动断开",
+    0x22: "链路层响应超时",
+    0x3B: "连接参数不可接受",
 }
 
 
@@ -156,7 +172,57 @@ class SerialService:
 
     def device_control_snapshot(self, device_id: int) -> dict[str, Any]:
         with self._lock:
-            return dict(self._device_control.get(device_id, {}))
+            snapshot = dict(self._device_control.get(device_id, {}))
+            link = snapshot.get("link")
+            if isinstance(link, dict):
+                link_snapshot = dict(link)
+                updated = link_snapshot.pop("_updated_monotonic", None)
+                link_snapshot["age_seconds"] = (
+                    max(0.0, time.monotonic() - updated)
+                    if updated is not None
+                    else None
+                )
+                snapshot["link"] = link_snapshot
+            return snapshot
+
+    @staticmethod
+    def _link_snapshot(diagnostic: LinkDiagnostic) -> dict[str, Any]:
+        link = asdict(diagnostic)
+        reason = diagnostic.last_disconnect_reason
+        hci_reason = reason - 0x200 if 0x200 <= reason <= 0x2FF else reason
+        if reason == 0:
+            reason_text = "无"
+        else:
+            reason_text = DISCONNECT_REASON_NAMES.get(
+                hci_reason, "未知原因"
+            )
+            reason_text = f"{reason_text} (0x{reason:04X})"
+        link["last_disconnect_reason_text"] = reason_text
+        link["link_layer_retransmissions"] = None
+        link["link_layer_retransmissions_note"] = (
+            "NimBLE 公开接口不提供链路层真实重传次数"
+        )
+        link["tx_phy_text"] = (
+            PHY_NAMES.get(diagnostic.tx_phy, f"未知({diagnostic.tx_phy})")
+            if diagnostic.tx_phy is not None
+            else None
+        )
+        link["rx_phy_text"] = (
+            PHY_NAMES.get(diagnostic.rx_phy, f"未知({diagnostic.rx_phy})")
+            if diagnostic.rx_phy is not None
+            else None
+        )
+        link["dle_request_result_text"] = (
+            "成功"
+            if diagnostic.dle_request_result == 0
+            else (
+                f"失败({diagnostic.dle_request_result})"
+                if diagnostic.dle_request_result is not None
+                else "未请求"
+            )
+        )
+        link["_updated_monotonic"] = time.monotonic()
+        return link
 
     @staticmethod
     def _command_payload(command: MotionCommand) -> bytes:
@@ -315,6 +381,14 @@ class SerialService:
                                 (response.device_id, response.request_id)
                             ] = response
                             self._response_condition.notify_all()
+                        continue
+                    if gateway_frame.link_diagnostic is not None:
+                        diagnostic = gateway_frame.link_diagnostic
+                        with self._lock:
+                            control = self._device_control.setdefault(
+                                diagnostic.device_id, {}
+                            )
+                            control["link"] = self._link_snapshot(diagnostic)
                         continue
                     if gateway_frame.motion is None:
                         continue

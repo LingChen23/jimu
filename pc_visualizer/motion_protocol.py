@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import IntEnum
 import re
 import struct
 from typing import Optional
@@ -13,14 +14,28 @@ MOTION_PACKET_SIZE = 100
 MOTION_PROTOCOL_VERSION = 1
 MOTION_PACKET_TYPE_DATA = 0x10
 MOTION_SAMPLE_COUNT = 4
-ACCEL_LSB_PER_G = 8192.0
-GYRO_LSB_PER_DPS = 65.5
+ACCEL_LSB_PER_G = 4096.0
+GYRO_LSB_PER_DPS = 32.8
 TICK_HZ = 32768.0
 GATEWAY_FRAME_VERSION = 1
 GATEWAY_FRAME_MOTION_DATA = 0x10
+GATEWAY_FRAME_CONTROL_REQUEST = 0x20
+GATEWAY_FRAME_CONTROL_RESPONSE = 0x21
 GATEWAY_HEADER_SIZE = 10
-GATEWAY_RAW_FRAME_SIZE = 114
+GATEWAY_CRC_SIZE = 4
+GATEWAY_MAX_RAW_FRAME_SIZE = 114
 GATEWAY_MAX_ENCODED_SIZE = 115
+MOTION_CONTROL_VERSION = 1
+
+
+class MotionCommand(IntEnum):
+    START_STREAM = 0x01
+    STOP_STREAM = 0x02
+    GET_INFO = 0x03
+    GET_STATUS = 0x04
+    RESET_STATS = 0x05
+    RECALIBRATE = 0x06
+    REBOOT = 0x07
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _HEX_RE = re.compile(r"MOTION_V1_HEX\s*[:=,]\s*([0-9a-fA-F]{200})")
@@ -68,7 +83,18 @@ class MotionFrame:
 class GatewayFrame:
     gateway_id: int
     gateway_sequence: int
-    motion: MotionFrame
+    frame_type: int
+    motion: MotionFrame | None = None
+    control_response: "ControlResponse | None" = None
+
+
+@dataclass(frozen=True)
+class ControlResponse:
+    device_id: int
+    command: int
+    request_id: int
+    result: int
+    payload: bytes
 
 
 class CobsDecodeError(ValueError):
@@ -131,40 +157,78 @@ def cobs_decode(data: bytes) -> bytes:
     return bytes(output)
 
 
-def encode_gateway_frame(
-    motion_payload: bytes,
+def encode_gateway_payload(
+    frame_type: int,
+    payload: bytes,
     gateway_id: int = 0,
     gateway_sequence: int = 0,
 ) -> bytes:
-    """Build COBS(raw gateway frame) + 0x00, mainly for tests/tools."""
-    if len(motion_payload) != MOTION_PACKET_SIZE:
-        raise ValueError("gateway motion payload must be 100 bytes")
-    raw = bytearray(GATEWAY_RAW_FRAME_SIZE)
+    """Build one generic COBS/CRC gateway frame."""
+    if len(payload) > MOTION_PACKET_SIZE:
+        raise ValueError("gateway payload exceeds 100 bytes")
+    raw = bytearray(GATEWAY_HEADER_SIZE + len(payload) + GATEWAY_CRC_SIZE)
     struct.pack_into(
         "<BBBBIH",
         raw,
         0,
         GATEWAY_FRAME_VERSION,
         gateway_id,
-        GATEWAY_FRAME_MOTION_DATA,
+        frame_type,
         0,
         gateway_sequence,
-        MOTION_PACKET_SIZE,
+        len(payload),
     )
-    raw[GATEWAY_HEADER_SIZE : GATEWAY_HEADER_SIZE + MOTION_PACKET_SIZE] = (
-        motion_payload
-    )
+    raw[GATEWAY_HEADER_SIZE : GATEWAY_HEADER_SIZE + len(payload)] = payload
     crc = zlib.crc32(raw[:-4]) & 0xFFFFFFFF
     struct.pack_into("<I", raw, len(raw) - 4, crc)
     return cobs_encode(bytes(raw)) + b"\x00"
 
 
+def encode_gateway_frame(
+    motion_payload: bytes,
+    gateway_id: int = 0,
+    gateway_sequence: int = 0,
+) -> bytes:
+    """Build a Motion gateway frame, mainly for tests and capture tools."""
+    if len(motion_payload) != MOTION_PACKET_SIZE:
+        raise ValueError("gateway motion payload must be 100 bytes")
+    return encode_gateway_payload(
+        GATEWAY_FRAME_MOTION_DATA,
+        motion_payload,
+        gateway_id,
+        gateway_sequence,
+    )
+
+
+def encode_gateway_command(
+    device_id: int,
+    command: MotionCommand | int,
+    request_id: int,
+    command_payload: bytes = b"",
+) -> bytes:
+    if not 1 <= device_id <= 255:
+        raise ValueError("device id must be 1..255")
+    if len(command_payload) > 16:
+        raise ValueError("command payload exceeds BLE request limit")
+    request = struct.pack(
+        "<BBBB",
+        MOTION_CONTROL_VERSION,
+        int(command),
+        request_id & 0xFF,
+        len(command_payload),
+    ) + command_payload
+    return encode_gateway_payload(
+        GATEWAY_FRAME_CONTROL_REQUEST,
+        bytes((device_id,)) + request,
+    )
+
+
 def decode_gateway_frame(raw: bytes) -> GatewayFrame:
-    """Validate one decoded 114-byte gateway frame."""
-    if len(raw) != GATEWAY_RAW_FRAME_SIZE:
-        raise GatewayFrameError(
-            f"expected 114 gateway bytes, received {len(raw)}"
-        )
+    """Validate one decoded variable-length gateway frame."""
+    if not GATEWAY_HEADER_SIZE + GATEWAY_CRC_SIZE <= len(raw) <= (
+        GATEWAY_MAX_RAW_FRAME_SIZE
+    ):
+        raise GatewayFrameError(f"invalid gateway length {len(raw)}")
 
     (
         version,
@@ -176,12 +240,15 @@ def decode_gateway_frame(raw: bytes) -> GatewayFrame:
     ) = struct.unpack_from("<BBBBIH", raw, 0)
     if version != GATEWAY_FRAME_VERSION:
         raise GatewayFrameError("unsupported gateway frame version")
-    if frame_type != GATEWAY_FRAME_MOTION_DATA:
+    if frame_type not in {
+        GATEWAY_FRAME_MOTION_DATA,
+        GATEWAY_FRAME_CONTROL_RESPONSE,
+    }:
         raise GatewayFrameError("unsupported gateway frame type")
     if reserved != 0:
         raise GatewayFrameError("gateway reserved byte is not zero")
-    if payload_length != MOTION_PACKET_SIZE:
-        raise GatewayFrameError("unexpected gateway payload length")
+    if len(raw) != GATEWAY_HEADER_SIZE + payload_length + GATEWAY_CRC_SIZE:
+        raise GatewayFrameError("gateway payload length mismatch")
 
     expected_crc = struct.unpack_from("<I", raw, len(raw) - 4)[0]
     actual_crc = zlib.crc32(raw[:-4]) & 0xFFFFFFFF
@@ -193,10 +260,37 @@ def decode_gateway_frame(raw: bytes) -> GatewayFrame:
     payload = raw[
         GATEWAY_HEADER_SIZE : GATEWAY_HEADER_SIZE + payload_length
     ]
+    if frame_type == GATEWAY_FRAME_MOTION_DATA:
+        if payload_length != MOTION_PACKET_SIZE:
+            raise GatewayFrameError("unexpected motion payload length")
+        return GatewayFrame(
+            gateway_id=gateway_id,
+            gateway_sequence=gateway_sequence,
+            frame_type=frame_type,
+            motion=decode_motion_packet(payload),
+        )
+
+    if payload_length < 6:
+        raise GatewayFrameError("control response is too short")
+    device_id = payload[0]
+    version, response_command, request_id, result, response_length = (
+        struct.unpack_from("<BBBBB", payload, 1)
+    )
+    if version != MOTION_CONTROL_VERSION or not (response_command & 0x80):
+        raise GatewayFrameError("invalid control response header")
+    if payload_length != 6 + response_length:
+        raise GatewayFrameError("control response payload length mismatch")
     return GatewayFrame(
         gateway_id=gateway_id,
         gateway_sequence=gateway_sequence,
-        motion=decode_motion_packet(payload),
+        frame_type=frame_type,
+        control_response=ControlResponse(
+            device_id=device_id,
+            command=response_command & 0x7F,
+            request_id=request_id,
+            result=result,
+            payload=bytes(payload[6:]),
+        ),
     )
 
 

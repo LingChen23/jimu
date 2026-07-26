@@ -2,14 +2,51 @@
 
 from __future__ import annotations
 
+import struct
 import threading
+import time
 from typing import Any
 
 import serial
 from serial.tools import list_ports
 
 from motion_model import MotionStore
-from motion_protocol import GatewayStreamDecoder
+from motion_protocol import (
+    ControlResponse,
+    GatewayStreamDecoder,
+    MotionCommand,
+    encode_gateway_command,
+)
+
+
+COMMAND_NAMES = {
+    "START_STREAM": MotionCommand.START_STREAM,
+    "STOP_STREAM": MotionCommand.STOP_STREAM,
+    "GET_INFO": MotionCommand.GET_INFO,
+    "GET_STATUS": MotionCommand.GET_STATUS,
+    "RESET_STATS": MotionCommand.RESET_STATS,
+    "RECALIBRATE": MotionCommand.RECALIBRATE,
+    "REBOOT": MotionCommand.REBOOT,
+}
+RESULT_NAMES = {
+    0: "成功",
+    1: "命令不支持",
+    2: "参数错误",
+    3: "设备忙",
+    4: "当前状态不允许",
+    5: "设备离线",
+    6: "网关转发失败",
+}
+RESET_REASON_BITS = {
+    0: "复位引脚",
+    1: "看门狗",
+    2: "软件重启",
+    3: "CPU 锁死",
+    16: "低功耗唤醒",
+    17: "比较器唤醒",
+    18: "调试接口唤醒",
+    19: "NFC 唤醒",
+}
 
 
 class SerialService:
@@ -19,6 +56,7 @@ class SerialService:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._response_condition = threading.Condition(self._lock)
         self._port = ""
         self._baud = 921600
         self._error = ""
@@ -27,15 +65,21 @@ class SerialService:
         self._gateway_lost_frames = 0
         self._last_gateway_sequence: dict[int, int] = {}
         self._decoder = GatewayStreamDecoder()
+        self._request_id = 0
+        self._responses: dict[tuple[int, int], ControlResponse] = {}
+        self._device_control: dict[int, dict[str, Any]] = {}
 
     @staticmethod
-    def ports() -> list[dict[str, str]]:
+    def ports() -> list[dict[str, Any]]:
         return [
             {
                 "device": port.device,
                 "description": port.description or port.device,
+                "native_usb": port.vid == 0x303A and port.pid == 0x1001,
             }
-            for port in sorted(list_ports.comports(), key=lambda item: item.device)
+            for port in sorted(
+                list_ports.comports(), key=lambda item: item.device
+            )
         ]
 
     def open(self, port: str, baud: int) -> dict[str, Any]:
@@ -49,6 +93,7 @@ class SerialService:
         connection.port = port
         connection.baudrate = baud
         connection.timeout = 0.2
+        connection.write_timeout = 1.0
         connection.dtr = False
         connection.rts = False
         connection.open()
@@ -63,6 +108,8 @@ class SerialService:
             self._gateway_lost_frames = 0
             self._last_gateway_sequence = {}
             self._decoder = GatewayStreamDecoder()
+            self._responses = {}
+            self._device_control = {}
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._reader_loop,
@@ -74,9 +121,10 @@ class SerialService:
 
     def close(self) -> dict[str, Any]:
         self._stop.set()
-        with self._lock:
+        with self._response_condition:
             connection = self._serial
             self._serial = None
+            self._response_condition.notify_all()
         if connection is not None:
             try:
                 connection.close()
@@ -106,6 +154,133 @@ class SerialService:
                 "overflow_count": self._decoder.overflow_count,
             }
 
+    def device_control_snapshot(self, device_id: int) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._device_control.get(device_id, {}))
+
+    @staticmethod
+    def _command_payload(command: MotionCommand) -> bytes:
+        if command == MotionCommand.START_STREAM:
+            return struct.pack("<HBB", 100, 50, 0x07)
+        if command == MotionCommand.REBOOT:
+            return b"\xA5"
+        return b""
+
+    @staticmethod
+    def _parse_response(response: ControlResponse) -> dict[str, Any]:
+        parsed: dict[str, Any] = {}
+        payload = response.payload
+        if response.result == 0 and response.command == MotionCommand.GET_INFO:
+            if len(payload) != 14:
+                raise ValueError("GET_INFO 响应长度错误")
+            parsed = {
+                "device_id": payload[0],
+                "firmware": f"{payload[1]}.{payload[2]}.{payload[3]}",
+                "motion_protocol_version": payload[4],
+                "accel_range_g": payload[5],
+                "gyro_range_dps": struct.unpack_from("<H", payload, 6)[0],
+                "sample_rate_hz": struct.unpack_from("<H", payload, 8)[0],
+                "coordinate_rate_hz": payload[10],
+                "capabilities": struct.unpack_from("<H", payload, 11)[0],
+            }
+        elif (
+            response.result == 0
+            and response.command == MotionCommand.GET_STATUS
+        ):
+            if len(payload) != 29:
+                raise ValueError("GET_STATUS 响应长度错误")
+            flags = payload[0]
+            battery_mv = struct.unpack_from("<H", payload, 10)[0]
+            reset_reason = struct.unpack_from("<I", payload, 2)[0]
+            reset_labels = [
+                label
+                for bit, label in RESET_REASON_BITS.items()
+                if reset_reason & (1 << bit)
+            ]
+            parsed = {
+                "streaming": bool(flags & 0x01),
+                "calibrated": bool(flags & 0x02),
+                "sensor_ok": bool(flags & 0x04),
+                "battery_low": bool(flags & 0x08),
+                "reset_reason": reset_reason,
+                "reset_reason_text": " / ".join(reset_labels)
+                if reset_labels
+                else "上电或未知",
+                "uptime_seconds": struct.unpack_from("<I", payload, 6)[0],
+                "battery_mV": None if battery_mv == 0xFFFF else battery_mv,
+                "session_id": struct.unpack_from("<I", payload, 12)[0],
+                "latest_sample_sequence": struct.unpack_from(
+                    "<I", payload, 16
+                )[0],
+                "sample_gap_count": struct.unpack_from("<H", payload, 20)[0],
+                "sensor_error_count": struct.unpack_from("<H", payload, 22)[0],
+                "queue_drop_count": struct.unpack_from("<H", payload, 24)[0],
+                "ble_resource_wait_count": struct.unpack_from(
+                    "<H", payload, 26
+                )[0],
+                "queue_depth": payload[28],
+            }
+        return parsed
+
+    def command(
+        self,
+        device_id: int,
+        command_name: str,
+        timeout_seconds: float = 3.0,
+    ) -> dict[str, Any]:
+        command = COMMAND_NAMES.get(command_name.upper())
+        if command is None:
+            raise ValueError("未知设备命令")
+
+        with self._response_condition:
+            connection = self._serial
+            if connection is None or not connection.is_open:
+                raise ValueError("串口未打开")
+            self._request_id = (self._request_id % 255) + 1
+            request_id = self._request_id
+            key = (device_id, request_id)
+            frame = encode_gateway_command(
+                device_id,
+                command,
+                request_id,
+                self._command_payload(command),
+            )
+            try:
+                connection.write(frame)
+                connection.flush()
+            except (serial.SerialException, OSError) as error:
+                raise OSError(str(error)) from error
+
+            deadline = time.monotonic() + timeout_seconds
+            while key not in self._responses:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"{command.name} 等待响应超时")
+                self._response_condition.wait(remaining)
+                if self._serial is None:
+                    raise OSError("等待响应时串口已关闭")
+            response = self._responses.pop(key)
+
+        parsed = self._parse_response(response)
+        result = {
+            "ok": response.result == 0,
+            "device_id": response.device_id,
+            "command": command.name,
+            "request_id": response.request_id,
+            "result": response.result,
+            "message": RESULT_NAMES.get(response.result, "未知结果"),
+            "data": parsed,
+        }
+        with self._lock:
+            control = self._device_control.setdefault(device_id, {})
+            control["last_command"] = command.name
+            control["last_result"] = result["message"]
+            if command == MotionCommand.GET_INFO and parsed:
+                control["info"] = parsed
+            elif command == MotionCommand.GET_STATUS and parsed:
+                control["status"] = parsed
+        return result
+
     def _reader_loop(self) -> None:
         while not self._stop.is_set():
             with self._lock:
@@ -133,6 +308,16 @@ class SerialService:
                     self._last_gateway_sequence[gateway_frame.gateway_id] = (
                         gateway_frame.gateway_sequence
                     )
+                    if gateway_frame.control_response is not None:
+                        response = gateway_frame.control_response
+                        with self._response_condition:
+                            self._responses[
+                                (response.device_id, response.request_id)
+                            ] = response
+                            self._response_condition.notify_all()
+                        continue
+                    if gateway_frame.motion is None:
+                        continue
                     if not self._store.process(gateway_frame.motion):
                         continue
                     with self._lock:
@@ -140,7 +325,9 @@ class SerialService:
             except (serial.SerialException, OSError) as error:
                 if self._stop.is_set():
                     return
-                with self._lock:
+                with self._response_condition:
                     self._error = str(error)
+                    self._serial = None
+                    self._response_condition.notify_all()
                 self._stop.set()
                 return

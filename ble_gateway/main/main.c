@@ -7,7 +7,7 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 
-#include "driver/uart.h"
+#include "driver/usb_serial_jtag.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -19,7 +19,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "motion_protocol.h"
 
-#define TARGET_DEVICE_NAME       "Mahjong"
+#define TARGET_DEVICE_NAME       "SmartBlock"
 #define SCAN_DURATION_MS         BLE_HS_FOREVER
 #define CONNECT_TIMEOUT_MS       30000
 #define MAX_MAHJONG_CONNECTIONS  1U
@@ -27,10 +27,26 @@
 #define GATEWAY_ID               0U
 #define GATEWAY_FRAME_VERSION    1U
 #define GATEWAY_FRAME_MOTION     0x10U
-#define GATEWAY_RAW_FRAME_SIZE   114U
-#define GATEWAY_COBS_MAX_SIZE    115U
-#define GATEWAY_UART_BAUD        921600
+#define GATEWAY_FRAME_CONTROL_REQUEST  0x20U
+#define GATEWAY_FRAME_CONTROL_RESPONSE 0x21U
+#define GATEWAY_HEADER_SIZE      10U
+#define GATEWAY_CRC_SIZE         4U
+#define GATEWAY_MAX_PAYLOAD_SIZE MOTION_PACKET_SIZE
+#define GATEWAY_MAX_RAW_FRAME_SIZE \
+    (GATEWAY_HEADER_SIZE + GATEWAY_MAX_PAYLOAD_SIZE + GATEWAY_CRC_SIZE)
+#define GATEWAY_COBS_MAX_SIZE    (GATEWAY_MAX_RAW_FRAME_SIZE + 1U)
 #define GATEWAY_TX_QUEUE_DEPTH   128U
+#define GATEWAY_USB_RX_BUFFER    256U
+#define GATEWAY_USB_TX_BUFFER    32768U
+#define GATEWAY_USB_WRITE_WAIT_MS 1000U
+#define MOTION_CONTROL_VERSION   1U
+#define MOTION_CONTROL_HEADER_SIZE 4U
+#define MOTION_RESPONSE_HEADER_SIZE 5U
+#define MOTION_CONTROL_MAX_SIZE  20U
+#define MOTION_RESPONSE_MAX_SIZE 53U
+#define MOTION_RESULT_BUSY       3U
+#define MOTION_RESULT_DEVICE_OFFLINE 5U
+#define MOTION_RESULT_GATEWAY_ERROR 6U
 
 #define MAHJONG_COMPANY_ID_LSB   0xcd
 #define MAHJONG_COMPANY_ID_MSB   0xab
@@ -81,6 +97,12 @@ static const ble_uuid_t *MOTION_SERVICE_UUID =
 static const ble_uuid_t *MOTION_DATA_UUID =
     BLE_UUID128_DECLARE(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
                         0x93, 0xf3, 0xa3, 0xb5, 0x02, 0x00, 0x41, 0x6e);
+static const ble_uuid_t *MOTION_CONTROL_UUID =
+    BLE_UUID128_DECLARE(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+                        0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x41, 0x6e);
+static const ble_uuid_t *MOTION_STATUS_UUID =
+    BLE_UUID128_DECLARE(0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+                        0x93, 0xf3, 0xa3, 0xb5, 0x04, 0x00, 0x41, 0x6e);
 static const ble_uuid_t *CCCD_UUID = BLE_UUID16_DECLARE(0x2902);
 
 typedef enum {
@@ -97,8 +119,17 @@ typedef struct {
     ble_addr_t addr;
     uint16_t service_start_handle;
     uint16_t service_end_handle;
+    uint16_t notify_def_handle;
     uint16_t notify_value_handle;
     uint16_t notify_cccd_handle;
+    uint16_t control_def_handle;
+    uint16_t control_value_handle;
+    uint16_t status_def_handle;
+    uint16_t status_value_handle;
+    uint16_t status_cccd_handle;
+    bool command_in_flight;
+    uint8_t pending_command;
+    uint8_t pending_request_id;
     bool has_board_info;
     uint8_t board_no;
     uint8_t board_type;
@@ -125,8 +156,9 @@ static uint32_t s_gateway_sequence;
 static volatile uint32_t s_gateway_queue_drops;
 
 typedef struct {
-    uint32_t gateway_sequence;
-    uint8_t payload[MOTION_PACKET_SIZE];
+    uint8_t frame_type;
+    uint16_t payload_length;
+    uint8_t payload[GATEWAY_MAX_PAYLOAD_SIZE];
 } gateway_tx_item_t;
 
 static int gap_event_handler(struct ble_gap_event *event, void *arg);
@@ -138,6 +170,7 @@ static int service_discovery_cb(uint16_t conn_handle,
                                 const struct ble_gatt_error *error,
                                 const struct ble_gatt_svc *service,
                                 void *arg);
+static void gateway_usb_rx_task(void *param);
 
 static void gateway_put_le16(uint8_t *dst, uint16_t value)
 {
@@ -151,6 +184,19 @@ static void gateway_put_le32(uint8_t *dst, uint32_t value)
     dst[1] = (uint8_t)(value >> 8);
     dst[2] = (uint8_t)(value >> 16);
     dst[3] = (uint8_t)(value >> 24);
+}
+
+static uint16_t gateway_get_le16(const uint8_t *src)
+{
+    return (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+}
+
+static uint32_t gateway_get_le32(const uint8_t *src)
+{
+    return (uint32_t)src[0] |
+           ((uint32_t)src[1] << 8) |
+           ((uint32_t)src[2] << 16) |
+           ((uint32_t)src[3] << 24);
 }
 
 static uint32_t gateway_crc32(const uint8_t *data, size_t length)
@@ -198,12 +244,87 @@ static size_t cobs_encode(const uint8_t *input,
     return write_index;
 }
 
-static void gateway_uart_tx_task(void *param)
+static bool cobs_decode(const uint8_t *input,
+                        size_t input_length,
+                        uint8_t *output,
+                        size_t output_capacity,
+                        size_t *output_length)
+{
+    size_t read_index = 0U;
+    size_t write_index = 0U;
+
+    while (read_index < input_length) {
+        uint8_t code = input[read_index++];
+        uint8_t copy_length;
+
+        if (code == 0U) {
+            return false;
+        }
+        copy_length = (uint8_t)(code - 1U);
+        if ((read_index + copy_length > input_length) ||
+            (write_index + copy_length > output_capacity)) {
+            return false;
+        }
+        memcpy(&output[write_index], &input[read_index], copy_length);
+        read_index += copy_length;
+        write_index += copy_length;
+        if ((code != 0xffU) && (read_index < input_length)) {
+            if (write_index >= output_capacity) {
+                return false;
+            }
+            output[write_index++] = 0U;
+        }
+    }
+    *output_length = write_index;
+    return true;
+}
+
+static bool gateway_queue_frame(uint8_t frame_type,
+                                const uint8_t *payload,
+                                uint16_t payload_length)
 {
     gateway_tx_item_t item;
-    uint8_t raw[GATEWAY_RAW_FRAME_SIZE];
+
+    if (payload_length > sizeof(item.payload)) {
+        return false;
+    }
+    item.frame_type = frame_type;
+    item.payload_length = payload_length;
+    if (payload_length > 0U) {
+        memcpy(item.payload, payload, payload_length);
+    }
+    if (xQueueSend(s_gateway_tx_queue, &item, 0) != pdTRUE) {
+        s_gateway_queue_drops++;
+        return false;
+    }
+    return true;
+}
+
+static bool gateway_usb_write_all(const uint8_t *data, size_t length)
+{
+    size_t offset = 0U;
+
+    while (offset < length) {
+        int written = usb_serial_jtag_write_bytes(
+            data + offset,
+            length - offset,
+            pdMS_TO_TICKS(GATEWAY_USB_WRITE_WAIT_MS));
+        if (written <= 0) {
+            return false;
+        }
+        offset += (size_t)written;
+    }
+    return true;
+}
+
+static void gateway_usb_tx_task(void *param)
+{
+    gateway_tx_item_t item;
+    uint8_t raw[GATEWAY_MAX_RAW_FRAME_SIZE];
     uint8_t encoded[GATEWAY_COBS_MAX_SIZE + 1U];
     uint32_t crc;
+    uint32_t gateway_sequence;
+    size_t raw_length;
     size_t encoded_length;
 
     (void)param;
@@ -214,56 +335,49 @@ static void gateway_uart_tx_task(void *param)
 
         raw[0] = GATEWAY_FRAME_VERSION;
         raw[1] = GATEWAY_ID;
-        raw[2] = GATEWAY_FRAME_MOTION;
+        raw[2] = item.frame_type;
         raw[3] = 0U;
-        gateway_put_le32(&raw[4], item.gateway_sequence);
-        gateway_put_le16(&raw[8], MOTION_PACKET_SIZE);
-        memcpy(&raw[10], item.payload, MOTION_PACKET_SIZE);
-        crc = gateway_crc32(raw, GATEWAY_RAW_FRAME_SIZE - 4U);
-        gateway_put_le32(&raw[GATEWAY_RAW_FRAME_SIZE - 4U], crc);
+        gateway_sequence = s_gateway_sequence++;
+        gateway_put_le32(&raw[4], gateway_sequence);
+        gateway_put_le16(&raw[8], item.payload_length);
+        memcpy(&raw[GATEWAY_HEADER_SIZE], item.payload, item.payload_length);
+        raw_length = GATEWAY_HEADER_SIZE + item.payload_length +
+                     GATEWAY_CRC_SIZE;
+        crc = gateway_crc32(raw, raw_length - GATEWAY_CRC_SIZE);
+        gateway_put_le32(&raw[raw_length - GATEWAY_CRC_SIZE], crc);
 
-        encoded_length = cobs_encode(raw, sizeof(raw), encoded);
+        encoded_length = cobs_encode(raw, raw_length, encoded);
         encoded[encoded_length++] = 0U;
-        uart_write_bytes(UART_NUM_0, encoded, encoded_length);
+        (void)gateway_usb_write_all(encoded, encoded_length);
     }
 }
 
-static void gateway_uart_init(void)
+static void gateway_usb_init(void)
 {
-    const uart_config_t config = {
-        .baud_rate = GATEWAY_UART_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+    usb_serial_jtag_driver_config_t config = {
+        .rx_buffer_size = GATEWAY_USB_RX_BUFFER,
+        .tx_buffer_size = GATEWAY_USB_TX_BUFFER,
     };
     const uint8_t delimiter = 0U;
 
-    ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_0,
-                                 UART_PIN_NO_CHANGE,
-                                 UART_PIN_NO_CHANGE,
-                                 UART_PIN_NO_CHANGE,
-                                 UART_PIN_NO_CHANGE));
-    if (!uart_is_driver_installed(UART_NUM_0)) {
-        ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0,
-                                            4096,
-                                            32768,
-                                            0,
-                                            NULL,
-                                            0));
-    }
-    uart_flush(UART_NUM_0);
-    uart_write_bytes(UART_NUM_0, &delimiter, 1U);
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&config));
+    (void)gateway_usb_write_all(&delimiter, 1U);
 
     s_gateway_tx_queue =
         xQueueCreate(GATEWAY_TX_QUEUE_DEPTH, sizeof(gateway_tx_item_t));
     ESP_ERROR_CHECK(s_gateway_tx_queue != NULL
                         ? ESP_OK
                         : ESP_ERR_NO_MEM);
-    if (xTaskCreate(gateway_uart_tx_task,
-                    "gateway_uart_tx",
+    if (xTaskCreate(gateway_usb_tx_task,
+                    "gateway_usb_tx",
+                    4096,
+                    NULL,
+                    8,
+                    NULL) != pdPASS) {
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
+    if (xTaskCreate(gateway_usb_rx_task,
+                    "gateway_usb_rx",
                     4096,
                     NULL,
                     8,
@@ -378,6 +492,171 @@ static uint8_t ready_peer_count(void)
     return count;
 }
 
+static mahjong_peer_t *find_ready_peer_by_device_id(uint8_t device_id)
+{
+    uint8_t index;
+
+    for (index = 0; index < MAX_MAHJONG_CONNECTIONS; index++) {
+        if (s_peers[index].state == PEER_READY &&
+            TARGETS[s_peers[index].target_index].expected_device_id ==
+                device_id) {
+            return &s_peers[index];
+        }
+    }
+    return NULL;
+}
+
+static void gateway_queue_control_result(uint8_t device_id,
+                                         uint8_t command,
+                                         uint8_t request_id,
+                                         uint8_t result)
+{
+    uint8_t payload[1U + MOTION_RESPONSE_HEADER_SIZE];
+
+    payload[0] = device_id;
+    payload[1] = MOTION_CONTROL_VERSION;
+    payload[2] = command | 0x80U;
+    payload[3] = request_id;
+    payload[4] = result;
+    payload[5] = 0U;
+    (void)gateway_queue_frame(GATEWAY_FRAME_CONTROL_RESPONSE,
+                              payload,
+                              sizeof(payload));
+}
+
+static int command_write_cb(uint16_t conn_handle,
+                            const struct ble_gatt_error *error,
+                            struct ble_gatt_attr *attr,
+                            void *arg)
+{
+    mahjong_peer_t *peer = arg;
+    uint8_t device_id;
+
+    (void)attr;
+    if (peer == NULL || peer->state == PEER_FREE ||
+        peer->conn_handle != conn_handle) {
+        return 0;
+    }
+    if (error->status != 0 && peer->command_in_flight) {
+        device_id = TARGETS[peer->target_index].expected_device_id;
+        gateway_queue_control_result(device_id,
+                                     peer->pending_command,
+                                     peer->pending_request_id,
+                                     MOTION_RESULT_GATEWAY_ERROR);
+        peer->command_in_flight = false;
+    }
+    return 0;
+}
+
+static void gateway_handle_encoded_command(const uint8_t *encoded,
+                                           size_t encoded_length)
+{
+    uint8_t raw[GATEWAY_MAX_RAW_FRAME_SIZE];
+    uint8_t device_id;
+    const uint8_t *request;
+    uint16_t payload_length;
+    uint16_t request_length;
+    uint32_t expected_crc;
+    size_t raw_length;
+    mahjong_peer_t *peer;
+    int rc;
+
+    if (!cobs_decode(encoded, encoded_length, raw, sizeof(raw), &raw_length) ||
+        raw_length < GATEWAY_HEADER_SIZE + GATEWAY_CRC_SIZE) {
+        return;
+    }
+    payload_length = gateway_get_le16(&raw[8]);
+    if (raw[0] != GATEWAY_FRAME_VERSION ||
+        raw[2] != GATEWAY_FRAME_CONTROL_REQUEST ||
+        raw_length != GATEWAY_HEADER_SIZE + payload_length +
+                      GATEWAY_CRC_SIZE) {
+        return;
+    }
+    expected_crc = gateway_get_le32(&raw[raw_length - GATEWAY_CRC_SIZE]);
+    if (gateway_crc32(raw, raw_length - GATEWAY_CRC_SIZE) != expected_crc ||
+        payload_length < 1U + MOTION_CONTROL_HEADER_SIZE) {
+        return;
+    }
+
+    device_id = raw[GATEWAY_HEADER_SIZE];
+    request = &raw[GATEWAY_HEADER_SIZE + 1U];
+    request_length = (uint16_t)(payload_length - 1U);
+    if (request_length > MOTION_CONTROL_MAX_SIZE ||
+        request[0] != MOTION_CONTROL_VERSION ||
+        request_length !=
+            (uint16_t)(MOTION_CONTROL_HEADER_SIZE + request[3])) {
+        return;
+    }
+
+    peer = find_ready_peer_by_device_id(device_id);
+    if (peer == NULL) {
+        gateway_queue_control_result(device_id,
+                                     request[1],
+                                     request[2],
+                                     MOTION_RESULT_DEVICE_OFFLINE);
+        return;
+    }
+    if (peer->command_in_flight) {
+        gateway_queue_control_result(device_id,
+                                     request[1],
+                                     request[2],
+                                     MOTION_RESULT_BUSY);
+        return;
+    }
+
+    peer->command_in_flight = true;
+    peer->pending_command = request[1];
+    peer->pending_request_id = request[2];
+    rc = ble_gattc_write_flat(peer->conn_handle,
+                              peer->control_value_handle,
+                              request,
+                              request_length,
+                              command_write_cb,
+                              peer);
+    if (rc != 0) {
+        peer->command_in_flight = false;
+        gateway_queue_control_result(device_id,
+                                     request[1],
+                                     request[2],
+                                     MOTION_RESULT_GATEWAY_ERROR);
+    }
+}
+
+static void gateway_usb_rx_task(void *param)
+{
+    uint8_t read_buffer[64];
+    uint8_t encoded[GATEWAY_COBS_MAX_SIZE];
+    size_t encoded_length = 0U;
+    bool overflow = false;
+    int read_length;
+    int index;
+
+    (void)param;
+    for (;;) {
+        read_length = usb_serial_jtag_read_bytes(read_buffer,
+                                                 sizeof(read_buffer),
+                                                 pdMS_TO_TICKS(100));
+        if (read_length <= 0) {
+            continue;
+        }
+        for (index = 0; index < read_length; index++) {
+            if (read_buffer[index] == 0U) {
+                if (!overflow && encoded_length > 0U) {
+                    gateway_handle_encoded_command(encoded, encoded_length);
+                }
+                encoded_length = 0U;
+                overflow = false;
+            } else if (!overflow) {
+                if (encoded_length < sizeof(encoded)) {
+                    encoded[encoded_length++] = read_buffer[index];
+                } else {
+                    overflow = true;
+                }
+            }
+        }
+    }
+}
+
 static bool has_available_target(void)
 {
     uint8_t target_index;
@@ -402,7 +681,6 @@ static void consume_notification(mahjong_peer_t *peer, struct os_mbuf *om)
     uint16_t expected_sequence;
     uint16_t sequence_gap;
     uint8_t expected_device_id = TARGETS[peer->target_index].expected_device_id;
-    gateway_tx_item_t tx_item;
 
     if (packet_len != sizeof(packet_bytes)) {
         peer->invalid_frames++;
@@ -459,11 +737,43 @@ static void consume_notification(mahjong_peer_t *peer, struct os_mbuf *om)
     peer->last_sequence = packet.packet_sequence;
     peer->received_frames++;
 
-    tx_item.gateway_sequence = s_gateway_sequence++;
-    memcpy(tx_item.payload, packet_bytes, sizeof(tx_item.payload));
-    if (xQueueSend(s_gateway_tx_queue, &tx_item, 0) != pdTRUE) {
-        s_gateway_queue_drops++;
+    (void)gateway_queue_frame(GATEWAY_FRAME_MOTION,
+                              packet_bytes,
+                              sizeof(packet_bytes));
+}
+
+static void consume_status_notification(mahjong_peer_t *peer,
+                                        struct os_mbuf *om)
+{
+    uint8_t payload[1U + MOTION_RESPONSE_MAX_SIZE];
+    uint16_t response_length = OS_MBUF_PKTLEN(om);
+    uint8_t device_id =
+        TARGETS[peer->target_index].expected_device_id;
+
+    if (response_length < MOTION_RESPONSE_HEADER_SIZE ||
+        response_length > MOTION_RESPONSE_MAX_SIZE) {
+        peer->invalid_frames++;
+        return;
     }
+    if (os_mbuf_copydata(om, 0, response_length, &payload[1]) != 0) {
+        return;
+    }
+    if (payload[1] != MOTION_CONTROL_VERSION ||
+        response_length !=
+            (uint16_t)(MOTION_RESPONSE_HEADER_SIZE + payload[5])) {
+        peer->invalid_frames++;
+        return;
+    }
+
+    payload[0] = device_id;
+    if (peer->command_in_flight &&
+        payload[2] == (uint8_t)(peer->pending_command | 0x80U) &&
+        payload[3] == peer->pending_request_id) {
+        peer->command_in_flight = false;
+    }
+    (void)gateway_queue_frame(GATEWAY_FRAME_CONTROL_RESPONSE,
+                              payload,
+                              (uint16_t)(response_length + 1U));
 }
 
 static int mtu_exchange_cb(uint16_t conn_handle,
@@ -527,10 +837,10 @@ static void restart_after_discovery_error(mahjong_peer_t *peer,
     }
 }
 
-static int subscribe_write_cb(uint16_t conn_handle,
-                              const struct ble_gatt_error *error,
-                              struct ble_gatt_attr *attr,
-                              void *arg)
+static int status_subscribe_write_cb(uint16_t conn_handle,
+                                     const struct ble_gatt_error *error,
+                                     struct ble_gatt_attr *attr,
+                                     void *arg)
 {
     mahjong_peer_t *peer = arg;
     char addr[18];
@@ -551,10 +861,43 @@ static int subscribe_write_cb(uint16_t conn_handle,
     peer->state = PEER_READY;
     format_addr(&peer->addr, addr, sizeof(addr));
     ESP_LOGI(TAG,
-             "Motion notifications enabled: addr=%s conn=%u id=%u ready=%u/%u",
+             "Motion/control notifications enabled: addr=%s conn=%u "
+             "id=%u ready=%u/%u",
              addr, conn_handle,
              TARGETS[peer->target_index].expected_device_id,
              ready_peer_count(), (unsigned int)TARGET_COUNT);
+    return 0;
+}
+
+static int data_subscribe_write_cb(uint16_t conn_handle,
+                                   const struct ble_gatt_error *error,
+                                   struct ble_gatt_attr *attr,
+                                   void *arg)
+{
+    static const uint8_t enable_notifications[] = {0x01, 0x00};
+    mahjong_peer_t *peer = arg;
+    int rc;
+
+    (void)attr;
+    if (peer == NULL || peer->state == PEER_FREE ||
+        peer->conn_handle != conn_handle) {
+        return 0;
+    }
+    if (error->status != 0) {
+        restart_after_discovery_error(peer, "Motion CCCD subscription",
+                                      error->status);
+        return 0;
+    }
+    rc = ble_gattc_write_flat(conn_handle,
+                              peer->status_cccd_handle,
+                              enable_notifications,
+                              sizeof(enable_notifications),
+                              status_subscribe_write_cb,
+                              peer);
+    if (rc != 0) {
+        restart_after_discovery_error(peer,
+                                      "Status CCCD write start", rc);
+    }
     return 0;
 }
 
@@ -577,6 +920,10 @@ static int descriptor_discovery_cb(uint16_t conn_handle,
         if (chr_val_handle == peer->notify_value_handle && dsc != NULL &&
             ble_uuid_cmp(&dsc->uuid.u, CCCD_UUID) == 0) {
             peer->notify_cccd_handle = dsc->handle;
+        } else if (chr_val_handle == peer->status_value_handle &&
+                   dsc != NULL &&
+                   ble_uuid_cmp(&dsc->uuid.u, CCCD_UUID) == 0) {
+            peer->status_cccd_handle = dsc->handle;
         }
         return 0;
     }
@@ -587,8 +934,25 @@ static int descriptor_discovery_cb(uint16_t conn_handle,
         return 0;
     }
 
-    if (peer->notify_cccd_handle == 0) {
-            restart_after_discovery_error(peer, "Motion data CCCD not found",
+    if (chr_val_handle == peer->notify_value_handle &&
+        peer->notify_cccd_handle != 0U &&
+        peer->status_cccd_handle == 0U) {
+        rc = ble_gattc_disc_all_dscs(conn_handle,
+                                     peer->status_value_handle,
+                                     peer->service_end_handle,
+                                     descriptor_discovery_cb,
+                                     peer);
+        if (rc != 0) {
+            restart_after_discovery_error(peer,
+                                          "Status descriptor discovery start",
+                                          rc);
+        }
+        return 0;
+    }
+
+    if (peer->notify_cccd_handle == 0 ||
+        peer->status_cccd_handle == 0) {
+        restart_after_discovery_error(peer, "Motion/status CCCD not found",
                                       BLE_HS_ENOENT);
         return 0;
     }
@@ -596,7 +960,7 @@ static int descriptor_discovery_cb(uint16_t conn_handle,
     rc = ble_gattc_write_flat(conn_handle, peer->notify_cccd_handle,
                               enable_notifications,
                               sizeof(enable_notifications),
-                              subscribe_write_cb, peer);
+                              data_subscribe_write_cb, peer);
     if (rc != 0) {
         restart_after_discovery_error(peer, "CCCD write start", rc);
     }
@@ -619,7 +983,16 @@ static int characteristic_discovery_cb(uint16_t conn_handle,
     if (error->status == 0) {
         if (chr != NULL &&
             ble_uuid_cmp(&chr->uuid.u, MOTION_DATA_UUID) == 0) {
+            peer->notify_def_handle = chr->def_handle;
             peer->notify_value_handle = chr->val_handle;
+        } else if (chr != NULL &&
+                   ble_uuid_cmp(&chr->uuid.u, MOTION_CONTROL_UUID) == 0) {
+            peer->control_def_handle = chr->def_handle;
+            peer->control_value_handle = chr->val_handle;
+        } else if (chr != NULL &&
+                   ble_uuid_cmp(&chr->uuid.u, MOTION_STATUS_UUID) == 0) {
+            peer->status_def_handle = chr->def_handle;
+            peer->status_value_handle = chr->val_handle;
         }
         return 0;
     }
@@ -630,15 +1003,17 @@ static int characteristic_discovery_cb(uint16_t conn_handle,
         return 0;
     }
 
-    if (peer->notify_value_handle == 0) {
+    if (peer->notify_value_handle == 0 ||
+        peer->control_value_handle == 0 ||
+        peer->status_value_handle == 0) {
         restart_after_discovery_error(peer,
-                                      "Motion data characteristic not found",
+                                      "Motion characteristics not found",
                                       BLE_HS_ENOENT);
         return 0;
     }
 
     rc = ble_gattc_disc_all_dscs(conn_handle, peer->notify_value_handle,
-                                 peer->service_end_handle,
+                                 (uint16_t)(peer->control_def_handle - 1U),
                                  descriptor_discovery_cb, peer);
     if (rc != 0) {
         restart_after_discovery_error(peer,
@@ -680,11 +1055,10 @@ static int service_discovery_cb(uint16_t conn_handle,
         return 0;
     }
 
-    rc = ble_gattc_disc_chrs_by_uuid(conn_handle,
-                                     peer->service_start_handle,
-                                     peer->service_end_handle,
-                                     MOTION_DATA_UUID,
-                                     characteristic_discovery_cb, peer);
+    rc = ble_gattc_disc_all_chrs(conn_handle,
+                                 peer->service_start_handle,
+                                 peer->service_end_handle,
+                                 characteristic_discovery_cb, peer);
     if (rc != 0) {
         restart_after_discovery_error(peer,
                                       "Characteristic discovery start", rc);
@@ -815,7 +1189,8 @@ static void start_scan(void)
     }
 
     s_scanning = true;
-    ESP_LOGI(TAG, "Scanning for Mahjong targets: active=%u configured=%u max=%u",
+    ESP_LOGI(TAG, "Scanning for %s targets: active=%u configured=%u max=%u",
+             TARGET_DEVICE_NAME,
              active_peer_count(), (unsigned int)TARGET_COUNT,
              MAX_MAHJONG_CONNECTIONS);
 }
@@ -895,6 +1270,13 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
                  (unsigned long)peer->received_frames,
                  (unsigned long)peer->lost_frames,
                  (unsigned long)peer->invalid_frames);
+        if (peer->command_in_flight) {
+            gateway_queue_control_result(
+                TARGETS[peer->target_index].expected_device_id,
+                peer->pending_command,
+                peer->pending_request_id,
+                MOTION_RESULT_DEVICE_OFFLINE);
+        }
         reset_peer(peer);
         start_scan();
         return 0;
@@ -906,9 +1288,14 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_NOTIFY_RX:
         peer = find_peer_by_conn_handle(event->notify_rx.conn_handle);
-        if (peer != NULL && peer->state == PEER_READY &&
-            event->notify_rx.attr_handle == peer->notify_value_handle) {
-            consume_notification(peer, event->notify_rx.om);
+        if (peer != NULL && peer->state == PEER_READY) {
+            if (event->notify_rx.attr_handle ==
+                peer->notify_value_handle) {
+                consume_notification(peer, event->notify_rx.om);
+            } else if (event->notify_rx.attr_handle ==
+                       peer->status_value_handle) {
+                consume_status_notification(peer, event->notify_rx.om);
+            }
         }
         return 0;
 
@@ -960,7 +1347,7 @@ void app_main(void)
     int rc;
 
     esp_log_level_set("*", ESP_LOG_NONE);
-    gateway_uart_init();
+    gateway_usb_init();
 
     err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES ||

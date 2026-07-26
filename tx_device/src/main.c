@@ -16,11 +16,12 @@
 #include "nrf_delay.h"
 #include "nrf_dfu_types.h"
 #include "nrf_drv_gpiote.h"
-#include "nrf_drv_wdt.h"
+#include "nrf_wdt.h"
 #include "nrf_log.h"
 #include "nrf_log_ctrl.h"
 #include "nrf_power.h"
 #include "nrf_pwr_mgmt.h"
+#include "nrf_saadc.h"
 #include "nrf_soc.h"
 #include "sensor_icm_20689.h"
 #include "softdevice_handler.h"
@@ -44,10 +45,7 @@
 app_fifo_t m_nus_fifo;
 uint8_t    nus_fifo[NUS_BUF_SIZE];
 
-APP_TIMER_DEF(m_wdt_feed_timer_id);
 APP_TIMER_DEF(m_dfu_timer_id);
-
-nrf_drv_wdt_channel_id m_channel_id;
 
 volatile uint8_t sync_traj_data_flag;
 volatile uint8_t m_ble_tx_complete;
@@ -58,9 +56,13 @@ static uint16_t   m_conn_handle = BLE_CONN_HANDLE_INVALID;
 static ble_uuid_t m_adv_uuids[] = { { BLE_UUID_NUS_SERVICE,
                                       NUS_SERVICE_UUID_TYPE } };
 
-#define MOTION_QUEUE_CAPACITY         16U
+#define MOTION_QUEUE_CAPACITY         32U
 #define TRAJ_POWER_OFF_DISCHARGE_MS   10U
 #define TRAJ_POWER_ON_SETTLE_MS       20U
+
+#if (WDT_CONFIG_RELOAD_VALUE < 4000) || (WDT_CONFIG_RELOAD_VALUE > 8000)
+#error "WDT_CONFIG_RELOAD_VALUE must stay within the 4-8 second design range"
+#endif
 
 typedef struct
 {
@@ -76,10 +78,31 @@ static volatile uint8_t m_sample_pending;
 static volatile uint32_t m_sample_timestamp_ticks;
 static volatile uint32_t m_sample_overruns;
 static realtime_traj_t m_realtime_traj;
+static volatile uint8_t m_control_request_pending;
+static uint8_t m_control_request[
+  MOTION_CONTROL_HEADER_SIZE + MOTION_CONTROL_MAX_PAYLOAD];
+static uint16_t m_control_request_length;
+static uint8_t m_status_response[MOTION_RESPONSE_MAX_SIZE];
+static uint16_t m_status_response_length;
+static volatile uint8_t m_status_response_pending;
+static uint8_t m_stream_enabled = 1U;
+static uint8_t m_recalibrate_requested;
+static uint8_t m_reboot_requested;
+static uint8_t m_reboot_response_accepted;
+static uint32_t m_reboot_response_tick;
+static uint32_t m_reset_reason;
+static uint32_t m_current_session_id;
+static uint32_t m_latest_sample_sequence;
+static uint32_t m_uptime_sample_count;
+static uint32_t m_sensor_error_count;
+static uint32_t m_ble_resource_wait_count;
+static uint8_t m_sensor_ok = 1U;
 
 static void realtime_sample_interrupt_init(void);
 static void sample_clock_init(void);
 static uint8_t take_sample_pending(uint32_t* timestamp_ticks);
+static void motion_control_write_handler(const uint8_t* data,
+                                         uint16_t length);
 
 static void motion_queue_clear(void)
 {
@@ -121,8 +144,35 @@ static void motion_send_pump(void)
 {
     uint32_t err_code;
 
-    if ((m_conn_handle == BLE_CONN_HANDLE_INVALID) ||
-        (!m_motion_service.notification_enabled)) {
+    if (m_conn_handle == BLE_CONN_HANDLE_INVALID) {
+        motion_queue_clear();
+        m_status_response_pending = 0U;
+        return;
+    }
+
+    if (m_status_response_pending) {
+        err_code = motion_service_status_notify(&m_motion_service,
+                                                m_status_response,
+                                                m_status_response_length);
+        if (err_code == NRF_SUCCESS) {
+            m_status_response_pending = 0U;
+            if (m_reboot_requested) {
+                m_reboot_response_accepted = 1U;
+                m_reboot_requested = 0U;
+                m_reboot_response_tick = app_timer_cnt_get();
+            }
+        } else if ((err_code == NRF_ERROR_RESOURCES) ||
+                   (err_code == BLE_ERROR_NO_TX_PACKETS)) {
+            m_ble_resource_wait_count++;
+            return;
+        } else if (err_code == NRF_ERROR_INVALID_STATE) {
+            m_status_response_pending = 0U;
+        } else {
+            APP_ERROR_CHECK(err_code);
+        }
+    }
+
+    if (!m_motion_service.notification_enabled) {
         motion_queue_clear();
         return;
     }
@@ -139,6 +189,7 @@ static void motion_send_pump(void)
 
         if ((err_code == NRF_ERROR_RESOURCES) ||
             (err_code == BLE_ERROR_NO_TX_PACKETS)) {
+            m_ble_resource_wait_count++;
             return;
         }
 
@@ -429,7 +480,8 @@ static void services_init(void)
     err_code = ble_nus_init(&m_nus, &nus_init);
     APP_ERROR_CHECK(err_code);
 
-    err_code = motion_service_init(&m_motion_service);
+    err_code = motion_service_init(&m_motion_service,
+                                   motion_control_write_handler);
     APP_ERROR_CHECK(err_code);
 }
 
@@ -501,6 +553,10 @@ static void on_ble_evt(ble_evt_t* p_ble_evt)
             sync_traj_data_flag = 0;
             m_nus.is_notification_enabled = false;
             motion_queue_clear();
+            m_control_request_pending = 0U;
+            m_status_response_pending = 0U;
+            m_reboot_requested = 0U;
+            m_reboot_response_accepted = 0U;
             break; // BLE_GAP_EVT_DISCONNECTED
 
         case BLE_EVT_TX_COMPLETE:
@@ -681,11 +737,6 @@ static void advertising_init(void)
     APP_ERROR_CHECK(err_code);
 }
 
-static void wdt_handler(void* p_context)
-{
-    nrf_drv_wdt_feed();
-}
-
 static void dfu_handler(void* p_context)
 {
     NRF_LOG_WARNING("wait dfu timeout, reboot\r\n");
@@ -698,11 +749,6 @@ static void timers_init(void)
 
     /*Initialize timer module.*/
     APP_TIMER_INIT(APP_TIMER_PRESCALER, APP_TIMER_OP_QUEUE_SIZE, false);
-
-    /*Create timers.*/
-    err_code = app_timer_create(
-      &m_wdt_feed_timer_id, APP_TIMER_MODE_REPEATED, wdt_handler);
-    APP_ERROR_CHECK(err_code);
 
     /*Create timers.*/
     err_code = app_timer_create(
@@ -1156,7 +1202,7 @@ __sleep:
 }
 #endif
 
-static void feed_running_watchdog(void)
+static void watchdog_feed_enabled_channels(void)
 {
     uint32_t channel;
 
@@ -1169,6 +1215,325 @@ static void feed_running_watchdog(void)
             NRF_WDT->RR[channel] = WDT_RR_RR_Reload;
         }
     }
+}
+
+static void watchdog_init_or_adopt(void)
+{
+    /*
+     * The nRF52 WDT cannot be stopped or reconfigured after it has started.
+     * A soft reset can therefore enter this application with a WDT that was
+     * started by an earlier image. Feed every enabled reload channel
+     * immediately and keep using that configuration until the next power-on
+     * reset.
+     */
+    if (NRF_WDT->RUNSTATUS != 0U) {
+        watchdog_feed_enabled_channels();
+        return;
+    }
+
+    nrf_wdt_behaviour_set(NRF_WDT_BEHAVIOUR_RUN_SLEEP);
+    nrf_wdt_reload_value_set(
+      (WDT_CONFIG_RELOAD_VALUE * 32768UL) / 1000UL);
+    nrf_wdt_reload_request_enable(NRF_WDT_RR0);
+    nrf_wdt_reload_request_set(NRF_WDT_RR0);
+    nrf_wdt_task_trigger(NRF_WDT_TASK_START);
+}
+
+static void motion_put_le16(uint8_t* dst, uint16_t value)
+{
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+}
+
+static void motion_put_le32(uint8_t* dst, uint32_t value)
+{
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+    dst[2] = (uint8_t)(value >> 16);
+    dst[3] = (uint8_t)(value >> 24);
+}
+
+static uint16_t motion_saturate_u16(uint32_t value)
+{
+    return value > 0xffffUL ? 0xffffU : (uint16_t)value;
+}
+
+static uint8_t battery_saadc_wait(nrf_saadc_event_t event)
+{
+    uint32_t timeout = 100000UL;
+
+    while ((!nrf_saadc_event_check(event)) && (timeout > 0U)) {
+        timeout--;
+    }
+    return timeout > 0U ? 1U : 0U;
+}
+
+static uint16_t battery_read_mv(void)
+{
+    nrf_saadc_value_t sample = 0;
+    uint32_t config;
+    uint32_t battery_mv;
+    uint8_t success = 1U;
+
+    config =
+      (SAADC_CH_CONFIG_RESP_Bypass << SAADC_CH_CONFIG_RESP_Pos) |
+      (SAADC_CH_CONFIG_RESN_Bypass << SAADC_CH_CONFIG_RESN_Pos) |
+      (SAADC_CH_CONFIG_GAIN_Gain1_4 << SAADC_CH_CONFIG_GAIN_Pos) |
+      (SAADC_CH_CONFIG_REFSEL_Internal << SAADC_CH_CONFIG_REFSEL_Pos) |
+      (SAADC_CH_CONFIG_TACQ_40us << SAADC_CH_CONFIG_TACQ_Pos) |
+      (SAADC_CH_CONFIG_MODE_SE << SAADC_CH_CONFIG_MODE_Pos) |
+      (SAADC_CH_CONFIG_BURST_Disabled << SAADC_CH_CONFIG_BURST_Pos);
+
+    NRF_SAADC->CH[0].PSELP = SAADC_CH_PSELP_PSELP_AnalogInput2;
+    NRF_SAADC->CH[0].PSELN = SAADC_CH_PSELN_PSELN_NC;
+    NRF_SAADC->CH[0].CONFIG = config;
+    NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_12bit;
+    NRF_SAADC->OVERSAMPLE = SAADC_OVERSAMPLE_OVERSAMPLE_Bypass;
+    NRF_SAADC->RESULT.PTR = (uint32_t)&sample;
+    NRF_SAADC->RESULT.MAXCNT = 1U;
+
+    nrf_saadc_event_clear(NRF_SAADC_EVENT_STARTED);
+    nrf_saadc_event_clear(NRF_SAADC_EVENT_END);
+    nrf_saadc_event_clear(NRF_SAADC_EVENT_STOPPED);
+    nrf_saadc_enable();
+    nrf_saadc_task_trigger(NRF_SAADC_TASK_START);
+    success = battery_saadc_wait(NRF_SAADC_EVENT_STARTED);
+    if (success) {
+        nrf_saadc_task_trigger(NRF_SAADC_TASK_SAMPLE);
+        success = battery_saadc_wait(NRF_SAADC_EVENT_END);
+    }
+    nrf_saadc_task_trigger(NRF_SAADC_TASK_STOP);
+    (void)battery_saadc_wait(NRF_SAADC_EVENT_STOPPED);
+    nrf_saadc_disable();
+    NRF_SAADC->CH[0].PSELP = SAADC_CH_PSELP_PSELP_NC;
+
+    if (!success) {
+        return 0xffffU;
+    }
+    if (sample < 0) {
+        sample = 0;
+    }
+
+    /*
+     * Internal 0.6 V reference and gain 1/4 give a 2.4 V ADC full scale.
+     * R17/R18 divide VBAT by two, so VBAT full scale is 4.8 V.
+     */
+    battery_mv =
+      (((uint32_t)sample * 4800UL) + 2048UL) / 4096UL;
+    return motion_saturate_u16(battery_mv);
+}
+
+static void motion_control_write_handler(const uint8_t* data,
+                                         uint16_t length)
+{
+    if ((data == NULL) ||
+        (length < MOTION_CONTROL_HEADER_SIZE) ||
+        (length > sizeof(m_control_request))) {
+        return;
+    }
+
+    CRITICAL_REGION_ENTER();
+    if (!m_control_request_pending) {
+        memcpy(m_control_request, data, length);
+        m_control_request_length = length;
+        m_control_request_pending = 1U;
+    }
+    CRITICAL_REGION_EXIT();
+}
+
+static void motion_queue_response(uint8_t command,
+                                  uint8_t request_id,
+                                  uint8_t result,
+                                  const uint8_t* payload,
+                                  uint8_t payload_length)
+{
+    if (payload_length > MOTION_RESPONSE_MAX_PAYLOAD) {
+        payload_length = 0U;
+        result = MOTION_RESULT_BAD_PARAMETER;
+    }
+
+    m_status_response[0] = MOTION_CONTROL_VERSION;
+    m_status_response[1] = (uint8_t)(command | 0x80U);
+    m_status_response[2] = request_id;
+    m_status_response[3] = result;
+    m_status_response[4] = payload_length;
+    if ((payload != NULL) && (payload_length > 0U)) {
+        memcpy(&m_status_response[MOTION_RESPONSE_HEADER_SIZE],
+               payload,
+               payload_length);
+    }
+    m_status_response_length =
+      (uint16_t)(MOTION_RESPONSE_HEADER_SIZE + payload_length);
+    m_status_response_pending = 1U;
+}
+
+static void motion_build_info_payload(uint8_t payload[MOTION_INFO_PAYLOAD_SIZE])
+{
+    memset(payload, 0, MOTION_INFO_PAYLOAD_SIZE);
+    payload[0] = (uint8_t)TX_DEVICE_ID;
+    payload[1] = 0U;
+    payload[2] = 1U;
+    payload[3] = 0U;
+    payload[4] = MOTION_PROTOCOL_VERSION;
+    payload[5] = 8U;
+    motion_put_le16(&payload[6], 1000U);
+    motion_put_le16(&payload[8], REALTIME_TRAJ_SAMPLE_HZ);
+    payload[10] = REALTIME_TRAJ_OUTPUT_HZ;
+    motion_put_le16(&payload[11], 0x007fU);
+}
+
+static void motion_build_status_payload(
+  uint8_t payload[MOTION_STATUS_PAYLOAD_SIZE])
+{
+    uint8_t flags = 0U;
+    uint16_t battery_mv = battery_read_mv();
+
+    memset(payload, 0, MOTION_STATUS_PAYLOAD_SIZE);
+    if (m_stream_enabled) {
+        flags |= MOTION_STATUS_FLAG_STREAMING;
+    }
+    if (m_realtime_traj.state != REALTIME_TRAJ_CALIBRATING) {
+        flags |= MOTION_STATUS_FLAG_CALIBRATED;
+    }
+    if (m_sensor_ok) {
+        flags |= MOTION_STATUS_FLAG_SENSOR_OK;
+    }
+    if ((battery_mv != 0xffffU) && (battery_mv <= 3400U)) {
+        flags |= MOTION_STATUS_FLAG_LOW_BATTERY;
+    }
+
+    payload[0] = flags;
+    motion_put_le32(&payload[2], m_reset_reason);
+    motion_put_le32(&payload[6],
+                    m_uptime_sample_count / REALTIME_TRAJ_SAMPLE_HZ);
+    motion_put_le16(&payload[10], battery_mv);
+    motion_put_le32(&payload[12], m_current_session_id);
+    motion_put_le32(&payload[16], m_latest_sample_sequence);
+    motion_put_le16(&payload[20],
+                    motion_saturate_u16(m_sample_overruns));
+    motion_put_le16(&payload[22],
+                    motion_saturate_u16(m_sensor_error_count));
+    motion_put_le16(&payload[24],
+                    motion_saturate_u16(m_motion_queue_drops));
+    motion_put_le16(&payload[26],
+                    motion_saturate_u16(m_ble_resource_wait_count));
+    payload[28] = m_motion_queue_count;
+}
+
+static void motion_process_control_request(void)
+{
+    uint8_t request[
+      MOTION_CONTROL_HEADER_SIZE + MOTION_CONTROL_MAX_PAYLOAD];
+    uint16_t request_length;
+    uint8_t command;
+    uint8_t request_id;
+    uint8_t payload_length;
+    uint8_t result = MOTION_RESULT_OK;
+    uint8_t response_payload[MOTION_RESPONSE_MAX_PAYLOAD];
+    uint8_t response_length = 0U;
+
+    if ((!m_control_request_pending) || m_status_response_pending) {
+        return;
+    }
+
+    CRITICAL_REGION_ENTER();
+    request_length = m_control_request_length;
+    memcpy(request, m_control_request, request_length);
+    m_control_request_pending = 0U;
+    CRITICAL_REGION_EXIT();
+
+    command = request[1];
+    request_id = request[2];
+    payload_length = request[3];
+    if ((request[0] != MOTION_CONTROL_VERSION) ||
+        (request_length !=
+         (uint16_t)(MOTION_CONTROL_HEADER_SIZE + payload_length))) {
+        motion_queue_response(command,
+                              request_id,
+                              MOTION_RESULT_BAD_PARAMETER,
+                              NULL,
+                              0U);
+        return;
+    }
+
+    switch (command) {
+        case MOTION_CMD_START_STREAM:
+            if ((payload_length != 4U) ||
+                ((((uint16_t)request[5] << 8) | request[4]) !=
+                 REALTIME_TRAJ_SAMPLE_HZ) ||
+                (request[6] != REALTIME_TRAJ_OUTPUT_HZ) ||
+                (request[7] != MOTION_STREAM_ALL)) {
+                result = MOTION_RESULT_BAD_PARAMETER;
+            } else {
+                m_stream_enabled = 1U;
+            }
+            break;
+
+        case MOTION_CMD_STOP_STREAM:
+            if (payload_length != 0U) {
+                result = MOTION_RESULT_BAD_PARAMETER;
+            } else {
+                m_stream_enabled = 0U;
+                motion_queue_clear();
+            }
+            break;
+
+        case MOTION_CMD_GET_INFO:
+            if (payload_length != 0U) {
+                result = MOTION_RESULT_BAD_PARAMETER;
+            } else {
+                motion_build_info_payload(response_payload);
+                response_length = MOTION_INFO_PAYLOAD_SIZE;
+            }
+            break;
+
+        case MOTION_CMD_GET_STATUS:
+            if (payload_length != 0U) {
+                result = MOTION_RESULT_BAD_PARAMETER;
+            } else {
+                motion_build_status_payload(response_payload);
+                response_length = MOTION_STATUS_PAYLOAD_SIZE;
+            }
+            break;
+
+        case MOTION_CMD_RESET_STATS:
+            if (payload_length != 0U) {
+                result = MOTION_RESULT_BAD_PARAMETER;
+            } else {
+                m_sample_overruns = 0U;
+                m_sensor_error_count = 0U;
+                m_motion_queue_drops = 0U;
+                m_ble_resource_wait_count = 0U;
+            }
+            break;
+
+        case MOTION_CMD_RECALIBRATE:
+            if (payload_length != 0U) {
+                result = MOTION_RESULT_BAD_PARAMETER;
+            } else {
+                m_recalibrate_requested = 1U;
+            }
+            break;
+
+        case MOTION_CMD_REBOOT:
+            if ((payload_length != 1U) ||
+                (request[4] != MOTION_REBOOT_CONFIRM)) {
+                result = MOTION_RESULT_BAD_PARAMETER;
+            } else {
+                m_reboot_requested = 1U;
+            }
+            break;
+
+        default:
+            result = MOTION_RESULT_UNSUPPORTED;
+            break;
+    }
+
+    motion_queue_response(command,
+                          request_id,
+                          result,
+                          response_payload,
+                          response_length);
 }
 
 static int32_t position_m_to_mm(float position_m)
@@ -1222,6 +1587,14 @@ int main(void)
     realtime_traj_event_t trajectory_event;
 
     /*
+     * Take ownership of an inherited watchdog before any peripheral or
+     * SoftDevice initialization can consume the remaining timeout.
+     */
+    watchdog_init_or_adopt();
+    m_reset_reason = NRF_POWER->RESETREAS;
+    NRF_POWER->RESETREAS = m_reset_reason;
+
+    /*
      * TRAJ_EN drives the gate of the ICM-20689 high-side P-MOSFET and is
      * active low. Drive it high first so the sensor starts from a known
      * powered-off state instead of the GPIO reset-state high impedance.
@@ -1229,11 +1602,15 @@ int main(void)
     nrf_gpio_pin_set(TRAJ_EN_PIN);
     nrf_gpio_cfg_output(TRAJ_EN_PIN);
     nrf_delay_ms(TRAJ_POWER_OFF_DISCHARGE_MS);
+    watchdog_feed_enabled_channels();
 
     timers_init();
+    watchdog_feed_enabled_channels();
     ble_stack_init();
+    watchdog_feed_enabled_channels();
     gap_params_init();
     services_init();
+    watchdog_feed_enabled_channels();
     sync_sys_config_from_flash();
     if (sys_config.no != (uint8_t)TX_DEVICE_ID) {
         sys_config.no = (uint8_t)TX_DEVICE_ID;
@@ -1245,11 +1622,14 @@ int main(void)
     session_id =
       NRF_FICR->DEVICEID[0] ^ NRF_FICR->DEVICEID[1] ^
       app_timer_cnt_get() ^ 0x4d4f544eUL;
+    m_current_session_id = session_id;
     advertising_init();
     conn_params_init();
+    watchdog_feed_enabled_channels();
 
     err_code = ble_advertising_start(BLE_ADV_MODE_FAST);
     APP_ERROR_CHECK(err_code);
+    watchdog_feed_enabled_channels();
 
     /* Power the sensor and wait for VCC_ICM to settle before the first SPI access. */
     nrf_gpio_pin_clear(TRAJ_EN_PIN);
@@ -1259,20 +1639,55 @@ int main(void)
     if (icm_20689_init() < 0) {
         APP_ERROR_HANDLER(NRF_ERROR_INTERNAL);
     }
+    watchdog_feed_enabled_channels();
     sample_clock_init();
     realtime_sample_interrupt_init();
     if (icm_20689_set_mode(ICM_20689_WORK_MODE_INT) < 0) {
         APP_ERROR_HANDLER(NRF_ERROR_INTERNAL);
     }
+    watchdog_feed_enabled_channels();
 
     for (;;) {
-        feed_running_watchdog();
+        motion_process_control_request();
+
+        if (m_recalibrate_requested) {
+            m_recalibrate_requested = 0U;
+            realtime_traj_init(&m_realtime_traj);
+            memset(position_mm, 0, sizeof(position_mm));
+            memset(position_m, 0, sizeof(position_m));
+            coordinate_flags = MOTION_COORD_FLAG_CALIBRATING;
+            coordinate_source_sequence = 0U;
+            coordinate_valid = 0U;
+            batch_sample_count = 0U;
+            sample_sequence = 0U;
+            m_latest_sample_sequence = 0U;
+            motion_queue_clear();
+            session_id =
+              NRF_FICR->DEVICEID[0] ^ NRF_FICR->DEVICEID[1] ^
+              app_timer_cnt_get() ^ 0x52454341UL;
+            m_current_session_id = session_id;
+        }
+
+        motion_send_pump();
+        if (m_reboot_response_accepted) {
+            err_code = app_timer_cnt_diff_compute(app_timer_cnt_get(),
+                                                  m_reboot_response_tick,
+                                                  &elapsed_ticks);
+            APP_ERROR_CHECK(err_code);
+            if (elapsed_ticks >=
+                APP_TIMER_TICKS(100, APP_TIMER_PRESCALER)) {
+                NVIC_SystemReset();
+            }
+        }
 
         if (take_sample_pending(&sample_timestamp_ticks)) {
             if (icm_20689_int_read_data(sizeof(raw), raw) != sizeof(raw)) {
                 sensor_error_pending = 1U;
+                m_sensor_error_count++;
+                m_sensor_ok = 0U;
                 continue;
             }
+            m_sensor_ok = 1U;
 
             if (has_sample_timestamp) {
                 err_code = app_timer_cnt_diff_compute(
@@ -1395,6 +1810,8 @@ int main(void)
             }
 
             batch_sample_count++;
+            m_latest_sample_sequence = sample_sequence;
+            m_uptime_sample_count++;
             sample_sequence++;
 
             if (batch_sample_count == MOTION_SAMPLE_COUNT) {
@@ -1414,13 +1831,20 @@ int main(void)
                 packet_sequence++;
                 batch_sample_count = 0U;
 
-                if ((m_conn_handle != BLE_CONN_HANDLE_INVALID) &&
+                if (m_stream_enabled &&
+                    (m_conn_handle != BLE_CONN_HANDLE_INVALID) &&
                     m_motion_service.notification_enabled) {
                     motion_queue_push(packet);
                 }
             }
 
             motion_send_pump();
+            /*
+             * Feed only after the main loop has read and processed a valid
+             * IMU sample. A stalled sample interrupt, persistent SPI failure,
+             * or blocked processing path will therefore reset the device.
+             */
+            watchdog_feed_enabled_channels();
         } else {
             if (m_ble_tx_complete) {
                 m_ble_tx_complete = 0;

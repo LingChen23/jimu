@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import struct
 import sys
 from pathlib import Path
@@ -12,11 +13,14 @@ from motion_model import InertialEstimate, MotionStore, MovementStats
 from motion_protocol import (
     GatewayStreamDecoder,
     ImuSample,
+    MotionCommand,
     MotionFrame,
     cobs_decode,
     cobs_encode,
     decode_motion_packet,
+    encode_gateway_command,
     encode_gateway_frame,
+    encode_gateway_payload,
     parse_serial_line,
 )
 
@@ -50,13 +54,16 @@ def make_frame(
     coordinate_flags: int,
     tick_start: int,
     x_mm: int = 0,
+    accel_raw: tuple[int, int, int] = (0, 0, 4096),
+    gyro_raw: tuple[int, int, int] = (0, 0, 0),
+    coordinate_source_sequence: int | None = None,
 ) -> MotionFrame:
     samples = tuple(
         ImuSample(
             sequence=packet_sequence * 4 + index,
             tick_32k=tick_start + index * 328,
-            accel_raw=(0, 0, 8192),
-            gyro_raw=(0, 0, 0),
+            accel_raw=accel_raw,
+            gyro_raw=gyro_raw,
         )
         for index in range(4)
     )
@@ -66,7 +73,11 @@ def make_frame(
         session_id=1,
         flags=0x41,
         samples=samples,
-        coordinate_source_sequence=samples[-1].sequence,
+        coordinate_source_sequence=(
+            samples[-1].sequence
+            if coordinate_source_sequence is None
+            else coordinate_source_sequence
+        ),
         position_mm=(x_mm, 0, 0),
         coordinate_flags=coordinate_flags,
         source="motion-v1-100b",
@@ -119,6 +130,34 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(len(frames), 1)
         self.assertEqual(decoder.crc_error_count, 1)
 
+    def test_gateway_command_encoding(self) -> None:
+        encoded = encode_gateway_command(
+            1,
+            MotionCommand.START_STREAM,
+            9,
+            struct.pack("<HBB", 100, 50, 7),
+        )
+        raw = cobs_decode(encoded[:-1])
+
+        self.assertEqual(raw[2], 0x20)
+        self.assertEqual(struct.unpack_from("<H", raw, 8)[0], 9)
+        self.assertEqual(raw[10:19], bytes((1, 1, 1, 9, 4, 100, 0, 50, 7)))
+
+    def test_gateway_control_response_decoding(self) -> None:
+        status_payload = bytes(range(29))
+        response = bytes((1, 1, 0x84, 11, 0, 29)) + status_payload
+        encoded = encode_gateway_payload(0x21, response)
+        frames = GatewayStreamDecoder().feed(encoded)
+
+        self.assertEqual(len(frames), 1)
+        control = frames[0].control_response
+        self.assertIsNotNone(control)
+        assert control is not None
+        self.assertEqual(control.device_id, 1)
+        self.assertEqual(control.command, MotionCommand.GET_STATUS)
+        self.assertEqual(control.request_id, 11)
+        self.assertEqual(control.payload, status_payload)
+
     def test_parse_current_esp32_diagnostic_line(self) -> None:
         line = (
             "I motion_data: [addr=X conn=1 id=1 pkt=512 sample=2048 "
@@ -145,7 +184,7 @@ class MotionProtocolTests(unittest.TestCase):
         store = MotionStore()
         line_template = (
             "I motion_data: [addr=X conn=1 id=1 pkt={packet} sample={sample} "
-            "tick={tick} flags=0x41] s0 a=1,2,8192 g=4,5,6 "
+            "tick={tick} flags=0x41] s0 a=1,2,4096 g=4,5,6 "
             "s3dt=983 coord_seq=9 xyz=10,20,30 cflags=0x0002"
         )
         first = parse_serial_line(
@@ -192,7 +231,7 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot["received_path"][0], [0.0, 0.0, 0.0])
         self.assertEqual(snapshot["calculated_path"][0], [0.0, 0.0, 0.0])
 
-    def test_short_stop_inside_movement_counts_as_pause(self) -> None:
+    def test_supported_short_stop_is_not_counted_as_airborne_pause(self) -> None:
         store = MotionStore()
         packet = 0
         tick = 0
@@ -210,7 +249,8 @@ class MotionProtocolTests(unittest.TestCase):
                 tick += 4 * 328
 
         movement = store.snapshot(1)["completed_movements"][0]
-        self.assertEqual(movement["pause_count"], 1)
+        self.assertEqual(movement["pause_count"], 0)
+        self.assertEqual(movement["pause_definition"], "airborne_count_only")
 
     def test_clear_analysis_preserves_link_counters(self) -> None:
         store = MotionStore()
@@ -224,13 +264,14 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(after["completed_movement_count"], 0)
         self.assertEqual(after["received_path"], [])
 
-    def test_shake_and_flip_events_are_debounced(self) -> None:
+    def test_shake_is_debounced_and_inversion_is_not_calculated(self) -> None:
         movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
         estimate = InertialEstimate(
             accel=[0.0, 0.0, 9.80665],
             gyro_dps=[0.0, 0.0, 0.0],
             corrected_gyro_dps=[0.0, 0.0, 0.0],
             linear_world=[16.0, 0.0, 0.0],
+            velocity=[0.0, 0.0, 0.0],
             position=[0.0, 0.0, 0.0],
             up_world=[0.0, 0.0, -1.0],
             dt=0.01,
@@ -241,7 +282,7 @@ class MotionProtocolTests(unittest.TestCase):
             movement.add_sample(estimate, index * 328)
 
         self.assertEqual(movement.shake_count, 1)
-        self.assertEqual(movement.flip_count, 1)
+        self.assertNotIn("flip_count", movement.snapshot("移动中"))
 
     def test_full_gyro_rotation_counts_once(self) -> None:
         movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
@@ -250,6 +291,7 @@ class MotionProtocolTests(unittest.TestCase):
             gyro_dps=[0.0, 0.0, 180.0],
             corrected_gyro_dps=[0.0, 0.0, 180.0],
             linear_world=[0.0, 0.0, 0.0],
+            velocity=[0.0, 0.0, 0.0],
             position=[0.0, 0.0, 0.0],
             up_world=[0.0, 0.0, 1.0],
             dt=0.01,
@@ -261,6 +303,457 @@ class MotionProtocolTests(unittest.TestCase):
 
         self.assertEqual(movement.rotation_count, 1)
 
+
+    def test_airborne_interval_counts_one_pause_with_hysteresis(self) -> None:
+        movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
+        airborne = InertialEstimate(
+            accel=[0.0, 0.0, 0.0],
+            gyro_dps=[0.0, 0.0, 40.0],
+            corrected_gyro_dps=[0.0, 0.0, 40.0],
+            linear_world=[0.0, 0.0, -9.8],
+            velocity=[0.0, 0.0, 0.0],
+            position=[0.0, 0.0, 0.0],
+            up_world=[0.0, 0.0, 1.0],
+            dt=0.01,
+            stationary=False,
+        )
+        supported = InertialEstimate(
+            accel=[0.0, 0.0, 9.80665],
+            gyro_dps=[0.0, 0.0, 0.0],
+            corrected_gyro_dps=[0.0, 0.0, 0.0],
+            linear_world=[0.0, 0.0, 0.0],
+            velocity=[0.0, 0.0, 0.0],
+            position=[0.0, 0.0, 0.0],
+            up_world=[0.0, 0.0, 1.0],
+            dt=0.01,
+            stationary=False,
+        )
+
+        for index in range(30):
+            movement.add_sample(airborne, index * 328)
+        self.assertEqual(movement.pause_count, 1)
+
+        for index in range(10):
+            movement.add_sample(supported, (30 + index) * 328)
+        for index in range(10):
+            movement.add_sample(airborne, (40 + index) * 328)
+        self.assertEqual(movement.pause_count, 2)
+
+    def test_diagonal_rotation_uses_total_angular_travel(self) -> None:
+        movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
+        component = 180.0 / (2.0 ** 0.5)
+        estimate = InertialEstimate(
+            accel=[0.0, 0.0, 9.80665],
+            gyro_dps=[component, component, 0.0],
+            corrected_gyro_dps=[component, component, 0.0],
+            linear_world=[0.0, 0.0, 0.0],
+            velocity=[0.0, 0.0, 0.0],
+            position=[0.0, 0.0, 0.0],
+            up_world=[0.0, 0.0, 1.0],
+            dt=0.01,
+            stationary=False,
+        )
+
+        for index in range(200):
+            movement.add_sample(estimate, index * 328)
+
+        self.assertEqual(movement.rotation_count, 1)
+        self.assertAlmostEqual(
+            movement.snapshot("移动中")["rotation_turns"], 1.0, places=5
+        )
+
+    def test_rest_to_rest_correction_removes_constant_bias(self) -> None:
+        movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
+        biased = InertialEstimate(
+            accel=[0.0, 0.0, 9.80665],
+            gyro_dps=[0.0, 0.0, 0.0],
+            corrected_gyro_dps=[0.0, 0.0, 0.0],
+            linear_world=[0.25, 0.0, 0.0],
+            velocity=[0.0, 0.0, 0.0],
+            position=[0.0, 0.0, 0.0],
+            up_world=[0.0, 0.0, 1.0],
+            dt=0.01,
+            stationary=False,
+        )
+        for index in range(100):
+            movement.add_sample(biased, index * 328)
+        corrected = movement.rest_to_rest_corrected_path()
+        self.assertAlmostEqual(corrected[-1][0], 0.0, places=8)
+        self.assertAlmostEqual(corrected[-1][1], 0.0, places=8)
+        self.assertAlmostEqual(corrected[-1][2], 0.0, places=8)
+
+    def test_completed_movement_speed_statistics_uses_core_p05(self) -> None:
+        movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
+        speeds = [0.0] * 10 + [1.0 + index / 100.0 for index in range(80)] + [0.0] * 10
+        for index, speed in enumerate(speeds):
+            estimate = InertialEstimate(
+                accel=[0.0, 0.0, 9.80665],
+                gyro_dps=[0.0, 0.0, 0.0],
+                corrected_gyro_dps=[0.0, 0.0, 0.0],
+                linear_world=[0.0, 0.0, 0.0],
+                velocity=[speed, 0.0, 0.0],
+                position=[speed * 0.01, 0.0, 0.0],
+                up_world=[0.0, 0.0, 1.0],
+                dt=0.01,
+                stationary=False,
+            )
+            movement.add_sample(estimate, index * 328, index, 1000.0 + index * 0.01)
+        movement.finalize(False, [[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]])
+        stats = movement.snapshot("已完成")["speed"]
+        self.assertEqual(stats["max"], max(speeds))
+        self.assertEqual(stats["min"], 0.0)  # retained internally for completeness
+        self.assertGreater(stats["p05"], 1.0)
+        self.assertEqual(stats["p05_percentile"], 5.0)
+        self.assertEqual(stats["p05_sample_count"], 80)
+
+    def test_tremor_fft_finds_six_hz_component(self) -> None:
+        movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
+        sample_rate = 100.0
+        for index in range(300):
+            t = index / sample_rate
+            rate = 18.0 * math.sin(2.0 * math.pi * 6.0 * t)
+            rate += 4.0 * math.sin(2.0 * math.pi * 0.8 * t)
+            estimate = InertialEstimate(
+                accel=[0.0, 0.0, 9.80665],
+                gyro_dps=[rate, 0.0, 0.0],
+                corrected_gyro_dps=[rate, 0.0, 0.0],
+                linear_world=[0.0, 0.0, 0.0],
+                velocity=[0.0, 0.0, 0.0],
+                position=[0.0, 0.0, 0.0],
+                up_world=[0.0, 0.0, 1.0],
+                dt=1.0 / sample_rate,
+                stationary=False,
+            )
+            movement.add_sample(estimate, index * 328, index, 1000.0 + t)
+        movement.finalize(False, [[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]])
+        self.assertTrue(movement.tremor["valid"])
+        self.assertAlmostEqual(
+            movement.tremor["dominant_frequency_hz"], 6.0, delta=0.15
+        )
+        self.assertGreater(movement.tremor["intensity_dps"], 10.0)
+
+    def test_drop_requires_freefall_then_impact(self) -> None:
+        movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
+        freefall = InertialEstimate(
+            accel=[0.0, 0.0, 0.0], gyro_dps=[0.0, 0.0, 0.0],
+            corrected_gyro_dps=[0.0, 0.0, 0.0], linear_world=[0.0, 0.0, -9.8],
+            velocity=[0.0, 0.0, 0.0], position=[0.0, 0.0, 0.0],
+            up_world=[0.0, 0.0, 1.0], dt=0.01, stationary=False,
+        )
+        impact = InertialEstimate(
+            accel=[0.0, 0.0, 3.2 * 9.80665], gyro_dps=[0.0, 0.0, 0.0],
+            corrected_gyro_dps=[0.0, 0.0, 0.0], linear_world=[0.0, 0.0, 20.0],
+            velocity=[0.0, 0.0, 0.0], position=[0.0, 0.0, 0.0],
+            up_world=[0.0, 0.0, 1.0], dt=0.01, stationary=False,
+        )
+        for index in range(12):
+            movement.add_sample(freefall, index * 328, index, 1000.0 + index * 0.01)
+        movement.add_sample(impact, 12 * 328, 12, 1000.12)
+        self.assertEqual(movement.drop_count, 1)
+        self.assertEqual(movement.pause_count, 1)
+        self.assertGreater(movement.drop_events[0]["impact_g"], 3.0)
+        self.assertNotIn("airborne_seconds", movement.snapshot("已完成"))
+
+    def test_history_detail_and_exports_are_available(self) -> None:
+        store = MotionStore()
+        packet = 0
+        tick = 0
+        for flags, count in ((0x0001, 5), (0x0002, 30), (0x0001, 25)):
+            for _ in range(count):
+                store.process(make_frame(packet, flags, tick))
+                packet += 1
+                tick += 4 * 328
+        movement_id = store.snapshot(1)["completed_movements"][0]["movement_id"]
+        detail = store.movement_detail(1, movement_id, "device")
+        self.assertIsNotNone(detail)
+        assert detail is not None
+        self.assertIn("acceleration_series", detail)
+        self.assertIn("session_tremor_average", detail)
+        self.assertIsNotNone(detail["time"]["start"]["beijing"])
+        self.assertAlmostEqual(
+            detail["time"]["end_epoch"] - detail["time"]["start_epoch"],
+            detail["segment_seconds"],
+            places=5,
+        )
+        csv_data = store.movement_export(1, movement_id, "csv", "device")
+        json_data = store.movement_export(1, movement_id, "json", "device")
+        self.assertIn("record_type", csv_data or "")
+        self.assertIn("speed_p05_mps", csv_data or "")
+        self.assertNotIn("airborne_seconds", csv_data or "")
+        self.assertIn('"samples"', json_data or "")
+        self.assertNotIn('"airborne_seconds"', json_data or "")
+        self.assertNotIn('"airborne_intervals"', json_data or "")
+
+    def test_pc_mode_ignores_delayed_device_state(self) -> None:
+        # This test exercises state independence, not the short-segment filter.
+        store = MotionStore(minimum_movement_seconds=0.0)
+        self.assertTrue(store.set_analysis_mode(1, "pc"))
+        packet = 0
+        tick = 0
+
+        # PC performs its own one-second stationary calibration.
+        for _ in range(25):
+            store.process(make_frame(packet, 0x0001, tick))
+            packet += 1
+            tick += 4 * 328
+
+        # Device state still says stationary, but current gyro data is moving.
+        store.process(
+            make_frame(
+                packet,
+                0x0001,
+                tick,
+                gyro_raw=(0, 0, 1200),
+            )
+        )
+        packet += 1
+        tick += 4 * 328
+        snapshot = store.snapshot(1)
+
+        self.assertEqual(snapshot["analysis_mode"], "pc")
+        self.assertEqual(snapshot["device_reference_state"], "静止")
+        self.assertEqual(snapshot["motion_state"], "移动中")
+        self.assertIsNotNone(snapshot["current_movement"])
+
+        # Device state now says moving, but PC sees a stable IMU and ends the
+        # segment independently after the configured hold interval.
+        for _ in range(25):
+            store.process(make_frame(packet, 0x0002, tick))
+            packet += 1
+            tick += 4 * 328
+        snapshot = store.snapshot(1)
+
+        self.assertEqual(snapshot["device_reference_state"], "移动中")
+        self.assertEqual(snapshot["motion_state"], "静止")
+        self.assertEqual(snapshot["completed_movement_count"], 1)
+
+    def test_pc_mode_fast_rotation_is_not_forced_into_calibration(self) -> None:
+        store = MotionStore()
+        store.set_analysis_mode(1, "pc")
+        packet = 0
+        tick = 0
+
+        for _ in range(25):
+            store.process(make_frame(packet, 0x0001, tick))
+            packet += 1
+            tick += 4 * 328
+
+        # Transmitter reports CALIBRATING, while the current IMU clearly shows
+        # a fast rotation. PC mode must continue as moving, not zero the samples.
+        for _ in range(35):
+            store.process(
+                make_frame(
+                    packet,
+                    0x0040,
+                    tick,
+                    gyro_raw=(20000, 0, 0),
+                )
+            )
+            packet += 1
+            tick += 4 * 328
+        snapshot = store.snapshot(1)
+
+        self.assertEqual(snapshot["device_reference_state"], "校准中")
+        self.assertEqual(snapshot["motion_state"], "移动中")
+        self.assertGreater(
+            snapshot["current_movement"]["rotation_count"], 0
+        )
+
+    def test_pc_coordinate_points_are_filtered_by_source_sequence(self) -> None:
+        store = MotionStore()
+        store.set_analysis_mode(1, "pc")
+        packet = 0
+        tick = 0
+
+        for _ in range(25):
+            store.process(make_frame(packet, 0x0001, tick))
+            packet += 1
+            tick += 4 * 328
+
+        stale_sequence = 10
+        store.process(
+            make_frame(
+                packet,
+                0x0001,
+                tick,
+                x_mm=500,
+                gyro_raw=(0, 0, 1200),
+                coordinate_source_sequence=stale_sequence,
+            )
+        )
+        packet += 1
+        tick += 4 * 328
+        movement_start_sequence = packet * 4 - 3
+
+        # A coordinate tagged before the PC segment start is ignored.
+        store.process(
+            make_frame(
+                packet,
+                0x0002,
+                tick,
+                x_mm=600,
+                gyro_raw=(0, 0, 1200),
+                coordinate_source_sequence=movement_start_sequence - 20,
+            )
+        )
+        packet += 1
+        tick += 4 * 328
+        self.assertEqual(store.snapshot(1)["received_path"], [[0.0, 0.0, 0.0]])
+
+        # First aligned coordinate establishes the received origin; the next
+        # aligned point produces a relative device-path point.
+        store.process(
+            make_frame(
+                packet,
+                0x0002,
+                tick,
+                x_mm=700,
+                gyro_raw=(0, 0, 1200),
+                coordinate_source_sequence=movement_start_sequence + 1,
+            )
+        )
+        packet += 1
+        tick += 4 * 328
+        store.process(
+            make_frame(
+                packet,
+                0x0002,
+                tick,
+                x_mm=750,
+                gyro_raw=(0, 0, 1200),
+                coordinate_source_sequence=movement_start_sequence + 5,
+            )
+        )
+        snapshot = store.snapshot(1)
+
+        self.assertEqual(snapshot["received_path"][0], [0.0, 0.0, 0.0])
+        self.assertAlmostEqual(snapshot["received_path"][-1][0], 0.05, places=6)
+
+    def test_mode_switch_keeps_both_parallel_results(self) -> None:
+        store = MotionStore()
+        packet = 0
+        tick = 0
+        for _ in range(25):
+            store.process(make_frame(packet, 0x0001, tick))
+            packet += 1
+            tick += 4 * 328
+        store.process(
+            make_frame(packet, 0x0001, tick, gyro_raw=(0, 0, 1200))
+        )
+
+        device_snapshot = store.snapshot(1)
+        self.assertEqual(device_snapshot["analysis_mode"], "device")
+        self.assertEqual(device_snapshot["motion_state"], "静止")
+
+        store.set_analysis_mode(1, "pc")
+        pc_snapshot = store.snapshot(1)
+        self.assertEqual(pc_snapshot["motion_state"], "移动中")
+        self.assertIsNotNone(pc_snapshot["current_movement"])
+
+        store.set_analysis_mode(1, "device")
+        restored = store.snapshot(1)
+        self.assertEqual(restored["motion_state"], "静止")
+
+    def test_snapshot_exposes_realtime_orientation(self) -> None:
+        store = MotionStore()
+        store.process(make_frame(0, 0x0001, 0))
+
+        snapshot = store.snapshot(1)
+        orientation = snapshot["orientation"]
+
+        self.assertEqual(len(orientation["quaternion_wxyz"]), 4)
+        self.assertEqual(len(orientation["euler_degrees"]), 3)
+        self.assertEqual(len(orientation["body_x_world"]), 3)
+        self.assertEqual(orientation["yaw_reference"], "relative")
+        self.assertAlmostEqual(
+            sum(value * value for value in orientation["body_z_world"]),
+            1.0,
+            places=5,
+        )
+
+    def test_live_snapshot_is_lightweight_and_contains_latest_imu(self) -> None:
+        store = MotionStore()
+        store.process(
+            make_frame(
+                0,
+                0x0001,
+                0,
+                accel_raw=(50, -100, 4096),
+                gyro_raw=(33, -66, 131),
+            )
+        )
+
+        live = store.live_snapshot(1)
+
+        self.assertEqual(live["device_id"], 1)
+        self.assertEqual(len(live["accel_mps2"]), 3)
+        self.assertEqual(len(live["gyro_dps"]), 3)
+        self.assertIn("orientation", live)
+        self.assertIn("calculated_position_m", live)
+        self.assertFalse(live["position_semantics"]["pc_metric_reliable"])
+        self.assertEqual(
+            live["position_semantics"]["default_display"], "relative_shape"
+        )
+        self.assertNotIn("calculated_path", live)
+        self.assertNotIn("accel", live)
+
+
+    def test_short_movement_is_ignored_without_consuming_number(self) -> None:
+        store = MotionStore(minimum_movement_seconds=0.30)
+        packet = 0
+        tick = 0
+        for _ in range(5):
+            store.process(make_frame(packet, 0x0001, tick))
+            packet += 1
+            tick += 4 * 328
+        for _ in range(2):
+            store.process(make_frame(packet, 0x0002, tick))
+            packet += 1
+            tick += 4 * 328
+        for _ in range(25):
+            store.process(make_frame(packet, 0x0001, tick))
+            packet += 1
+            tick += 4 * 328
+
+        snapshot = store.snapshot(1)
+        self.assertEqual(snapshot["completed_movement_count"], 0)
+        self.assertEqual(snapshot["movement_filter"]["ignored_short_count"], 1)
+
+        for _ in range(10):
+            store.process(make_frame(packet, 0x0002, tick))
+            packet += 1
+            tick += 4 * 328
+        for _ in range(25):
+            store.process(make_frame(packet, 0x0001, tick))
+            packet += 1
+            tick += 4 * 328
+        snapshot = store.snapshot(1)
+        self.assertEqual(snapshot["completed_movement_count"], 1)
+        self.assertEqual(snapshot["completed_movements"][0]["movement_id"], 1)
+
+    def test_setting_removes_existing_short_records(self) -> None:
+        store = MotionStore(minimum_movement_seconds=0.0)
+        packet = 0
+        tick = 0
+        for _ in range(5):
+            store.process(make_frame(packet, 0x0001, tick))
+            packet += 1
+            tick += 4 * 328
+        for _ in range(2):
+            store.process(make_frame(packet, 0x0002, tick))
+            packet += 1
+            tick += 4 * 328
+        for _ in range(25):
+            store.process(make_frame(packet, 0x0001, tick))
+            packet += 1
+            tick += 4 * 328
+        self.assertEqual(store.snapshot(1)["completed_movement_count"], 1)
+
+        result = store.set_minimum_movement_seconds(0.30)
+        self.assertGreaterEqual(result["removed_existing_records_across_pipelines"], 1)
+        snapshot = store.snapshot(1)
+        self.assertEqual(snapshot["completed_movement_count"], 0)
+        self.assertEqual(snapshot["movement_filter"]["minimum_seconds"], 0.30)
 
 if __name__ == "__main__":
     unittest.main()

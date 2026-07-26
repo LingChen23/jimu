@@ -5,8 +5,8 @@
 #include <string.h>
 
 #define GRAVITY_MPS2                9.80665f
-#define ACCEL_SCALE_MPS2            (4.0f * GRAVITY_MPS2 / 32768.0f)
-#define GYRO_SCALE_RADPS            (500.0f * 3.14159265358979323846f / \
+#define ACCEL_SCALE_MPS2            (8.0f * GRAVITY_MPS2 / 32768.0f)
+#define GYRO_SCALE_RADPS            (1000.0f * 3.14159265358979323846f / \
                                      (180.0f * 32768.0f))
 #define NOMINAL_DT_SECONDS          0.01f
 #define CALIBRATION_SAMPLES         200U

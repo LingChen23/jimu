@@ -1,4 +1,4 @@
-# ESP32-S3 Motion V1 Single-Node Gateway
+# ESP32-S3 Motion V1 Single-Node USB Gateway
 
 This ESP-IDF project is the first hardware closure for one nRF52832 TX and
 one ESP32-S3 gateway. The ESP32-S3 acts as a BLE Central and connects only to:
@@ -18,11 +18,12 @@ scan -> connect -> exchange MTU 185 -> discover Motion Service
 Motion Data is a fixed 100-byte little-endian packet. Every packet contains
 four 100 Hz six-axis IMU samples plus the latest coordinate, so the BLE
 notification rate is 25 packets/s. Every packet is decoded, checked and
-forwarded unchanged through UART0 as a COBS + CRC32 gateway frame.
+forwarded unchanged through native USB Serial/JTAG CDC as a COBS + CRC32
+gateway frame.
 
-The UART business stream is `921600 8N1`. Each decoded gateway frame is 114
-bytes and each delimited wire frame is normally about 116 bytes. Runtime text
-logging is disabled so it cannot corrupt the binary stream. See
+Each decoded gateway frame is 114 bytes and each delimited USB frame is
+normally about 116 bytes. Runtime text logging is disabled so it cannot
+corrupt the binary stream. See
 `README_PROTOCOL.md` for the byte layout.
 
 The custom UUIDs are:
@@ -43,17 +44,18 @@ Motion Data:    6E410002-B5A3-F393-E0A9-E50E24DCCA9E
   -p COM14 -b 460800 flash
 ```
 
-The business UART is `COM14` at `921600` baud on the currently connected
-board. If flashing reports that COM14 is busy, disconnect the PC visualizer
-or any serial monitor before retrying.
+The board's `COM` connector remains available for flashing (currently COM14).
+The binary business stream uses the separate native `USB` connector, which
+enumerates as an ESP32-S3 USB Serial/JTAG CDC port (currently COM15). A baud
+setting supplied by PC serial software is ignored by native USB.
 
 The current implementation is intentionally limited to one TX. Multi-node
 connection scheduling and forwarding to an aggregator are later stages.
 
 ## Hardware validation
 
-The single-node binary closure was verified on 2026-07-25 with nRF device 1,
-ESP32-S3 COM14 and the local Python visualizer:
+The previous UART single-node binary closure was verified on 2026-07-25 with
+nRF device 1, ESP32-S3 COM14 and the local Python visualizer:
 
 ```text
 valid gateway frames: 5755

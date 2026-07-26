@@ -21,8 +21,8 @@ The ICM-20689 is sampled at 100 Hz. Four samples are batched into one fixed
 the sensor driver's calibrated and board-axis-mapped signed raw values:
 
 ```text
-acceleration range: +/-4 g, 8192 LSB/g
-angular-rate range: +/-500 deg/s, 65.5 LSB/(deg/s)
+acceleration range: +/-8 g, 4096 LSB/g
+angular-rate range: +/-1000 deg/s, 32.8 LSB/(deg/s)
 sample order: ax, ay, az, gx, gy, gz
 ```
 
@@ -52,3 +52,15 @@ timers from resetting the IMU time base.
 
 The SoftDevice RAM start for this target is `0x20003000`. This leaves enough
 reserved RAM for S132 with MTU 185.
+
+## Watchdog
+
+The active main loop owns a 6-second hardware watchdog. On a cold boot it
+configures and starts reload channel 0. If a soft reset enters the application
+with an already-running watchdog, startup immediately reloads every enabled
+channel and adopts the inherited configuration.
+
+Startup reloads occur only between major initialization stages. After the IMU
+starts, the watchdog is reloaded only after the main loop successfully reads
+and processes a valid IMU sample. A stalled sample interrupt, persistent SPI
+read failure, or blocked processing path therefore causes a hardware reset.

@@ -516,9 +516,9 @@ int icm_20689_init()
 
     dev_data.sample_freq = 100;
 
-    dev_data.acce_range = 4;
+    dev_data.acce_range = 8;
 
-    dev_data.gyro_range = 500;
+    dev_data.gyro_range = 1000;
 
     // ensure acce is running
     bit = 0x01;

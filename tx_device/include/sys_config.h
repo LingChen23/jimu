@@ -12,7 +12,7 @@
 #define CENTRAL_LINK_COUNT              0                                           /**< Number of central links used by the application. When changing this number remember to adjust the RAM settings*/
 #define PERIPHERAL_LINK_COUNT           1                                           /**< Number of peripheral links used by the application. When changing this number remember to adjust the RAM settings*/
 
-#define DEVICE_NAME                     "Mahjong"                                       /**< Name of device. Will be included in the advertising data. */
+#define DEVICE_NAME                     "SmartBlock"                                    /**< Name of device. Will be included in the advertising data. */
 #define NUS_SERVICE_UUID_TYPE           BLE_UUID_TYPE_VENDOR_BEGIN                  /**< UUID type for the Nordic UART Service (vendor specific). */
 
 #define APP_ADV_INTERVAL                100                                          /**< The advertising interval (in units of 0.625 ms. This value corresponds to 40 ms). */
@@ -36,7 +36,6 @@
 
 #define NUS_BUF_SIZE                    (4096)
 
-#define WDT_FEED_INTERVAL               APP_TIMER_TICKS(1000, APP_TIMER_PRESCALER)
 #define DFU_TIMEOUT_INTERVAL            APP_TIMER_TICKS(60000, APP_TIMER_PRESCALER)
 
 #define SYS_CONFIG_PAGE                 (NRF_FICR->CODESIZE - 31)//use last-31 page in flash

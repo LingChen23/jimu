@@ -489,7 +489,8 @@
         <div class="metric"><div class="metric-label">平均 / 中位速度</div><div id="meanMedianSpeed" class="metric-value">0.000 / 0.000</div></div>
         <div class="metric"><div class="metric-label">速度标准差</div><div id="speedStd" class="metric-value">0.000 m/s</div></div>
         <div class="metric"><div class="metric-label">完整旋转</div><div id="rotationCount" class="metric-value">0 次</div></div>
-        <div class="metric"><div class="metric-label">空中停顿</div><div id="pauseCount" class="metric-value">0 次</div></div>
+        <div class="metric"><div class="metric-label">翻转</div><div id="flipCount" class="metric-value">0 次</div></div>
+        <div class="metric"><div class="metric-label">停顿（≥0.8s）</div><div id="pauseCount" class="metric-value">0 次</div></div>
         <div class="metric"><div class="metric-label">掉落</div><div id="dropCount" class="metric-value">0 次</div></div>
         <div class="metric"><div class="metric-label">本段震颤</div><div id="segmentTremor" class="metric-value">待结束计算</div></div>
         <div class="metric"><div class="metric-label">会话平均震颤频率</div><div id="sessionTremorFrequency" class="metric-value">— Hz</div></div>
@@ -497,8 +498,8 @@
       </div>
       <div class="movement-table-wrap">
         <table class="movement-table">
-          <thead><tr><th>移动</th><th>开始时间（北京）</th><th>时长(s)</th><th>最大 / 平均速度</th><th>旋转</th><th>空中停顿</th><th>掉落</th><th>震颤主频</th><th>震颤强度</th><th>详情</th></tr></thead>
-          <tbody id="movementRows"><tr><td colspan="10" class="movement-empty">尚无完整移动</td></tr></tbody>
+          <thead><tr><th>移动</th><th>开始时间（北京）</th><th>时长(s)</th><th>最大 / 平均速度</th><th>旋转</th><th>翻转</th><th>停顿</th><th>掉落</th><th>震颤主频</th><th>震颤强度</th><th>详情</th></tr></thead>
+          <tbody id="movementRows"><tr><td colspan="11" class="movement-empty">尚无完整移动</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -596,7 +597,7 @@
         <div id="detailAccelStats" class="movement-table-wrap"></div>
       </section>
       <section class="detail-section">
-        <h3>空中与掉落事件</h3>
+        <h3>停顿与掉落事件</h3>
         <div id="detailEvents" class="detail-note">无事件</div>
       </section>
       <div id="detailMethodNote" class="detail-note"></div>
@@ -645,6 +646,7 @@
       meanMedianSpeed: document.getElementById("meanMedianSpeed"),
       speedStd: document.getElementById("speedStd"),
       rotationCount: document.getElementById("rotationCount"),
+      flipCount: document.getElementById("flipCount"),
       pauseCount: document.getElementById("pauseCount"),
       dropCount: document.getElementById("dropCount"),
       segmentTremor: document.getElementById("segmentTremor"),
@@ -1391,6 +1393,7 @@
         elements.meanMedianSpeed.textContent = "0.000 / 0.000";
         elements.speedStd.textContent = "0.000 m/s";
         elements.rotationCount.textContent = "0 次";
+        elements.flipCount.textContent = "0 次";
         elements.pauseCount.textContent = "0 次";
         elements.dropCount.textContent = "0 次";
         elements.segmentTremor.textContent = "待结束计算";
@@ -1407,10 +1410,10 @@
         elements.meanMedianSpeed.textContent =
           `${finiteNumber(speed.mean).toFixed(3)} / ${finiteNumber(speed.median).toFixed(3)}`;
         elements.speedStd.textContent = `${finiteNumber(speed.std).toFixed(3)} m/s`;
-        const turns = finiteNumber(movement.rotation_turns || movement.rotation_count);
-        elements.rotationCount.textContent =
-          `${movement.rotation_count || 0} 次 · 累计 ${turns.toFixed(2)} 圈`;
-        elements.pauseCount.textContent = `${movement.pause_count || 0} 次`;
+        elements.rotationCount.textContent = `${movement.rotation_count || 0} 次`;
+        elements.flipCount.textContent = `${movement.flip_count || 0} 次`;
+        elements.pauseCount.textContent =
+          `${movement.pause_count || 0} 次 · ${finiteNumber(movement.pause_total_seconds).toFixed(1)} s`;
         elements.dropCount.textContent = `${movement.drop_count || 0} 次`;
         elements.segmentTremor.textContent = tremor.valid
           ? `${finiteNumber(tremor.dominant_frequency_hz).toFixed(2)} Hz / ${finiteNumber(tremor.intensity_dps).toFixed(2)} °/s`
@@ -1421,7 +1424,7 @@
       elements.movementRows.replaceChildren();
       if (!completed.length) {
         const row = document.createElement("tr");
-        row.innerHTML = '<td colspan="10" class="movement-empty">尚无完整移动</td>';
+        row.innerHTML = '<td colspan="11" class="movement-empty">尚无完整移动</td>';
         elements.movementRows.appendChild(row);
         return;
       }
@@ -1437,7 +1440,8 @@
           compactTime(item.time?.start?.beijing),
           finiteNumber(item.moving_seconds).toFixed(2),
           `${finiteNumber(speed.max).toFixed(3)} / ${finiteNumber(speed.mean).toFixed(3)}`,
-          `${item.rotation_count || 0} / ${finiteNumber(item.rotation_turns).toFixed(2)}圈`,
+          `${item.rotation_count || 0} 次`,
+          `${item.flip_count || 0} 次`,
           `${item.pause_count || 0} 次`,
           `${item.drop_count || 0} 次`,
           tremor.valid ? `${finiteNumber(tremor.dominant_frequency_hz).toFixed(2)} Hz` : "—",
@@ -1625,8 +1629,9 @@
         ["平均速度（估算）", `${finiteNumber(speed.mean).toFixed(4)} m/s`],
         ["速度中位数", `${finiteNumber(speed.median).toFixed(4)} m/s`],
         ["速度标准差", `${finiteNumber(speed.std).toFixed(4)} m/s`],
-        ["完整旋转", `${detail.rotation_count || 0} 次；累计 ${finiteNumber(detail.rotation_turns).toFixed(3)} 圈`],
-        ["空中停顿", `${detail.pause_count || 0} 次`],
+        ["完整旋转", `${detail.rotation_count || 0} 次`],
+        ["翻转", `${detail.flip_count || 0} 次`],
+        ["停顿（≥0.8s后恢复）", `${detail.pause_count || 0} 次；累计 ${finiteNumber(detail.pause_total_seconds).toFixed(3)} s`],
         ["掉落", `${detail.drop_count || 0} 次`],
         ["本段震颤主频", tremor.valid ? `${finiteNumber(tremor.dominant_frequency_hz).toFixed(3)} Hz` : (tremor.reason || "不可用")],
         ["本段震颤强度", tremor.valid ? `${finiteNumber(tremor.intensity_dps).toFixed(3)} °/s` : "—"],
@@ -1637,13 +1642,20 @@
       ].forEach(([label, value]) => addDetailCard(label, value));
 
       elements.detailAccelStats.replaceChildren(axisStatsTable(detail.acceleration_statistics));
+      const pauses = detail.pause_events || [];
       const drops = detail.drop_events || [];
       elements.detailEvents.replaceChildren();
-      if (!drops.length) {
-        elements.detailEvents.textContent = "该段未识别到掉落事件。";
+      if (!pauses.length && !drops.length) {
+        elements.detailEvents.textContent = "该段未识别到停顿或掉落事件。";
       } else {
         const list = document.createElement("ul");
         list.className = "event-list";
+        pauses.forEach(item => {
+          const li = document.createElement("li");
+          li.textContent =
+            `停顿 ${item.pause_index}：${finiteNumber(item.duration_seconds).toFixed(3)} s`;
+          list.appendChild(li);
+        });
         drops.forEach(item => {
           const li = document.createElement("li");
           li.textContent = `掉落 ${item.drop_index}：冲击 ${finiteNumber(item.impact_g).toFixed(2)} g，发生于 ${finiteNumber(item.impact_s).toFixed(3)} s`;

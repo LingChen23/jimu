@@ -55,22 +55,28 @@ COORD_ORIGIN = 0x0004
 COORD_STOP = 0x0008
 COORD_CALIBRATING = 0x0040
 
-STOP_HOLD_SECONDS = 0.8
+PAUSE_MIN_SECONDS = 0.8
+MOVEMENT_END_HOLD_SECONDS = 3.0
 SHAKE_START_MPS2 = 1.5 * GRAVITY
 SHAKE_END_MPS2 = 0.7 * GRAVITY
 SHAKE_GYRO_DPS = 300.0
 SHAKE_COOLDOWN_SECONDS = 0.45
-ROTATION_THRESHOLD_DEGREES = 360.0
-ROTATION_RATE_DEADBAND_DPS = 3.0
+# A physical full turn often integrates below 360 degrees because the first and
+# last slow samples fall under the rate gate. 330 degrees keeps a modest sensor
+# tolerance without allowing ordinary movement to become a completed rotation.
+ROTATION_THRESHOLD_DEGREES = 330.0
+ROTATION_START_RATE_DPS = 10.0
+ROTATION_CONTINUE_RATE_DPS = 5.0
+ROTATION_AXIS_ALIGNMENT = 0.65
+ROTATION_REVERSE_ALIGNMENT = -0.25
+ROTATION_GAP_RESET_SECONDS = 0.35
+ROTATION_AXIS_TRACK_RATE = 0.05
 
-# A "pause" is intentionally defined as a short airborne/free-fall phase inside
-# an active movement.  It is detected from the norm of specific force, not from
-# the delayed device STOP/STATIONARY flags.  Hysteresis prevents one airborne
-# interval from being counted repeatedly.
-AIRBORNE_PAUSE_START_G = 0.68
-AIRBORNE_PAUSE_END_G = 0.82
-AIRBORNE_PAUSE_CONFIRM_SECONDS = 0.08
-AIRBORNE_PAUSE_RESET_SECONDS = 0.06
+# A flip is a persistent transition of the device Z axis to the opposite
+# hemisphere.  The reference is updated after every accepted flip, so flipping
+# back counts as another event while a pure yaw rotation does not.
+FLIP_OPPOSITE_DOT = math.cos(math.radians(150.0))
+FLIP_CONFIRM_SECONDS = 0.10
 
 # Drop: a confirmed low-g interval followed by a strong impact.  These defaults
 # are deliberately conservative and are exposed in movement detail metadata.
@@ -823,6 +829,7 @@ class MovementStats:
     accel_max: float = 0.0
     shake_count: int = 0
     rotation_count: int = 0
+    flip_count: int = 0
     pause_count: int = 0
     drop_count: int = 0
     pending_stop_tick: int | None = None
@@ -831,9 +838,12 @@ class MovementStats:
     shake_active: bool = False
     last_shake_tick: int | None = None
     rotation_degrees_total: float = 0.0
-    airborne_pause_candidate_seconds: float = 0.0
-    airborne_pause_reset_seconds: float = 0.0
-    airborne_pause_active: bool = False
+    rotation_progress_degrees: float = 0.0
+    rotation_axis: list[float] | None = None
+    rotation_gap_seconds: float = 0.0
+    flip_reference_up: list[float] = field(default_factory=list)
+    flip_candidate_seconds: float = 0.0
+    pause_events: list[dict[str, Any]] = field(default_factory=list)
     drop_freefall_candidate_seconds: float = 0.0
     drop_freefall_start_s: float | None = None
     drop_armed: bool = False
@@ -853,6 +863,106 @@ class MovementStats:
     speed_statistics: dict[str, Any] = field(default_factory=dict)
     accel_statistics: dict[str, Any] = field(default_factory=dict)
     tremor: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.flip_reference_up = list(self.start_up)
+
+    def _update_rotation(self, gyro_dps: list[float], dt: float) -> None:
+        magnitude = _norm(gyro_dps)
+        if magnitude < ROTATION_CONTINUE_RATE_DPS:
+            if self.rotation_axis is not None:
+                self.rotation_gap_seconds += dt
+        else:
+            direction = [value / magnitude for value in gyro_dps]
+            if self.rotation_axis is None:
+                if magnitude >= ROTATION_START_RATE_DPS:
+                    self.rotation_axis = direction
+                    self.rotation_progress_degrees = magnitude * dt
+                    self.rotation_gap_seconds = 0.0
+            else:
+                alignment = sum(
+                    direction[axis] * self.rotation_axis[axis]
+                    for axis in range(3)
+                )
+                if alignment >= ROTATION_AXIS_ALIGNMENT:
+                    self.rotation_progress_degrees += (
+                        magnitude * alignment * dt
+                    )
+                    tracked_axis = [
+                        (1.0 - ROTATION_AXIS_TRACK_RATE)
+                        * self.rotation_axis[axis]
+                        + ROTATION_AXIS_TRACK_RATE * direction[axis]
+                        for axis in range(3)
+                    ]
+                    tracked_norm = _norm(tracked_axis)
+                    if tracked_norm > 1e-9:
+                        self.rotation_axis = [
+                            value / tracked_norm for value in tracked_axis
+                        ]
+                    self.rotation_gap_seconds = 0.0
+                elif alignment <= ROTATION_REVERSE_ALIGNMENT:
+                    self.rotation_progress_degrees = max(
+                        0.0,
+                        self.rotation_progress_degrees
+                        + magnitude * alignment * dt,
+                    )
+                    self.rotation_gap_seconds = 0.0
+                    if self.rotation_progress_degrees <= 1e-6:
+                        self.rotation_axis = direction
+                else:
+                    self.rotation_gap_seconds += dt
+
+        if self.rotation_gap_seconds >= ROTATION_GAP_RESET_SECONDS:
+            self.rotation_axis = None
+            self.rotation_progress_degrees = 0.0
+            self.rotation_gap_seconds = 0.0
+
+        while (
+            self.rotation_progress_degrees + 1e-6
+            >= ROTATION_THRESHOLD_DEGREES
+        ):
+            self.rotation_count += 1
+            self.rotation_degrees_total += ROTATION_THRESHOLD_DEGREES
+            self.rotation_progress_degrees -= ROTATION_THRESHOLD_DEGREES
+
+    def _update_flip(self, up_world: list[float], dt: float) -> None:
+        reference_norm = _norm(self.flip_reference_up)
+        up_norm = _norm(up_world)
+        if reference_norm <= 1e-9 or up_norm <= 1e-9:
+            self.flip_candidate_seconds = 0.0
+            return
+        opposite_dot = sum(
+            self.flip_reference_up[axis] * up_world[axis]
+            for axis in range(3)
+        ) / (reference_norm * up_norm)
+        if opposite_dot <= FLIP_OPPOSITE_DOT:
+            self.flip_candidate_seconds += dt
+            if self.flip_candidate_seconds >= FLIP_CONFIRM_SECONDS:
+                self.flip_count += 1
+                self.flip_reference_up = [
+                    value / up_norm for value in up_world
+                ]
+                self.flip_candidate_seconds = 0.0
+        else:
+            self.flip_candidate_seconds = 0.0
+
+    def add_pause(
+        self,
+        start_tick: int,
+        end_tick: int,
+        start_epoch: float | None,
+        end_epoch: float | None,
+    ) -> None:
+        duration = _tick_seconds(end_tick, start_tick)
+        if duration + 1e-9 < PAUSE_MIN_SECONDS:
+            return
+        self.pause_count += 1
+        self.pause_events.append({
+            "pause_index": self.pause_count,
+            "duration_seconds": duration,
+            "start": _iso_times(start_epoch),
+            "end": _iso_times(end_epoch),
+        })
 
     def add_sample(
         self,
@@ -894,47 +1004,16 @@ class MovementStats:
         ):
             self.shake_active = False
 
-        # Rotation is orientation travel accumulated from the corrected angular
-        # rate vector.  It is independent of the instantaneous axis and does not
-        # cancel when direction reverses.
-        if gyro_magnitude >= ROTATION_RATE_DEADBAND_DPS:
-            self.rotation_degrees_total += gyro_magnitude * estimate.dt
-            self.rotation_count = int(
-                (self.rotation_degrees_total + 1e-6)
-                // ROTATION_THRESHOLD_DEGREES
-            )
+        # A complete rotation requires a coherent angular-rate direction.
+        # Reversals cancel progress and short orthogonal bursts reset the event,
+        # preventing ordinary translation and shaking from accumulating turns.
+        self._update_rotation(estimate.corrected_gyro_dps, estimate.dt)
 
-        # Airborne pause count: low-specific-force intervals are counted with
-        # confirmation and hysteresis, but duration is intentionally not stored
-        # or reported.
-        if specific_force_g <= AIRBORNE_PAUSE_START_G:
-            self.airborne_pause_reset_seconds = 0.0
-            if not self.airborne_pause_active:
-                self.airborne_pause_candidate_seconds += estimate.dt
-                if (
-                    self.airborne_pause_candidate_seconds
-                    >= AIRBORNE_PAUSE_CONFIRM_SECONDS
-                ):
-                    self.pause_count += 1
-                    self.airborne_pause_active = True
-                    self.airborne_pause_candidate_seconds = 0.0
-        else:
-            self.airborne_pause_candidate_seconds = 0.0
-            if self.airborne_pause_active:
-                if specific_force_g >= AIRBORNE_PAUSE_END_G:
-                    self.airborne_pause_reset_seconds += estimate.dt
-                    if (
-                        self.airborne_pause_reset_seconds
-                        >= AIRBORNE_PAUSE_RESET_SECONDS
-                    ):
-                        self.airborne_pause_active = False
-                        self.airborne_pause_reset_seconds = 0.0
-                else:
-                    self.airborne_pause_reset_seconds = 0.0
+        # Flip counting is independent from complete 360-degree rotations.
+        self._update_flip(estimate.up_world, estimate.dt)
 
         # Drop: confirmed near-free-fall followed by a high-g impact within the
-        # configured time window. A low-g interval without an impact only affects
-        # the airborne-pause count and is not recorded as a drop.
+        # configured time window. Low-g alone is neither a pause nor a drop.
         if not self.drop_armed:
             if specific_force_g <= DROP_FREEFALL_G:
                 if self.drop_freefall_candidate_seconds <= 0.0:
@@ -1149,8 +1228,13 @@ class MovementStats:
             "shake_count": self.shake_count,
             "rotation_count": self.rotation_count,
             "rotation_turns": self.rotation_degrees_total / ROTATION_THRESHOLD_DEGREES,
+            "rotation_progress_degrees": self.rotation_progress_degrees,
+            "flip_count": self.flip_count,
             "pause_count": self.pause_count,
-            "pause_definition": "airborne_count_only",
+            "pause_total_seconds": sum(
+                float(event["duration_seconds"]) for event in self.pause_events
+            ),
+            "pause_definition": "stationary_at_least_0.8s_then_resume",
             "drop_count": self.drop_count,
             "speed": live_speed_stats,
             "tremor": tremor,
@@ -1180,13 +1264,21 @@ class MovementStats:
             "acceleration_series": acceleration_series,
             "dynamic_acceleration_series": dynamic_acceleration_series,
             "speed_series": speed_series,
+            "pause_events": self.pause_events,
             "drop_events": self.drop_events,
             "calculated_path": self.calculated_path_final,
             "received_path": self.received_path_final,
             "device_coordinates": self.device_coordinate_records,
             "analysis_parameters": {
-                "airborne_pause_start_g": AIRBORNE_PAUSE_START_G,
-                "airborne_pause_confirm_seconds": AIRBORNE_PAUSE_CONFIRM_SECONDS,
+                "pause_min_seconds": PAUSE_MIN_SECONDS,
+                "movement_end_hold_seconds": MOVEMENT_END_HOLD_SECONDS,
+                "rotation_start_rate_dps": ROTATION_START_RATE_DPS,
+                "rotation_continue_rate_dps": ROTATION_CONTINUE_RATE_DPS,
+                "rotation_threshold_degrees": ROTATION_THRESHOLD_DEGREES,
+                "rotation_axis_alignment": ROTATION_AXIS_ALIGNMENT,
+                "rotation_gap_reset_seconds": ROTATION_GAP_RESET_SECONDS,
+                "flip_opposite_degrees": 150.0,
+                "flip_confirm_seconds": FLIP_CONFIRM_SECONDS,
                 "speed_p05_percentile": SPEED_PERCENTILE,
                 "speed_core_trim_fraction": SPEED_CORE_TRIM_FRACTION,
                 "speed_core_trim_max_seconds": SPEED_CORE_TRIM_MAX_SECONDS,
@@ -1226,10 +1318,14 @@ class MovementStats:
         writer.writerow(["metadata", "end_computer", _iso_times(self.end_epoch)["computer"]])
         writer.writerow(["metadata", "start_beijing", _iso_times(self.start_epoch)["beijing"]])
         writer.writerow(["metadata", "end_beijing", _iso_times(self.end_epoch)["beijing"]])
-        writer.writerow(["metadata", "airborne_pause_count", self.pause_count])
+        writer.writerow(["metadata", "pause_count", self.pause_count])
+        writer.writerow(["metadata", "pause_total_seconds", sum(
+            float(event["duration_seconds"]) for event in self.pause_events
+        )])
         writer.writerow(["metadata", "speed_p05_mps", self.speed_statistics.get("p05")])
         writer.writerow(["metadata", "drop_count", self.drop_count])
-        writer.writerow(["metadata", "rotation_turns", self.rotation_degrees_total / 360.0])
+        writer.writerow(["metadata", "rotation_count", self.rotation_count])
+        writer.writerow(["metadata", "flip_count", self.flip_count])
         writer.writerow(["metadata", "tremor_frequency_hz", self.tremor.get("dominant_frequency_hz")])
         writer.writerow(["metadata", "tremor_intensity_dps", self.tremor.get("intensity_dps")])
         writer.writerow(["metadata", "session_mean_tremor_frequency_hz", session_tremor.get("mean_frequency_hz")])
@@ -1325,10 +1421,20 @@ class AnalysisPipeline:
         )
         self.motion_state = "移动中"
 
-    def _resume_movement(self, tick: int) -> None:
+    def _resume_movement(
+        self,
+        tick: int,
+        resume_epoch: float | None,
+    ) -> None:
         movement = self.current_movement
         if movement is None or movement.pending_stop_tick is None:
             return
+        movement.add_pause(
+            movement.pending_stop_tick,
+            tick,
+            movement.pending_stop_epoch,
+            resume_epoch,
+        )
         movement.pending_stop_tick = None
         movement.pending_stop_sequence = None
         movement.pending_stop_epoch = None
@@ -1409,8 +1515,11 @@ class AnalysisPipeline:
         movement = self.current_movement
         if movement is None or movement.pending_stop_tick is None:
             return
-        if _tick_seconds(tick, movement.pending_stop_tick) >= STOP_HOLD_SECONDS:
+        stopped_seconds = _tick_seconds(tick, movement.pending_stop_tick)
+        if stopped_seconds >= MOVEMENT_END_HOLD_SECONDS:
             self._finish_movement()
+        elif stopped_seconds >= PAUSE_MIN_SECONDS:
+            self.motion_state = "停顿中"
 
     def _append_received_coordinate(
         self,
@@ -1464,7 +1573,10 @@ class AnalysisPipeline:
                     frame,
                 )
             elif self.current_movement.pending_stop_tick is not None:
-                self._resume_movement(first_sample.tick_32k)
+                self._resume_movement(
+                    first_sample.tick_32k,
+                    first_epoch,
+                )
         elif stationary_now:
             if self.current_movement is not None:
                 self._mark_stop(
@@ -1532,7 +1644,14 @@ class AnalysisPipeline:
                 self._resume_movement(
                     decision.transition_tick
                     if decision.transition_tick is not None
-                    else sample.tick_32k
+                    else sample.tick_32k,
+                    _sample_epoch(
+                        frame_epoch,
+                        decision.transition_tick
+                        if decision.transition_tick is not None
+                        else sample.tick_32k,
+                        last_tick,
+                    ),
                 )
 
             if decision.started and self.current_movement is None:

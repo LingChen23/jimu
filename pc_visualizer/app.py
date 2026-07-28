@@ -173,6 +173,18 @@ class ApiHandler(SimpleHTTPRequestHandler):
                     }
                 )
                 return
+            if self.path == "/api/device/reset-packet-counters":
+                device_id = max(1, min(12, int(body.get("device", 1))))
+                if not STORE.reset_packet_counters(device_id):
+                    raise ValueError("设备不存在")
+                self._json_response(
+                    {
+                        "ok": True,
+                        "device_id": device_id,
+                        "snapshot": STORE.snapshot(device_id),
+                    }
+                )
+                return
             if self.path == "/api/device/command":
                 device_id = max(1, min(12, int(body.get("device", 1))))
                 command = str(body.get("command", "")).upper()

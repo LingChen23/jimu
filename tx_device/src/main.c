@@ -444,6 +444,9 @@ static void gap_params_init(void)
 
     err_code = sd_ble_gap_ppcp_set(&gap_conn_params);
     APP_ERROR_CHECK(err_code);
+
+    err_code = sd_ble_gap_tx_power_set(BLE_TX_POWER_DBM);
+    APP_ERROR_CHECK(err_code);
 }
 
 static void nus_data_handler(ble_nus_t* p_evt)
@@ -485,6 +488,7 @@ static void services_init(void)
     APP_ERROR_CHECK(err_code);
 }
 
+#if TX_CONN_PARAMS_UPDATE_ENABLED
 static void on_conn_params_evt(ble_conn_params_evt_t* p_evt)
 {
     uint32_t err_code;
@@ -520,6 +524,12 @@ static void conn_params_init(void)
     err_code = ble_conn_params_init(&cp_init);
     APP_ERROR_CHECK(err_code);
 }
+#else
+static void conn_params_init(void)
+{
+    /* Optional diagnostic build: retain the interval chosen by the ESP32. */
+}
+#endif
 
 static void on_adv_evt(ble_adv_evt_t ble_adv_evt)
 {
@@ -639,7 +649,9 @@ static void on_ble_evt(ble_evt_t* p_ble_evt)
 
 static void ble_evt_dispatch(ble_evt_t* p_ble_evt)
 {
+#if TX_CONN_PARAMS_UPDATE_ENABLED
     ble_conn_params_on_ble_evt(p_ble_evt);
+#endif
     ble_nus_on_ble_evt(&m_nus, p_ble_evt);
     motion_service_on_ble_evt(&m_motion_service, p_ble_evt);
     on_ble_evt(p_ble_evt);
@@ -1373,7 +1385,8 @@ static void motion_build_info_payload(uint8_t payload[MOTION_INFO_PAYLOAD_SIZE])
     payload[0] = (uint8_t)TX_DEVICE_ID;
     payload[1] = 0U;
     payload[2] = 1U;
-    payload[3] = 0U;
+    /* Firmware 0.1.3: every device actively requests the 30 ms interval. */
+    payload[3] = 3U;
     payload[4] = MOTION_PROTOCOL_VERSION;
     payload[5] = 8U;
     motion_put_le16(&payload[6], 1000U);

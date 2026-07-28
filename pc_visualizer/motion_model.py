@@ -1965,6 +1965,11 @@ class DeviceState:
         self.clock_anchor_tick = None
         self.clock_anchor_epoch = None
 
+    def reset_packet_counters(self) -> None:
+        self.packet_count = 0
+        self.lost_packets = 0
+        self.last_packet_sequence = None
+
     def process(self, frame: MotionFrame) -> None:
         frame_epoch = time.time()
         last_sample_tick = frame.samples[-1].tick_32k
@@ -2198,6 +2203,14 @@ class MotionStore:
             if state is None:
                 return False
             state.clear_analysis()
+        return True
+
+    def reset_packet_counters(self, device_id: int) -> bool:
+        with self._lock:
+            state = self._devices.get(device_id)
+            if state is None:
+                return False
+            state.reset_packet_counters()
         return True
 
     def set_analysis_mode(self, device_id: int, mode: str) -> bool:

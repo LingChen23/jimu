@@ -362,6 +362,27 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(after["completed_movement_count"], 0)
         self.assertEqual(after["received_path"], [])
 
+    def test_reset_packet_counters_preserves_analysis_and_rebases_loss(self) -> None:
+        store = MotionStore()
+        store.process(make_frame(10, 0x0002, 0, x_mm=100))
+        store.process(make_frame(12, 0x0002, 4 * 328, x_mm=200))
+        before = store.snapshot(1)
+
+        self.assertEqual(before["packet_count"], 2)
+        self.assertEqual(before["lost_packets"], 1)
+        self.assertTrue(store.reset_packet_counters(1))
+
+        after = store.snapshot(1)
+        self.assertEqual(after["packet_count"], 0)
+        self.assertEqual(after["lost_packets"], 0)
+        self.assertEqual(after["sample_count"], before["sample_count"])
+        self.assertEqual(after["received_path"], before["received_path"])
+
+        store.process(make_frame(100, 0x0002, 8 * 328, x_mm=300))
+        rebased = store.snapshot(1)
+        self.assertEqual(rebased["packet_count"], 1)
+        self.assertEqual(rebased["lost_packets"], 0)
+
     def test_shake_and_flip_are_counted_independently(self) -> None:
         movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
         estimate = InertialEstimate(

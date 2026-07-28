@@ -133,6 +133,27 @@ sensor/sample errors: 0
 negotiated links: MTU 185, DLE 189 octets, PHY 1M
 ```
 
+## Link-budget and reconnect protection
+
+The gateway uses the highest ESP-IDF 5.2.3 ESP32-S3 controller power selector,
+`CONFIG_BT_CTRL_DFT_TX_POWER_LEVEL_P21`. This is the controller's maximum
+approximately-20-dBm class setting; the matching nRF52832 application
+explicitly selects its supported maximum of +4 dBm.
+
+Scanning no longer runs continuously when a target disconnects. Each retry is:
+
+```text
+passive scan
+scan interval: 100 ms
+scan window: 15 ms
+scan duration: 2 seconds
+pause before next retry: 2 seconds
+```
+
+The 15% in-burst scan duty cycle and the pause between retries preserve radio
+time for links that remain connected. The existing 5 ms per-link connection
+event cap remains enabled so a weak link cannot monopolize the controller.
+
 Successful `STOP_STREAM` and `START_STREAM` commands reset only the ESP32
 sequence baseline. This prevents the intentional no-stream interval—during
 which the nRF sampling sequence continues—from being counted as BLE packet

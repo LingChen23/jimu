@@ -23,6 +23,7 @@
 #define APP_TIMER_PRESCALER             0                                           /**< Value of the RTC1 PRESCALER register. */
 #define APP_TIMER_OP_QUEUE_SIZE         4                                           /**< Size of timer operation queues. */
 
+#define BLE_TX_POWER_DBM                4                                           /**< Explicit nRF52832 BLE transmit power (+4 dBm maximum). */
 #define MIN_CONN_INTERVAL               MSEC_TO_UNITS(30, UNIT_1_25_MS)             /**< All SmartBlock devices use a 30 ms connection interval. */
 #define MAX_CONN_INTERVAL               MSEC_TO_UNITS(30, UNIT_1_25_MS)             /**< All SmartBlock devices use a 30 ms connection interval. */
 #define SLAVE_LATENCY                   0                                           /**< Slave latency. */
@@ -30,6 +31,13 @@
 #define FIRST_CONN_PARAMS_UPDATE_DELAY  APP_TIMER_TICKS(5000, APP_TIMER_PRESCALER)  /**< Time from initiating event (connect or start of notification) to first time sd_ble_gap_conn_param_update is called (5 seconds). */
 #define NEXT_CONN_PARAMS_UPDATE_DELAY   APP_TIMER_TICKS(30000, APP_TIMER_PRESCALER) /**< Time between each call to sd_ble_gap_conn_param_update after the first call (30 seconds). */
 #define MAX_CONN_PARAMS_UPDATE_COUNT    3                                           /**< Number of attempts before giving up the connection parameter negotiation. */
+
+/*
+ * Every SmartBlock requests the preferred 30 ms connection interval about
+ * five seconds after connecting. Keeping the behavior identical across all
+ * device IDs avoids leaving device 1 on a gateway-selected interval.
+ */
+#define TX_CONN_PARAMS_UPDATE_ENABLED   1U
 
 #define DEAD_BEEF                       0xDEADBEEF                                  /**< Value used as error code on stack dump, can be used to identify stack location on stack unwind. */
 

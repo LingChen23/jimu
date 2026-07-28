@@ -444,6 +444,7 @@
           <button type="button" data-command="GET_INFO">设备信息</button>
           <button type="button" data-command="GET_STATUS">运行状态</button>
           <button type="button" data-command="RESET_STATS">清零设备计数</button>
+          <button id="resetPacketCounters" type="button" title="仅清零当前设备在PC端的解析数据包和丢包计数">清零PC包计数</button>
           <button type="button" data-command="RECALIBRATE">重新校准</button>
           <button type="button" class="danger" data-command="REBOOT">重启设备</button>
         </div>
@@ -651,6 +652,7 @@
       linkInvalidDisconnect: document.getElementById("linkInvalidDisconnect"),
       linkRetransmissions: document.getElementById("linkRetransmissions"),
       linkGatewayQueue: document.getElementById("linkGatewayQueue"),
+      resetPacketCounters: document.getElementById("resetPacketCounters"),
       reset: document.getElementById("resetAnalysis"),
       toggleMode: document.getElementById("toggleAnalysisMode"),
       analysisModeLabel: document.getElementById("analysisModeLabel"),
@@ -1949,6 +1951,23 @@
       }
     }
 
+    async function resetPacketCounters() {
+      elements.error.textContent = "";
+      try {
+        const result = await api("/api/device/reset-packet-counters", {
+          method: "POST",
+          body: JSON.stringify({device: selectedDevice})
+        });
+        render({
+          ...result.snapshot,
+          serial: latestSnapshot?.serial,
+          control: latestSnapshot?.control
+        });
+      } catch (error) {
+        elements.error.textContent = error.message;
+      }
+    }
+
     async function applyMovementFilter() {
       elements.error.textContent = "";
       const value = Number(elements.minimumMovementSeconds.value);
@@ -2010,11 +2029,12 @@
     elements.refresh.addEventListener("click", loadPorts);
     elements.open.addEventListener("click", () => setSerial(true));
     elements.close.addEventListener("click", () => setSerial(false));
-    elements.commandButtons.querySelectorAll("button").forEach(button => {
+    elements.commandButtons.querySelectorAll("button[data-command]").forEach(button => {
       button.addEventListener("click", () => {
         sendDeviceCommand(button.dataset.command, button);
       });
     });
+    elements.resetPacketCounters.addEventListener("click", resetPacketCounters);
     elements.reset.addEventListener("click", resetAnalysis);
     elements.toggleMode.addEventListener("click", toggleAnalysisMode);
     elements.applyMovementFilter.addEventListener("click", applyMovementFilter);

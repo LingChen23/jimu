@@ -21,7 +21,10 @@
 #include "motion_protocol.h"
 
 #define TARGET_DEVICE_NAME       "SmartBlock"
-#define SCAN_DURATION_MS         BLE_HS_FOREVER
+#define SCAN_DURATION_MS         2000
+#define SCAN_INTERVAL_MS         100
+#define SCAN_WINDOW_MS           15
+#define SCAN_RETRY_DELAY_MS      2000
 #define CONNECT_TIMEOUT_MS       30000
 #define MAX_MAHJONG_CONNECTIONS  4U
 #define INVALID_PEER_INDEX       UINT8_MAX
@@ -239,6 +242,7 @@ typedef struct {
 static uint8_t s_own_addr_type;
 static bool s_scanning;
 static uint8_t s_connecting_peer = INVALID_PEER_INDEX;
+static esp_timer_handle_t s_scan_retry_timer;
 static mahjong_peer_t s_peers[MAX_MAHJONG_CONNECTIONS];
 static QueueHandle_t s_gateway_tx_queue;
 static uint32_t s_gateway_sequence;
@@ -254,6 +258,7 @@ typedef struct {
 
 static int gap_event_handler(struct ble_gap_event *event, void *arg);
 static void start_scan(void);
+static void schedule_scan_retry(void);
 static void restart_after_discovery_error(mahjong_peer_t *peer,
                                           const char *stage,
                                           int status);
@@ -1583,15 +1588,22 @@ static void start_scan(void)
         return;
     }
 
+    if (s_scan_retry_timer != NULL) {
+        (void)esp_timer_stop(s_scan_retry_timer);
+    }
+
     memset(&params, 0, sizeof(params));
-    params.passive = 0;
+    params.passive = 1;
     params.filter_duplicates = 1;
+    params.itvl = BLE_GAP_SCAN_ITVL_MS(SCAN_INTERVAL_MS);
+    params.window = BLE_GAP_SCAN_WIN_MS(SCAN_WINDOW_MS);
 
     rc = ble_gap_disc(s_own_addr_type, SCAN_DURATION_MS, &params,
                       gap_event_handler, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to start scan: rc=%d", rc);
         s_scanning = false;
+        schedule_scan_retry();
         return;
     }
 
@@ -1600,6 +1612,31 @@ static void start_scan(void)
              TARGET_DEVICE_NAME,
              active_peer_count(), (unsigned int)TARGET_COUNT,
              MAX_MAHJONG_CONNECTIONS);
+}
+
+static void scan_retry_timer_callback(void *arg)
+{
+    (void)arg;
+    start_scan();
+}
+
+static void schedule_scan_retry(void)
+{
+    esp_err_t err;
+
+    if (s_scan_retry_timer == NULL || s_scanning ||
+        s_connecting_peer != INVALID_PEER_INDEX ||
+        !has_available_target()) {
+        return;
+    }
+
+    (void)esp_timer_stop(s_scan_retry_timer);
+    err = esp_timer_start_once(
+        s_scan_retry_timer,
+        (uint64_t)SCAN_RETRY_DELAY_MS * 1000ULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to schedule BLE scan retry: err=%d", err);
+    }
 }
 
 static int gap_event_handler(struct ble_gap_event *event, void *arg)
@@ -1759,7 +1796,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISC_COMPLETE:
         s_scanning = false;
-        start_scan();
+        schedule_scan_retry();
         return 0;
 
     case BLE_GAP_EVENT_NOTIFY_RX:
@@ -1801,6 +1838,9 @@ static void ble_on_reset(int reason)
             link_stats_on_disconnect(target_index, reason);
         }
     }
+    if (s_scan_retry_timer != NULL) {
+        (void)esp_timer_stop(s_scan_retry_timer);
+    }
     reset_all_peers();
 }
 
@@ -1832,6 +1872,13 @@ static void nimble_host_task(void *param)
 
 void app_main(void)
 {
+    const esp_timer_create_args_t scan_retry_timer_args = {
+        .callback = scan_retry_timer_callback,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "ble_scan_retry",
+        .skip_unhandled_events = true,
+    };
     esp_err_t err;
     int rc;
 
@@ -1847,6 +1894,8 @@ void app_main(void)
     ESP_ERROR_CHECK(err);
 
     reset_all_peers();
+    ESP_ERROR_CHECK(esp_timer_create(&scan_retry_timer_args,
+                                     &s_scan_retry_timer));
 
     ESP_ERROR_CHECK(nimble_port_init());
     ble_svc_gap_init();

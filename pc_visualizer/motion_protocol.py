@@ -22,6 +22,7 @@ GATEWAY_FRAME_MOTION_DATA = 0x10
 GATEWAY_FRAME_CONTROL_REQUEST = 0x20
 GATEWAY_FRAME_CONTROL_RESPONSE = 0x21
 GATEWAY_FRAME_LINK_DIAGNOSTIC = 0x30
+GATEWAY_FRAME_AGGREGATOR_DIAGNOSTIC = 0x31
 GATEWAY_HEADER_SIZE = 10
 GATEWAY_CRC_SIZE = 4
 GATEWAY_MAX_RAW_FRAME_SIZE = 114
@@ -30,6 +31,9 @@ MOTION_CONTROL_VERSION = 1
 LINK_DIAGNOSTIC_VERSION = 2
 LINK_DIAGNOSTIC_V1_PAYLOAD_SIZE = 44
 LINK_DIAGNOSTIC_PAYLOAD_SIZE = 64
+AGGREGATOR_DIAGNOSTIC_VERSION = 1
+AGGREGATOR_DIAGNOSTIC_PAYLOAD_SIZE = 100
+AGGREGATOR_LINK_COUNT = 3
 
 
 class MotionCommand(IntEnum):
@@ -84,16 +88,6 @@ class MotionFrame:
 
 
 @dataclass(frozen=True)
-class GatewayFrame:
-    gateway_id: int
-    gateway_sequence: int
-    frame_type: int
-    motion: MotionFrame | None = None
-    control_response: "ControlResponse | None" = None
-    link_diagnostic: "LinkDiagnostic | None" = None
-
-
-@dataclass(frozen=True)
 class ControlResponse:
     device_id: int
     command: int
@@ -135,6 +129,49 @@ class LinkDiagnostic:
     dle_request_result: int | None
     phy_read_result: int | None
     dle_update_count: int
+
+
+@dataclass(frozen=True)
+class AggregatorLinkDiagnostic:
+    gateway_id: int
+    active: bool
+    rx_queue_pending: bool
+    command_queue_pending: bool
+    uart_port: int
+    rx_queue_high_watermark: int
+    uart_rx_bytes: int
+    valid_frames: int
+    cobs_errors: int
+    crc_errors: int
+    frame_errors: int
+    frame_drops: int
+    uart_output_drops: int
+    last_frame_age_ms: float | None
+
+
+@dataclass(frozen=True)
+class AggregatorDiagnostic:
+    usb_ready: bool
+    output_drop_seen: bool
+    uptime_ms: int
+    usb_rx_bytes: int
+    usb_tx_bytes: int
+    usb_valid_commands: int
+    usb_input_errors: int
+    usb_output_drops: int
+    usb_queue_high_watermark: int
+    links: tuple[AggregatorLinkDiagnostic, ...]
+
+
+@dataclass(frozen=True)
+class GatewayFrame:
+    gateway_id: int
+    gateway_sequence: int
+    frame_type: int
+    motion: MotionFrame | None = None
+    control_response: ControlResponse | None = None
+    link_diagnostic: LinkDiagnostic | None = None
+    aggregator_diagnostic: AggregatorDiagnostic | None = None
 
 
 class CobsDecodeError(ValueError):
@@ -284,6 +321,7 @@ def decode_gateway_frame(raw: bytes) -> GatewayFrame:
         GATEWAY_FRAME_MOTION_DATA,
         GATEWAY_FRAME_CONTROL_RESPONSE,
         GATEWAY_FRAME_LINK_DIAGNOSTIC,
+        GATEWAY_FRAME_AGGREGATOR_DIAGNOSTIC,
     }:
         raise GatewayFrameError("unsupported gateway frame type")
     if reserved != 0:
@@ -435,6 +473,91 @@ def decode_gateway_frame(raw: bytes) -> GatewayFrame:
                 dle_request_result=dle_request_result,
                 phy_read_result=phy_read_result,
                 dle_update_count=dle_update_count,
+            ),
+        )
+
+    if frame_type == GATEWAY_FRAME_AGGREGATOR_DIAGNOSTIC:
+        if payload_length != AGGREGATOR_DIAGNOSTIC_PAYLOAD_SIZE:
+            raise GatewayFrameError(
+                "unexpected aggregator diagnostic payload length"
+            )
+        (
+            diagnostic_version,
+            link_count,
+            flags,
+            usb_queue_high_watermark,
+            uptime_ms,
+            usb_rx_bytes,
+            usb_tx_bytes,
+            usb_valid_commands,
+            usb_input_errors,
+            usb_output_drops,
+        ) = struct.unpack_from("<BBBBIIIIII", payload, 0)
+        if diagnostic_version != AGGREGATOR_DIAGNOSTIC_VERSION:
+            raise GatewayFrameError(
+                "unsupported aggregator diagnostic version"
+            )
+        if link_count != AGGREGATOR_LINK_COUNT:
+            raise GatewayFrameError(
+                "unexpected aggregator link count"
+            )
+
+        links: list[AggregatorLinkDiagnostic] = []
+        offset = 28
+        for _ in range(link_count):
+            (
+                link_gateway_id,
+                link_flags,
+                uart_port,
+                rx_queue_high_watermark,
+                uart_rx_bytes,
+                valid_frames,
+                cobs_errors,
+                crc_errors,
+                frame_errors,
+                frame_drops,
+                uart_output_drops,
+                last_frame_age_100ms,
+            ) = struct.unpack_from("<BBBBIIHHHHHH", payload, offset)
+            links.append(
+                AggregatorLinkDiagnostic(
+                    gateway_id=link_gateway_id,
+                    active=bool(link_flags & 0x01),
+                    rx_queue_pending=bool(link_flags & 0x02),
+                    command_queue_pending=bool(link_flags & 0x04),
+                    uart_port=uart_port,
+                    rx_queue_high_watermark=rx_queue_high_watermark,
+                    uart_rx_bytes=uart_rx_bytes,
+                    valid_frames=valid_frames,
+                    cobs_errors=cobs_errors,
+                    crc_errors=crc_errors,
+                    frame_errors=frame_errors,
+                    frame_drops=frame_drops,
+                    uart_output_drops=uart_output_drops,
+                    last_frame_age_ms=(
+                        None
+                        if last_frame_age_100ms == 0xFFFF
+                        else last_frame_age_100ms * 100.0
+                    ),
+                )
+            )
+            offset += 24
+
+        return GatewayFrame(
+            gateway_id=gateway_id,
+            gateway_sequence=gateway_sequence,
+            frame_type=frame_type,
+            aggregator_diagnostic=AggregatorDiagnostic(
+                usb_ready=bool(flags & 0x01),
+                output_drop_seen=bool(flags & 0x02),
+                uptime_ms=uptime_ms,
+                usb_rx_bytes=usb_rx_bytes,
+                usb_tx_bytes=usb_tx_bytes,
+                usb_valid_commands=usb_valid_commands,
+                usb_input_errors=usb_input_errors,
+                usb_output_drops=usb_output_drops,
+                usb_queue_high_watermark=usb_queue_high_watermark,
+                links=tuple(links),
             ),
         )
 

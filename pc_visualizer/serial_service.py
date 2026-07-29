@@ -13,6 +13,7 @@ from serial.tools import list_ports
 
 from motion_model import MotionStore
 from motion_protocol import (
+    AggregatorDiagnostic,
     ControlResponse,
     GatewayStreamDecoder,
     LinkDiagnostic,
@@ -84,6 +85,7 @@ class SerialService:
         self._request_id = 0
         self._responses: dict[tuple[int, int], ControlResponse] = {}
         self._device_control: dict[int, dict[str, Any]] = {}
+        self._aggregator_diagnostic: dict[str, Any] | None = None
 
     @staticmethod
     def ports() -> list[dict[str, Any]]:
@@ -126,6 +128,7 @@ class SerialService:
             self._decoder = GatewayStreamDecoder()
             self._responses = {}
             self._device_control = {}
+            self._aggregator_diagnostic = None
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._reader_loop,
@@ -168,7 +171,23 @@ class SerialService:
                 "crc_error_count": self._decoder.crc_error_count,
                 "frame_error_count": self._decoder.frame_error_count,
                 "overflow_count": self._decoder.overflow_count,
+                "aggregator": self._aggregator_snapshot_locked(),
             }
+
+    def _aggregator_snapshot_locked(self) -> dict[str, Any] | None:
+        if self._aggregator_diagnostic is None:
+            return None
+        snapshot = dict(self._aggregator_diagnostic)
+        snapshot["links"] = [
+            dict(link) for link in snapshot.get("links", [])
+        ]
+        updated = snapshot.pop("_updated_monotonic", None)
+        snapshot["age_seconds"] = (
+            max(0.0, time.monotonic() - updated)
+            if updated is not None
+            else None
+        )
+        return snapshot
 
     def device_control_snapshot(self, device_id: int) -> dict[str, Any]:
         with self._lock:
@@ -374,6 +393,15 @@ class SerialService:
                     self._last_gateway_sequence[gateway_frame.gateway_id] = (
                         gateway_frame.gateway_sequence
                     )
+                    if gateway_frame.aggregator_diagnostic is not None:
+                        diagnostic: AggregatorDiagnostic = (
+                            gateway_frame.aggregator_diagnostic
+                        )
+                        snapshot = asdict(diagnostic)
+                        snapshot["_updated_monotonic"] = time.monotonic()
+                        with self._lock:
+                            self._aggregator_diagnostic = snapshot
+                        continue
                     if gateway_frame.control_response is not None:
                         response = gateway_frame.control_response
                         with self._response_condition:

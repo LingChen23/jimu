@@ -113,6 +113,14 @@
     .stat { padding: 13px 15px; }
     .stat-label { color: var(--muted); font-size: 12px; }
     .stat-value { margin-top: 3px; font-size: 18px; font-variant-numeric: tabular-nums; }
+    #aggregatorSummary,
+    #aggregatorLinkA,
+    #aggregatorLinkB,
+    #aggregatorLinkC {
+      font-size: 12px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
     .command-panel { padding: 14px; margin-bottom: 14px; }
     .command-head {
       display: flex;
@@ -423,6 +431,13 @@
       <div id="errorText" class="error" role="alert"></div>
     </section>
 
+    <section class="status-row" aria-label="三路聚合器状态">
+      <div class="panel stat"><div class="stat-label">三路聚合器</div><div id="aggregatorSummary" class="stat-value">等待状态帧</div></div>
+      <div class="panel stat"><div class="stat-label">网关 A · 设备 1～4</div><div id="aggregatorLinkA" class="stat-value">—</div></div>
+      <div class="panel stat"><div class="stat-label">网关 B · 设备 5～8</div><div id="aggregatorLinkB" class="stat-value">—</div></div>
+      <div class="panel stat"><div class="stat-label">网关 C · 设备 9～12</div><div id="aggregatorLinkC" class="stat-value">—</div></div>
+    </section>
+
     <nav id="deviceStrip" class="device-strip" aria-label="选择设备"></nav>
 
     <section class="status-row" aria-label="当前设备状态">
@@ -629,6 +644,12 @@
       strip: document.getElementById("deviceStrip"),
       dot: document.getElementById("connectionDot"),
       connection: document.getElementById("connectionText"),
+      aggregatorSummary: document.getElementById("aggregatorSummary"),
+      aggregatorLinks: [
+        document.getElementById("aggregatorLinkA"),
+        document.getElementById("aggregatorLinkB"),
+        document.getElementById("aggregatorLinkC")
+      ],
       device: document.getElementById("deviceValue"),
       packet: document.getElementById("packetValue"),
       sample: document.getElementById("sampleValue"),
@@ -882,6 +903,51 @@
       }
     }
 
+    function compactBytes(value) {
+      const bytes = Number(value || 0);
+      if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+      if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+      return `${bytes} B`;
+    }
+
+    function renderAggregatorStatus(status) {
+      const diagnostic = status?.aggregator;
+      if (!diagnostic) {
+        elements.aggregatorSummary.textContent = "未检测到聚合器状态帧";
+        elements.aggregatorLinks.forEach(element => {
+          element.textContent = "—";
+        });
+        return;
+      }
+
+      const stale = Number(diagnostic.age_seconds || 0) > 3;
+      elements.aggregatorSummary.textContent =
+        `${stale ? "状态超时" : "运行中"} · `
+        + `USB收/发 ${compactBytes(diagnostic.usb_rx_bytes)} / ${compactBytes(diagnostic.usb_tx_bytes)} · `
+        + `输入错 ${diagnostic.usb_input_errors || 0} · 输出丢 ${diagnostic.usb_output_drops || 0} · `
+        + `队列峰值 ${diagnostic.usb_queue_high_watermark || 0}`;
+
+      const linksById = new Map(
+        (diagnostic.links || []).map(link => [Number(link.gateway_id), link])
+      );
+      elements.aggregatorLinks.forEach((element, gatewayId) => {
+        const link = linksById.get(gatewayId);
+        if (!link) {
+          element.textContent = "无状态";
+          return;
+        }
+        const age = link.last_frame_age_ms === null
+          ? "未收到"
+          : `${(link.last_frame_age_ms / 1000).toFixed(1)} s`;
+        element.textContent =
+          `${link.active ? "活跃" : "等待"} · UART${link.uart_port} · `
+          + `${link.valid_frames} 帧 / ${compactBytes(link.uart_rx_bytes)} · `
+          + `错 ${link.cobs_errors}/${link.crc_errors}/${link.frame_errors} · `
+          + `丢 ${link.frame_drops}/${link.uart_output_drops} · `
+          + `队列峰值 ${link.rx_queue_high_watermark} · 龄 ${age}`;
+      });
+    }
+
     function updateSerialStatus(status) {
       const open = Boolean(status?.open);
       elements.dot.classList.toggle("open", open);
@@ -893,6 +959,7 @@
       elements.open.disabled = open;
       elements.close.disabled = !open;
       if (status?.error) elements.error.textContent = status.error;
+      renderAggregatorStatus(status);
     }
 
     async function setSerial(open) {

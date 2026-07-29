@@ -202,6 +202,63 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertFalse(link.dle_valid)
         self.assertIsNone(link.tx_phy)
 
+    def test_aggregator_diagnostic_decoding(self) -> None:
+        payload = bytearray(100)
+        struct.pack_into(
+            "<BBBBIIIIII",
+            payload,
+            0,
+            1,
+            3,
+            0x01,
+            17,
+            4567,
+            48,
+            123456,
+            7,
+            2,
+            3,
+        )
+        for gateway_id in range(3):
+            struct.pack_into(
+                "<BBBBIIHHHHHH",
+                payload,
+                28 + gateway_id * 24,
+                gateway_id,
+                0x01 if gateway_id != 2 else 0x00,
+                (1, 2, 0)[gateway_id],
+                5 + gateway_id,
+                1000 * (gateway_id + 1),
+                100 * (gateway_id + 1),
+                gateway_id,
+                gateway_id + 1,
+                gateway_id + 2,
+                gateway_id + 3,
+                gateway_id + 4,
+                15 if gateway_id != 2 else 0xFFFF,
+            )
+        encoded = encode_gateway_payload(
+            0x31,
+            bytes(payload),
+            gateway_id=0xFF,
+            gateway_sequence=9,
+        )
+        frames = GatewayStreamDecoder().feed(encoded)
+
+        self.assertEqual(len(frames), 1)
+        diagnostic = frames[0].aggregator_diagnostic
+        self.assertIsNotNone(diagnostic)
+        assert diagnostic is not None
+        self.assertTrue(diagnostic.usb_ready)
+        self.assertEqual(diagnostic.usb_tx_bytes, 123456)
+        self.assertEqual(diagnostic.usb_queue_high_watermark, 17)
+        self.assertEqual(len(diagnostic.links), 3)
+        self.assertTrue(diagnostic.links[0].active)
+        self.assertEqual(diagnostic.links[1].uart_port, 2)
+        self.assertEqual(diagnostic.links[1].valid_frames, 200)
+        self.assertEqual(diagnostic.links[0].last_frame_age_ms, 1500.0)
+        self.assertIsNone(diagnostic.links[2].last_frame_age_ms)
+
     def test_gateway_link_diagnostic_v2_decoding(self) -> None:
         payload = struct.pack(
             "<BBBbHHHHIIIIIIIIHHHHHBBhhI",

@@ -1,22 +1,80 @@
-menu "SmartBlock single-link aggregator"
+menu "SmartBlock three-link aggregator"
 
-    config SMARTBLOCK_AGGREGATOR_UART_PORT
-        int "Gateway UART controller"
+    config SMARTBLOCK_AGGREGATOR_UART_BAUD
+        int "Gateway UART baud rate (all three links)"
+        default 921600
+
+    config SMARTBLOCK_AGGREGATOR_UART_RX_BUFFER_SIZE
+        int "Per-link UART RX driver buffer size"
+        range 4096 65536
+        default 16384
+
+    config SMARTBLOCK_AGGREGATOR_UART_TX_BUFFER_SIZE
+        int "Per-link UART command TX driver buffer size"
+        range 1024 16384
+        default 4096
+
+    config SMARTBLOCK_AGGREGATOR_LINK_QUEUE_DEPTH
+        int "Per-link validated-frame queue depth"
+        range 16 256
+        default 64
+
+    config SMARTBLOCK_AGGREGATOR_USB_QUEUE_DEPTH
+        int "Merged USB output queue depth"
+        range 64 1024
+        default 256
+
+    config SMARTBLOCK_AGGREGATOR_MERGE_BURST
+        int "Maximum frames taken from one link per merge pass"
+        range 1 16
+        default 4
+        help
+            A bounded burst prevents one busy or recovering gateway from
+            starving the other two links.
+
+    config SMARTBLOCK_AGGREGATOR_A_UART_PORT
+        int "Gateway A UART controller"
         range 0 2
         default 1
 
-    config SMARTBLOCK_AGGREGATOR_UART_BAUD
-        int "Gateway UART baud rate"
-        default 921600
-
-    config SMARTBLOCK_AGGREGATOR_UART_TX_GPIO
-        int "Aggregator TX GPIO (to gateway RX)"
+    config SMARTBLOCK_AGGREGATOR_A_TX_GPIO
+        int "Gateway A: aggregator TX GPIO (to gateway RX)"
         range 0 48
         default 17
 
-    config SMARTBLOCK_AGGREGATOR_UART_RX_GPIO
-        int "Aggregator RX GPIO (from gateway TX)"
+    config SMARTBLOCK_AGGREGATOR_A_RX_GPIO
+        int "Gateway A: aggregator RX GPIO (from gateway TX)"
         range 0 48
         default 18
+
+    config SMARTBLOCK_AGGREGATOR_B_UART_PORT
+        int "Gateway B UART controller"
+        range 0 2
+        default 2
+
+    config SMARTBLOCK_AGGREGATOR_B_TX_GPIO
+        int "Gateway B: aggregator TX GPIO (to gateway RX)"
+        range 0 48
+        default 15
+
+    config SMARTBLOCK_AGGREGATOR_B_RX_GPIO
+        int "Gateway B: aggregator RX GPIO (from gateway TX)"
+        range 0 48
+        default 16
+
+    config SMARTBLOCK_AGGREGATOR_C_UART_PORT
+        int "Gateway C UART controller"
+        range 0 2
+        default 0
+
+    config SMARTBLOCK_AGGREGATOR_C_TX_GPIO
+        int "Gateway C: aggregator TX GPIO (to gateway RX)"
+        range 0 48
+        default 5
+
+    config SMARTBLOCK_AGGREGATOR_C_RX_GPIO
+        int "Gateway C: aggregator RX GPIO (from gateway TX)"
+        range 0 48
+        default 6
 
 endmenu

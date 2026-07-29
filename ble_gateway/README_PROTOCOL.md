@@ -28,6 +28,7 @@ Frame types:
 | `0x20` | PC → ESP32 | device ID + BLE control request |
 | `0x21` | ESP32 → PC | device ID + BLE control response |
 | `0x30` | ESP32 → PC | 64-byte per-device BLE link diagnostic |
+| `0x31` | Aggregator → PC | 100-byte three-link aggregator diagnostic |
 
 The ESP32 sends one version 2 `0x30` diagnostic frame per configured device
 per second. The PC decoder also accepts the legacy 44-byte version 1 frame.
@@ -69,6 +70,42 @@ does not by itself prove that the link-layer payload length was extended.
 The public NimBLE API does not expose the controller's true link-layer
 retransmission count. Sequence gaps, receive rate, RSSI and disconnect reasons
 are reported instead; sequence gaps must not be labelled as retransmissions.
+
+The three-link aggregator sends one `0x31` diagnostic frame per second with
+`gateway_id=0xFF`. Its 100-byte payload is:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 1 | diagnostic version = 1 |
+| 1 | 1 | link count = 3 |
+| 2 | 1 | flags: USB ready / output drop observed |
+| 3 | 1 | USB output queue high-water mark |
+| 4 | 4 | aggregator uptime in milliseconds |
+| 8 | 4 | USB RX bytes |
+| 12 | 4 | USB TX bytes |
+| 16 | 4 | valid PC control requests |
+| 20 | 4 | invalid PC input frames |
+| 24 | 4 | USB output drops |
+| 28 | 24 | gateway A link record |
+| 52 | 24 | gateway B link record |
+| 76 | 24 | gateway C link record |
+
+Each 24-byte link record is:
+
+| Relative offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 1 | gateway ID |
+| 1 | 1 | flags: active / RX queue pending / command queue pending |
+| 2 | 1 | aggregator UART controller |
+| 3 | 1 | validated-frame queue high-water mark |
+| 4 | 4 | UART RX bytes |
+| 8 | 4 | valid gateway frames |
+| 12 | 2 | COBS errors, saturated at 65535 |
+| 14 | 2 | CRC errors, saturated at 65535 |
+| 16 | 2 | format errors, saturated at 65535 |
+| 18 | 2 | complete input/output frame drops, saturated at 65535 |
+| 20 | 2 | command UART output drops, saturated at 65535 |
+| 22 | 2 | last valid frame age in 100 ms units; `0xFFFF` means never |
 
 BLE control request:
 

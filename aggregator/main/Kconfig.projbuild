@@ -1,0 +1,22 @@
+menu "SmartBlock single-link aggregator"
+
+    config SMARTBLOCK_AGGREGATOR_UART_PORT
+        int "Gateway UART controller"
+        range 0 2
+        default 1
+
+    config SMARTBLOCK_AGGREGATOR_UART_BAUD
+        int "Gateway UART baud rate"
+        default 921600
+
+    config SMARTBLOCK_AGGREGATOR_UART_TX_GPIO
+        int "Aggregator TX GPIO (to gateway RX)"
+        range 0 48
+        default 17
+
+    config SMARTBLOCK_AGGREGATOR_UART_RX_GPIO
+        int "Aggregator RX GPIO (from gateway TX)"
+        range 0 48
+        default 18
+
+endmenu

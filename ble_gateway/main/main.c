@@ -8,7 +8,6 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 
-#include "driver/usb_serial_jtag.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -18,6 +17,7 @@
 #include "nimble/nimble_port_freertos.h"
 #include "os/os_mbuf.h"
 #include "services/gap/ble_svc_gap.h"
+#include "gateway_transport.h"
 #include "motion_protocol.h"
 
 #define TARGET_DEVICE_NAME       "SmartBlock"
@@ -41,9 +41,7 @@
     (GATEWAY_HEADER_SIZE + GATEWAY_MAX_PAYLOAD_SIZE + GATEWAY_CRC_SIZE)
 #define GATEWAY_COBS_MAX_SIZE    (GATEWAY_MAX_RAW_FRAME_SIZE + 1U)
 #define GATEWAY_TX_QUEUE_DEPTH   128U
-#define GATEWAY_USB_RX_BUFFER    256U
-#define GATEWAY_USB_TX_BUFFER    32768U
-#define GATEWAY_USB_WRITE_WAIT_MS 1000U
+#define GATEWAY_TRANSPORT_WRITE_WAIT_MS 1000U
 #define LINK_DIAGNOSTIC_VERSION  2U
 #define LINK_DIAGNOSTIC_PAYLOAD_SIZE 64U
 #define LINK_DIAGNOSTIC_PERIOD_MS 1000U
@@ -266,7 +264,7 @@ static int service_discovery_cb(uint16_t conn_handle,
                                 const struct ble_gatt_error *error,
                                 const struct ble_gatt_svc *service,
                                 void *arg);
-static void gateway_usb_rx_task(void *param);
+static void gateway_transport_rx_task(void *param);
 static void link_diagnostic_task(void *param);
 
 static void gateway_put_le16(uint8_t *dst, uint16_t value)
@@ -534,15 +532,15 @@ static bool gateway_queue_frame(uint8_t frame_type,
     return true;
 }
 
-static bool gateway_usb_write_all(const uint8_t *data, size_t length)
+static bool gateway_transport_write_all(const uint8_t *data, size_t length)
 {
     size_t offset = 0U;
 
     while (offset < length) {
-        int written = usb_serial_jtag_write_bytes(
+        int written = gateway_transport_write(
             data + offset,
             length - offset,
-            pdMS_TO_TICKS(GATEWAY_USB_WRITE_WAIT_MS));
+            pdMS_TO_TICKS(GATEWAY_TRANSPORT_WRITE_WAIT_MS));
         if (written <= 0) {
             return false;
         }
@@ -551,7 +549,7 @@ static bool gateway_usb_write_all(const uint8_t *data, size_t length)
     return true;
 }
 
-static void gateway_usb_tx_task(void *param)
+static void gateway_transport_tx_task(void *param)
 {
     gateway_tx_item_t item;
     uint8_t raw[GATEWAY_MAX_RAW_FRAME_SIZE];
@@ -582,7 +580,7 @@ static void gateway_usb_tx_task(void *param)
 
         encoded_length = cobs_encode(raw, raw_length, encoded);
         encoded[encoded_length++] = 0U;
-        (void)gateway_usb_write_all(encoded, encoded_length);
+        (void)gateway_transport_write_all(encoded, encoded_length);
     }
 }
 
@@ -730,32 +728,28 @@ static void link_diagnostic_task(void *param)
     }
 }
 
-static void gateway_usb_init(void)
+static void gateway_transport_tasks_init(void)
 {
-    usb_serial_jtag_driver_config_t config = {
-        .rx_buffer_size = GATEWAY_USB_RX_BUFFER,
-        .tx_buffer_size = GATEWAY_USB_TX_BUFFER,
-    };
     const uint8_t delimiter = 0U;
 
-    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&config));
-    (void)gateway_usb_write_all(&delimiter, 1U);
+    ESP_ERROR_CHECK(gateway_transport_init());
+    (void)gateway_transport_write_all(&delimiter, 1U);
 
     s_gateway_tx_queue =
         xQueueCreate(GATEWAY_TX_QUEUE_DEPTH, sizeof(gateway_tx_item_t));
     ESP_ERROR_CHECK(s_gateway_tx_queue != NULL
                         ? ESP_OK
                         : ESP_ERR_NO_MEM);
-    if (xTaskCreate(gateway_usb_tx_task,
-                    "gateway_usb_tx",
+    if (xTaskCreate(gateway_transport_tx_task,
+                    "gateway_transport_tx",
                     4096,
                     NULL,
                     8,
                     NULL) != pdPASS) {
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
-    if (xTaskCreate(gateway_usb_rx_task,
-                    "gateway_usb_rx",
+    if (xTaskCreate(gateway_transport_rx_task,
+                    "gateway_transport_rx",
                     4096,
                     NULL,
                     8,
@@ -1008,7 +1002,7 @@ static void gateway_handle_encoded_command(const uint8_t *encoded,
     }
 }
 
-static void gateway_usb_rx_task(void *param)
+static void gateway_transport_rx_task(void *param)
 {
     uint8_t read_buffer[64];
     uint8_t encoded[GATEWAY_COBS_MAX_SIZE];
@@ -1019,9 +1013,9 @@ static void gateway_usb_rx_task(void *param)
 
     (void)param;
     for (;;) {
-        read_length = usb_serial_jtag_read_bytes(read_buffer,
-                                                 sizeof(read_buffer),
-                                                 pdMS_TO_TICKS(100));
+        read_length = gateway_transport_read(read_buffer,
+                                             sizeof(read_buffer),
+                                             pdMS_TO_TICKS(100));
         if (read_length <= 0) {
             continue;
         }
@@ -1883,7 +1877,7 @@ void app_main(void)
     int rc;
 
     esp_log_level_set("*", ESP_LOG_NONE);
-    gateway_usb_init();
+    gateway_transport_tasks_init();
 
     err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES ||

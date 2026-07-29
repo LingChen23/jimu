@@ -1,0 +1,51 @@
+menu "SmartBlock BLE gateway"
+
+    choice SMARTBLOCK_GATEWAY_TRANSPORT
+        prompt "Business-channel transport"
+        default SMARTBLOCK_GATEWAY_TRANSPORT_USB
+        help
+            USB keeps the existing direct-to-PC gateway mode. UART sends and
+            receives the same COBS + CRC32 frames through an ESP32-S3
+            aggregator.
+
+        config SMARTBLOCK_GATEWAY_TRANSPORT_USB
+            bool "Native USB Serial/JTAG"
+
+        config SMARTBLOCK_GATEWAY_TRANSPORT_UART
+            bool "UART to SmartBlock aggregator"
+    endchoice
+
+    if SMARTBLOCK_GATEWAY_TRANSPORT_UART
+
+        config SMARTBLOCK_GATEWAY_UART_PORT
+            int "UART controller"
+            range 0 2
+            default 1
+
+        config SMARTBLOCK_GATEWAY_UART_BAUD
+            int "UART baud rate"
+            default 921600
+
+        config SMARTBLOCK_GATEWAY_UART_TX_GPIO
+            int "UART TX GPIO"
+            range 0 48
+            default 17
+
+        config SMARTBLOCK_GATEWAY_UART_RX_GPIO
+            int "UART RX GPIO"
+            range 0 48
+            default 18
+
+        config SMARTBLOCK_GATEWAY_UART_RX_BUFFER_SIZE
+            int "UART RX driver buffer size"
+            range 1024 65536
+            default 16384
+
+        config SMARTBLOCK_GATEWAY_UART_TX_BUFFER_SIZE
+            int "UART TX driver buffer size"
+            range 1024 65536
+            default 32768
+
+    endif
+
+endmenu

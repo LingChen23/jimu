@@ -1,6 +1,7 @@
-# Gateway USB Protocol
+# Gateway Business-Channel Protocol
 
-The ESP32-S3 native USB Serial/JTAG CDC channel is bidirectional:
+The protocol is bidirectional and identical over direct native USB or the
+UART link from a BLE gateway to the SmartBlock aggregator:
 
 ```text
 COBS(raw_gateway_frame) + 0x00
@@ -93,4 +94,7 @@ CRC uses reflected polynomial `0xEDB88320`, initial value `0xFFFFFFFF`, and
 final XOR `0xFFFFFFFF`. This is compatible with Python `zlib.crc32`.
 
 The native USB CDC port is a binary-only business channel after application
-startup. USB CDC does not use a physical UART baud rate or 8N1 format.
+startup. USB CDC does not use a physical UART baud rate or 8N1 format. The
+gateway-to-aggregator UART variant uses 921600 baud, 8N1, full duplex and
+forwards these same delimited frames without changing the gateway ID,
+gateway sequence or CRC.

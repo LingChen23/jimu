@@ -1,4 +1,4 @@
-# ESP32-S3 Motion V1 Four-Node USB Gateway
+# ESP32-S3 Motion V1 Four-Node Gateway
 
 This ESP-IDF project implements gateway A for four nRF52832 TX devices.
 The ESP32-S3 acts as a BLE Central and uses a fixed device-ID/address map:
@@ -20,8 +20,9 @@ scan -> connect -> request DLE 251 -> exchange MTU 185 -> discover Motion Servic
 Motion Data is a fixed 100-byte little-endian packet. Every packet contains
 four 100 Hz six-axis IMU samples plus the latest coordinate, so the BLE
 notification rate is 25 packets/s. Every packet is decoded, checked and
-forwarded unchanged through native USB Serial/JTAG CDC as a COBS + CRC32
-gateway frame.
+forwarded unchanged as a COBS + CRC32 gateway frame. The default build uses
+native USB Serial/JTAG CDC directly to PC. A separate UART build uses UART1
+at 921600 8N1 to connect to the SmartBlock aggregator.
 
 Each decoded gateway frame is 114 bytes and each delimited USB frame is
 normally about 116 bytes. Runtime text logging is disabled so it cannot
@@ -51,8 +52,23 @@ The binary business stream uses the separate native `USB` connector, which
 enumerates as an ESP32-S3 USB Serial/JTAG CDC port (currently COM15). A baud
 setting supplied by PC serial software is ignored by native USB.
 
-The current implementation supports these four fixed targets. Forwarding three
-four-node gateways to the final aggregator remains a later stage.
+The current implementation supports these four fixed targets. The normal
+build remains the stable direct-USB variant. The UART-to-aggregator variant is
+built separately so switching transport cannot silently change the stable
+image:
+
+```powershell
+& 'D:\AIOT\ESP\ESPIDF\V523\523Tools\python_env\idf5.2_py3.11_env\Scripts\python.exe' `
+  'D:\AIOT\ESP\ESPIDF\V523\v5.2.3\esp-idf\tools\idf.py' `
+  -B build-uart `
+  -D 'SDKCONFIG=sdkconfig.gateway_uart' `
+  -D 'SDKCONFIG_DEFAULTS=sdkconfig.gateway_uart.defaults' `
+  build
+```
+
+UART mode uses UART1, TX GPIO17, RX GPIO18, 921600 baud, 8N1 and no hardware
+flow control. See `../aggregator/README.md` for wiring, flashing and the
+single-link acceptance procedure.
 
 ## Hardware validation
 

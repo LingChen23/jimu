@@ -17,18 +17,18 @@
 #include "nimble/nimble_port_freertos.h"
 #include "os/os_mbuf.h"
 #include "services/gap/ble_svc_gap.h"
+#include "gateway_profile.h"
 #include "gateway_transport.h"
 #include "motion_protocol.h"
 
 #define TARGET_DEVICE_NAME       "SmartBlock"
-#define SCAN_DURATION_MS         2000
+#define SCAN_DURATION_MS         1000
 #define SCAN_INTERVAL_MS         100
-#define SCAN_WINDOW_MS           15
-#define SCAN_RETRY_DELAY_MS      2000
+#define SCAN_WINDOW_MS           10
+#define SCAN_RETRY_DELAY_MS      4000
 #define CONNECT_TIMEOUT_MS       30000
 #define MAX_MAHJONG_CONNECTIONS  4U
 #define INVALID_PEER_INDEX       UINT8_MAX
-#define GATEWAY_ID               0U
 #define GATEWAY_FRAME_VERSION    1U
 #define GATEWAY_FRAME_MOTION     0x10U
 #define GATEWAY_FRAME_CONTROL_REQUEST  0x20U
@@ -76,79 +76,10 @@
 
 static const char *TAG = "motion_gateway";
 
-typedef struct {
-    ble_addr_t addr;
-    uint8_t expected_device_id;
-} mahjong_target_t;
-
-/* Gateway A fixed targets: nRF52832 devices 1 through 4. */
-static const mahjong_target_t TARGETS[] = {
-    {
-        .addr = {
-            .type = BLE_ADDR_RANDOM,
-            .val = {0x4b, 0xf7, 0xe7, 0xe0, 0xcf, 0xe0},
-        },
-        .expected_device_id = 1,
-    },
-    {
-        .addr = {
-            .type = BLE_ADDR_RANDOM,
-            .val = {0x27, 0x17, 0xe7, 0xf9, 0xf1, 0xff},
-        },
-        .expected_device_id = 2,
-    },
-    {
-        .addr = {
-            .type = BLE_ADDR_RANDOM,
-            .val = {0xf1, 0x03, 0x67, 0xf3, 0xcb, 0xdc},
-        },
-        .expected_device_id = 3,
-    },
-    {
-        .addr = {
-            .type = BLE_ADDR_RANDOM,
-            .val = {0xf0, 0xe3, 0x27, 0x25, 0x8e, 0xfd},
-        },
-        .expected_device_id = 4,
-    },
-};
-
-#define TARGET_COUNT (sizeof(TARGETS) / sizeof(TARGETS[0]))
+#define TARGET_COUNT GATEWAY_PROFILE_TARGET_COUNT
 
 _Static_assert(TARGET_COUNT <= MAX_MAHJONG_CONNECTIONS,
-               "TARGETS exceeds MAX_MAHJONG_CONNECTIONS");
-
-/*
- * Seed the four connection anchors with different initial intervals.  Each
- * nRF requests its 30 ms preferred interval after five seconds, so the steady
- * state is still 30 ms on every link without creating four coincident anchors
- * during initial connection establishment.
- *
- * A 100-byte notification plus weak-signal retries fits in the 5 ms
- * connection-event cap after the 189-octet DLE negotiation. Four links still
- * consume at most 20 ms of each 30 ms scheduling period.
- */
-#define TARGET_CONN_PARAMS_ENTRY(interval_ms)                 \
-    {                                                         \
-        .scan_itvl = BLE_GAP_SCAN_FAST_INTERVAL_MIN,          \
-        .scan_window = BLE_GAP_SCAN_FAST_WINDOW,               \
-        .itvl_min = BLE_GAP_CONN_ITVL_MS(interval_ms),         \
-        .itvl_max = BLE_GAP_CONN_ITVL_MS(interval_ms),         \
-        .latency = 0,                                          \
-        .supervision_timeout =                                 \
-            BLE_GAP_SUPERVISION_TIMEOUT_MS(4000),              \
-        .min_ce_len = 0,                                       \
-        .max_ce_len = 8,                                       \
-    }
-
-static const struct ble_gap_conn_params TARGET_CONN_PARAMS[TARGET_COUNT] = {
-    TARGET_CONN_PARAMS_ENTRY(30),
-    TARGET_CONN_PARAMS_ENTRY(32.5),
-    TARGET_CONN_PARAMS_ENTRY(35),
-    TARGET_CONN_PARAMS_ENTRY(37.5),
-};
-
-#undef TARGET_CONN_PARAMS_ENTRY
+               "gateway profile exceeds MAX_MAHJONG_CONNECTIONS");
 
 /* NimBLE stores 128-bit UUID bytes in little-endian order. */
 static const ble_uuid_t *MOTION_SERVICE_UUID =
@@ -238,6 +169,7 @@ typedef struct {
 } advertisement_match_t;
 
 static uint8_t s_own_addr_type;
+static const gateway_profile_t *s_profile;
 static bool s_scanning;
 static uint8_t s_connecting_peer = INVALID_PEER_INDEX;
 static esp_timer_handle_t s_scan_retry_timer;
@@ -247,6 +179,9 @@ static uint32_t s_gateway_sequence;
 static volatile uint32_t s_gateway_queue_drops;
 static link_diagnostic_stats_t s_link_stats[TARGET_COUNT];
 static portMUX_TYPE s_link_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+
+#define TARGETS (s_profile->targets)
+#define GATEWAY_ID (s_profile->gateway_id)
 
 typedef struct {
     uint8_t frame_type;
@@ -1046,7 +981,8 @@ static bool has_available_target(void)
     }
 
     for (target_index = 0; target_index < TARGET_COUNT; target_index++) {
-        if (!target_is_in_use(target_index)) {
+        if (TARGETS[target_index].enabled &&
+            !target_is_in_use(target_index)) {
             return true;
         }
     }
@@ -1270,7 +1206,8 @@ static int status_subscribe_write_cb(uint16_t conn_handle,
              "id=%u ready=%u/%u",
              addr, conn_handle,
              TARGETS[peer->target_index].expected_device_id,
-             ready_peer_count(), (unsigned int)TARGET_COUNT);
+             ready_peer_count(),
+             gateway_profile_enabled_target_count(s_profile));
     return 0;
 }
 
@@ -1500,7 +1437,8 @@ static bool matches_target(const struct ble_gap_disc_desc *disc,
     int rc;
 
     for (target_index = 0; target_index < TARGET_COUNT; target_index++) {
-        if (disc->addr.type == TARGETS[target_index].addr.type &&
+        if (TARGETS[target_index].enabled &&
+            disc->addr.type == TARGETS[target_index].addr.type &&
             memcmp(disc->addr.val, TARGETS[target_index].addr.val,
                    sizeof(disc->addr.val)) == 0) {
             break;
@@ -1524,9 +1462,26 @@ static bool matches_target(const struct ble_gap_disc_desc *disc,
     return true;
 }
 
+static void build_target_conn_params(
+    struct ble_gap_conn_params *params)
+{
+    memset(params, 0, sizeof(*params));
+    params->scan_itvl = BLE_GAP_SCAN_FAST_INTERVAL_MIN;
+    params->scan_window = BLE_GAP_SCAN_FAST_WINDOW;
+    params->itvl_min = s_profile->preferred_conn_interval_units;
+    params->itvl_max = s_profile->preferred_conn_interval_units;
+    params->latency = 0U;
+    params->supervision_timeout =
+        BLE_GAP_SUPERVISION_TIMEOUT_MS(4000);
+    params->min_ce_len = 0U;
+    /* Eight 0.625 ms units keep every connection event at or below 5 ms. */
+    params->max_ce_len = 8U;
+}
+
 static void connect_target(const struct ble_gap_disc_desc *disc,
                            const advertisement_match_t *match)
 {
+    struct ble_gap_conn_params conn_params;
     mahjong_peer_t *peer;
     uint8_t peer_index;
     char addr[18];
@@ -1561,8 +1516,9 @@ static void connect_target(const struct ble_gap_disc_desc *disc,
     }
     s_scanning = false;
 
+    build_target_conn_params(&conn_params);
     rc = ble_gap_connect(s_own_addr_type, &peer->addr, CONNECT_TIMEOUT_MS,
-                         &TARGET_CONN_PARAMS[peer->target_index],
+                         &conn_params,
                          gap_event_handler, peer);
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to start connection: addr=%s rc=%d", addr, rc);
@@ -1604,7 +1560,8 @@ static void start_scan(void)
     s_scanning = true;
     ESP_LOGI(TAG, "Scanning for %s targets: active=%u configured=%u max=%u",
              TARGET_DEVICE_NAME,
-             active_peer_count(), (unsigned int)TARGET_COUNT,
+             active_peer_count(),
+             gateway_profile_enabled_target_count(s_profile),
              MAX_MAHJONG_CONNECTIONS);
 }
 
@@ -1699,7 +1656,8 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "Connected: addr=%s conn=%u id=%u active=%u/%u",
                  addr, peer->conn_handle,
                  TARGETS[peer->target_index].expected_device_id,
-                 active_peer_count(), (unsigned int)TARGET_COUNT);
+                 active_peer_count(),
+                 gateway_profile_enabled_target_count(s_profile));
 
         peer->state = PEER_DISCOVERING;
         rc = ble_gattc_exchange_mtu(peer->conn_handle,
@@ -1876,6 +1834,11 @@ void app_main(void)
     esp_err_t err;
     int rc;
 
+    s_profile = gateway_profile_get();
+    ESP_ERROR_CHECK(gateway_profile_validate(s_profile)
+                        ? ESP_OK
+                        : ESP_ERR_INVALID_ARG);
+
     esp_log_level_set("*", ESP_LOG_NONE);
     gateway_transport_tasks_init();
 
@@ -1891,6 +1854,10 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_create(&scan_retry_timer_args,
                                      &s_scan_retry_timer));
 
+    if (s_profile->ble_startup_delay_ms > 0U) {
+        vTaskDelay(pdMS_TO_TICKS(s_profile->ble_startup_delay_ms));
+    }
+
     ESP_ERROR_CHECK(nimble_port_init());
     ble_svc_gap_init();
 
@@ -1903,7 +1870,13 @@ void app_main(void)
     ble_hs_cfg.sync_cb = ble_on_sync;
 
     ESP_LOGI(TAG,
-             "ESP32-S3 Motion V1 gateway started: targets=%u max_links=%u",
-             (unsigned int)TARGET_COUNT, MAX_MAHJONG_CONNECTIONS);
+             "ESP32-S3 Motion V1 gateway %s started: id=%u "
+             "enabled_targets=%u max_links=%u interval=%u units "
+             "startup_delay=%u ms",
+             s_profile->name, s_profile->gateway_id,
+             gateway_profile_enabled_target_count(s_profile),
+             MAX_MAHJONG_CONNECTIONS,
+             s_profile->preferred_conn_interval_units,
+             s_profile->ble_startup_delay_ms);
     nimble_port_freertos_init(nimble_host_task);
 }

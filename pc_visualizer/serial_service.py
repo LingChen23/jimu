@@ -110,7 +110,10 @@ class SerialService:
         connection = serial.Serial()
         connection.port = port
         connection.baudrate = baud
-        connection.timeout = 0.2
+        # Return bytes promptly instead of waiting for a 4096-byte batch.  The
+        # decoder is incremental, so short USB reads are both safe and much
+        # lower latency at the normal Motion stream data rate.
+        connection.timeout = 0.02
         connection.write_timeout = 1.0
         connection.dtr = False
         connection.rts = False
@@ -153,6 +156,8 @@ class SerialService:
         if thread is not None and thread.is_alive():
             thread.join(timeout=1.0)
         self._thread = None
+        if connection is not None:
+            self._store.transport_discontinuity("serial_closed")
         return self.status()
 
     def status(self) -> dict[str, Any]:
@@ -373,7 +378,8 @@ class SerialService:
             if connection is None:
                 return
             try:
-                raw = connection.read(4096)
+                waiting = min(max(connection.in_waiting, 1), 4096)
+                raw = connection.read(waiting)
                 if not raw:
                     continue
                 with self._lock:
@@ -432,4 +438,5 @@ class SerialService:
                     self._serial = None
                     self._response_condition.notify_all()
                 self._stop.set()
+                self._store.transport_discontinuity("serial_error")
                 return

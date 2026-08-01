@@ -1385,8 +1385,8 @@ static void motion_build_info_payload(uint8_t payload[MOTION_INFO_PAYLOAD_SIZE])
     payload[0] = (uint8_t)TX_DEVICE_ID;
     payload[1] = 0U;
     payload[2] = 1U;
-    /* Firmware 0.1.3: every device actively requests the 30 ms interval. */
-    payload[3] = 3U;
+    /* Firmware 0.1.4: gateway groups use 30, 32.5 and 35 ms intervals. */
+    payload[3] = 4U;
     payload[4] = MOTION_PROTOCOL_VERSION;
     payload[5] = 8U;
     motion_put_le16(&payload[6], 1000U);

@@ -1,7 +1,17 @@
-# ESP32-S3 Motion V1 Four-Node Gateway
+# ESP32-S3 SmartBlock BLE Gateway
 
-This ESP-IDF project implements gateway A for four nRF52832 TX devices.
-The ESP32-S3 acts as a BLE Central and uses a fixed device-ID/address map:
+This is one ESP-IDF source project with three compile-time gateway profiles.
+Every ESP32-S3 remains a four-link BLE Central, while the selected profile
+fixes its gateway ID and the four nRF52832 devices that it is allowed to
+connect:
+
+| Profile | Gateway ID | Device IDs | Current address state |
+| --- | ---: | --- | --- |
+| A | 0 | 1-4 | Configured and enabled |
+| B | 1 | 5-8 | Configured and enabled |
+| C | 2 | 9-12 | Empty and disabled |
+
+Gateway A currently uses this fixed device-ID/address map:
 
 ```text
 device 1: E0:CF:E0:E7:F7:4B
@@ -9,6 +19,21 @@ device 2: FF:F1:F9:E7:17:27
 device 3: DC:CB:F3:67:03:F1
 device 4: FD:8E:25:27:E3:F0
 ```
+
+Gateway B uses:
+
+```text
+device 5: DE:7A:A0:A1:06:5C
+device 6: FC:D9:6A:DF:B3:E4
+device 7: E1:69:9E:5A:1D:B3
+device 8: C1:2F:3F:19:FB:92
+```
+
+Profile C retains device IDs 9 through 12 but uses an all-zero address with
+`enabled=false`. Disabled slots are skipped by matching, scanning and
+reconnect decisions. Therefore a C image is safe to run before those devices
+exist: it emits offline diagnostics for its four IDs but cannot accidentally
+connect to another SmartBlock.
 
 The gateway repeats the connection flow until all four targets are ready:
 
@@ -52,23 +77,58 @@ The binary business stream uses the separate native `USB` connector, which
 enumerates as an ESP32-S3 USB Serial/JTAG CDC port (currently COM15). A baud
 setting supplied by PC serial software is ignored by native USB.
 
-The current implementation supports these four fixed targets. The normal
-build remains the stable direct-USB variant. The UART-to-aggregator variant is
-built separately so switching transport cannot silently change the stable
-image:
+The normal `sdkconfig.defaults` build remains the stable profile-A direct-USB
+variant. The three production aggregator images all use UART1 and are built
+from the same sources with separate configuration and build directories:
 
 ```powershell
-& 'D:\AIOT\ESP\ESPIDF\V523\523Tools\python_env\idf5.2_py3.11_env\Scripts\python.exe' `
-  'D:\AIOT\ESP\ESPIDF\V523\v5.2.3\esp-idf\tools\idf.py' `
-  -B build-uart `
-  -D 'SDKCONFIG=sdkconfig.gateway_uart' `
-  -D 'SDKCONFIG_DEFAULTS=sdkconfig.gateway_uart.defaults' `
-  build
+.\build_gateway_profiles.ps1
+
+# Or build only one profile:
+.\build_gateway_profiles.ps1 -Profile B
+```
+
+The outputs are:
+
+```text
+build-gateway-a/esp32s3_multi_receiver.bin  (gateway_id 0, devices 1-4)
+build-gateway-b/esp32s3_multi_receiver.bin  (gateway_id 1, devices 5-8)
+build-gateway-c/esp32s3_multi_receiver.bin  (gateway_id 2, devices 9-12)
+```
+
+Flash the required image by selecting its existing build directory:
+
+```powershell
+idf.py -B build-gateway-a -p COM13 -b 460800 flash
+idf.py -B build-gateway-b -p COM13 -b 460800 flash
+idf.py -B build-gateway-c -p COM13 -b 460800 flash
 ```
 
 UART mode uses UART1, TX GPIO17, RX GPIO18, 921600 baud, 8N1 and no hardware
-flow control. See `../aggregator/README.md` for wiring, flashing and the
-single-link acceptance procedure.
+flow control. See `../aggregator/README.md` for three-link wiring and
+acceptance procedures.
+
+## Assign devices 9 through 12
+
+All target assignments live in `main/gateway_profile.c`; do not create or
+copy another ESP-IDF project. After measuring a device address, replace only
+its disabled entry. For example, if device 9 is `AA:BB:CC:DD:EE:FF`, change:
+
+```c
+DISABLED_TARGET(9U)
+```
+
+to:
+
+```c
+RANDOM_TARGET(9U, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff)
+```
+
+The macro accepts the same left-to-right address order displayed by a BLE
+scanner and performs NimBLE's byte-order conversion internally. Rebuild the
+C profile afterward. Startup validation rejects wrong
+device-number ranges, duplicate enabled addresses, zero enabled addresses,
+and nonzero disabled placeholders.
 
 ## Hardware validation
 
@@ -116,17 +176,25 @@ devices 2..4: approximately 25 packets/s, zero gaps
 ESP USB queue drop delta: 0
 ```
 
-Based on that result, the production configuration now requests 30 ms on all
-four ESP32 central links, matching the 30 ms preference in every nRF firmware.
-The web diagnostics must report an actual 30 ms interval for devices 1 through
-4 after they reconnect. Each connection also advertises a 5 ms maximum
-connection-event length, enough for a complete 100-byte notification and
-weak-signal retries with the negotiated DLE while limiting the four-link total
-to 20 ms of each 30 ms scheduling period. The ESP32 controller honors this HCI
-connection-event value rather than use its original internal length algorithm.
-During initial establishment only, the ESP32 uses 30, 32.5, 35 and 37.5 ms
-respectively to seed different link-anchor phases; each nRF then requests its
-configured 30 ms preference after approximately five seconds.
+Based on that result, every connection retains a 5 ms maximum connection-event
+length, enough for a complete 100-byte notification and weak-signal retries
+with the negotiated DLE. The ESP32 controller honors this HCI connection-event
+value rather than use its original internal length algorithm.
+
+The multi-gateway production configuration intentionally uses a different
+steady interval for each independent radio:
+
+```text
+gateway A / devices 1..4:   30 ms (24 BLE units)
+gateway B / devices 5..8: 32.5 ms (26 BLE units)
+gateway C / devices 9..12:  35 ms (28 BLE units)
+```
+
+Each gateway requests its group interval from the first connection. Firmware
+0.1.4 on every nRF requests the same group interval after approximately five
+seconds, so a reconnect cannot collapse all colocated gateways back to a
+phase-locked 30 ms period. The web diagnostics should therefore report 30,
+32.5 or 35 ms according to the device group.
 
 The four-link follow-up on 2026-07-26 showed why both controls are required:
 starting all four links directly at 30 ms caused one link to remain near
@@ -151,22 +219,31 @@ negotiated links: MTU 185, DLE 189 octets, PHY 1M
 
 ## Link-budget and reconnect protection
 
-The gateway uses the highest ESP-IDF 5.2.3 ESP32-S3 controller power selector,
-`CONFIG_BT_CTRL_DFT_TX_POWER_LEVEL_P21`. This is the controller's maximum
-approximately-20-dBm class setting; the matching nRF52832 application
-explicitly selects its supported maximum of +4 dBm.
+The gateway uses the ESP-IDF controller `P9` transmit-power selector. Lowering
+the colocated gateway radios from the previous maximum selector reduces
+receiver blocking while the matching nRF52832 application keeps its supported
+maximum of +4 dBm.
+
+BLE startup is offset by profile so gateways powered from the same module do
+not establish all connection anchors at the same instant:
+
+```text
+gateway A:    0 ms
+gateway B: 1500 ms
+gateway C: 3000 ms
+```
 
 Scanning no longer runs continuously when a target disconnects. Each retry is:
 
 ```text
 passive scan
 scan interval: 100 ms
-scan window: 15 ms
-scan duration: 2 seconds
-pause before next retry: 2 seconds
+scan window: 10 ms
+scan duration: 1 second
+pause before next retry: 4 seconds
 ```
 
-The 15% in-burst scan duty cycle and the pause between retries preserve radio
+The 10% in-burst scan duty cycle and the longer pause between retries preserve radio
 time for links that remain connected. The existing 5 ms per-link connection
 event cap remains enabled so a weak link cannot monopolize the controller.
 

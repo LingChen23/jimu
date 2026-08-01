@@ -1,5 +1,22 @@
 menu "SmartBlock BLE gateway"
 
+    choice SMARTBLOCK_GATEWAY_PROFILE
+        prompt "Gateway device group"
+        default SMARTBLOCK_GATEWAY_PROFILE_A
+        help
+            One source project builds three gateway firmware variants.
+            Each variant owns a fixed gateway ID and four nRF device slots.
+
+        config SMARTBLOCK_GATEWAY_PROFILE_A
+            bool "Gateway A: devices 1-4"
+
+        config SMARTBLOCK_GATEWAY_PROFILE_B
+            bool "Gateway B: devices 5-8"
+
+        config SMARTBLOCK_GATEWAY_PROFILE_C
+            bool "Gateway C: devices 9-12"
+    endchoice
+
     choice SMARTBLOCK_GATEWAY_TRANSPORT
         prompt "Business-channel transport"
         default SMARTBLOCK_GATEWAY_TRANSPORT_USB

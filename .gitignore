@@ -23,6 +23,8 @@ tx_device/lib_nRF/components/softdevice/*/hex/*.sct
 **/sdkconfig.old
 **/sdkconfig.gateway_uart
 **/sdkconfig.gateway_uart.old
+**/sdkconfig.gateway_*_uart
+**/sdkconfig.gateway_*_uart.old
 
 # Keil per-user state and backups
 *.uvgui.*

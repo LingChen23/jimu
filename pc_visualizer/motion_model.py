@@ -40,6 +40,9 @@ SIGNAL_HISTORY = 1000
 PATH_HISTORY = 3000
 MAX_MOVEMENT_SAMPLES = 30000
 UINT32_MASK = 0xFFFFFFFF
+UINT16_MASK = 0xFFFF
+MAX_CONTINUOUS_SAMPLE_GAP_SECONDS = 0.25
+MAX_HOST_ARRIVAL_GAP_SECONDS = 1.0
 
 ANALYSIS_MODE_DEVICE = "device"
 ANALYSIS_MODE_PC = "pc"
@@ -1381,6 +1384,8 @@ class AnalysisPipeline:
     received_origin: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     received_origin_set: bool = False
     last_coordinate_source_sequence: int | None = None
+    trajectory_revision: int = 0
+    interrupted_movement_count: int = 0
     motion_state: str = "等待静止"
 
     def __post_init__(self) -> None:
@@ -1394,6 +1399,7 @@ class AnalysisPipeline:
         start_epoch: float | None,
         frame: MotionFrame | None = None,
     ) -> None:
+        self.trajectory_revision += 1
         self.estimator.reset_position()
         self.received_path.clear()
         self.calculated_path.clear()
@@ -1420,6 +1426,25 @@ class AnalysisPipeline:
             start_epoch=start_epoch,
         )
         self.motion_state = "移动中"
+
+    def break_segment(self, reason: str) -> None:
+        """Discard an incomplete segment and rebuild all causal tracking state."""
+        if self.current_movement is not None:
+            self.interrupted_movement_count += 1
+        self.current_movement = None
+        self.estimator = InertialEstimator()
+        if self.mode == ANALYSIS_MODE_PC:
+            self.detector = PcMotionDetector()
+            self.motion_state = "数据中断，等待静止校准"
+        else:
+            self.detector = None
+            self.motion_state = "数据中断，等待设备状态"
+        self.received_path.clear()
+        self.calculated_path.clear()
+        self.received_origin = [0.0, 0.0, 0.0]
+        self.received_origin_set = False
+        self.last_coordinate_source_sequence = None
+        self.trajectory_revision += 1
 
     def _resume_movement(
         self,
@@ -1495,6 +1520,7 @@ class AnalysisPipeline:
             self.last_coordinate_source_sequence = None
             self.current_movement = None
             self.motion_state = "静止"
+            self.trajectory_revision += 1
             return
 
         if movement.calculated_path_final:
@@ -1759,9 +1785,11 @@ class AnalysisPipeline:
         self.current_movement = None
         self.next_movement_id = 1
         self.ignored_short_movement_count = 0
+        self.interrupted_movement_count = 0
         self.received_origin = [0.0, 0.0, 0.0]
         self.received_origin_set = False
         self.last_coordinate_source_sequence = None
+        self.trajectory_revision += 1
         if self.detector is not None:
             self.detector.reset_analysis()
             self.motion_state = "静止" if self.detector.calibrated else "PC校准中"
@@ -1835,6 +1863,7 @@ class AnalysisPipeline:
         return {
             "motion_state": self.motion_state,
             "movement_active": self.current_movement is not None,
+            "trajectory_revision": self.trajectory_revision,
             "movement_filter": {
                 "minimum_seconds": self.minimum_movement_seconds,
                 "ignored_short_count": self.ignored_short_movement_count,
@@ -1882,6 +1911,8 @@ class AnalysisPipeline:
             }
         return {
             "motion_state": self.motion_state,
+            "trajectory_revision": self.trajectory_revision,
+            "interrupted_movement_count": self.interrupted_movement_count,
             "movement_filter": {
                 "minimum_seconds": self.minimum_movement_seconds,
                 "ignored_short_count": self.ignored_short_movement_count,
@@ -1918,14 +1949,24 @@ class DeviceState:
         default_factory=lambda: deque(maxlen=SIGNAL_HISTORY)
     )
     last_seen: float = 0.0
+    last_arrival_monotonic: float = 0.0
     first_tick: int | None = None
     clock_anchor_tick: int | None = None
     clock_anchor_epoch: float | None = None
     last_packet_sequence: int | None = None
     last_sample_sequence: int | None = None
+    last_continuity_sample_sequence: int | None = None
+    last_sample_tick: int | None = None
+    current_session_id: int | None = None
     packet_count: int = 0
     sample_count: int = 0
     lost_packets: int = 0
+    duplicate_packet_count: int = 0
+    out_of_order_packet_count: int = 0
+    continuity_gap_count: int = 0
+    discontinuity_count: int = 0
+    last_discontinuity_reason: str | None = None
+    last_discontinuity_epoch: float | None = None
     source: str = "waiting"
     last_flags: int = 0
     coordinate_flags: int = 0
@@ -1965,13 +2006,139 @@ class DeviceState:
         self.clock_anchor_tick = None
         self.clock_anchor_epoch = None
 
+    def _break_analysis_segment(
+        self,
+        reason: str,
+        event_epoch: float,
+        mark_offline: bool = False,
+    ) -> None:
+        for analysis in self.analyses.values():
+            analysis.break_segment(reason)
+        self.accel_history.clear()
+        self.gyro_history.clear()
+        self.first_tick = None
+        self.clock_anchor_tick = None
+        self.clock_anchor_epoch = None
+        self.discontinuity_count += 1
+        self.last_discontinuity_reason = reason
+        self.last_discontinuity_epoch = event_epoch
+        if mark_offline:
+            self.last_seen = 0.0
+            self.last_arrival_monotonic = 0.0
+            self.source = "waiting"
+
+    def transport_discontinuity(self, reason: str) -> None:
+        has_stream_state = (
+            self.current_session_id is not None
+            or self.last_seen > 0.0
+            or self.last_packet_sequence is not None
+            or any(
+                analysis.current_movement is not None
+                or analysis.estimator.initialized
+                for analysis in self.analyses.values()
+            )
+        )
+        if not has_stream_state:
+            return
+        self._break_analysis_segment(reason, time.time(), mark_offline=True)
+        self.last_packet_sequence = None
+        self.last_sample_sequence = None
+        self.last_continuity_sample_sequence = None
+        self.last_sample_tick = None
+        self.current_session_id = None
+
     def reset_packet_counters(self) -> None:
         self.packet_count = 0
         self.lost_packets = 0
+        self.duplicate_packet_count = 0
+        self.out_of_order_packet_count = 0
+        self.continuity_gap_count = 0
         self.last_packet_sequence = None
+        self.last_continuity_sample_sequence = None
+        self.last_sample_tick = None
 
-    def process(self, frame: MotionFrame) -> None:
+    def process(self, frame: MotionFrame) -> bool:
         frame_epoch = time.time()
+        frame_arrival_monotonic = time.monotonic()
+        if not frame.samples:
+            return False
+        full_motion_frame = frame.source == "motion-v1-100b"
+        discontinuity_reason: str | None = None
+
+        if full_motion_frame:
+            if (
+                self.last_arrival_monotonic > 0.0
+                and frame_arrival_monotonic - self.last_arrival_monotonic
+                > MAX_HOST_ARRIVAL_GAP_SECONDS
+            ):
+                discontinuity_reason = "host_arrival_gap"
+
+            if self.current_session_id is None:
+                self.current_session_id = frame.session_id
+            elif frame.session_id != self.current_session_id:
+                self.current_session_id = frame.session_id
+                self.last_packet_sequence = None
+                self.last_continuity_sample_sequence = None
+                self.last_sample_tick = None
+                discontinuity_reason = "session_changed"
+
+            if self.last_packet_sequence is not None:
+                if frame.packet_sequence == self.last_packet_sequence:
+                    self.duplicate_packet_count += 1
+                    return False
+                expected_packet = (
+                    self.last_packet_sequence + 1
+                ) & UINT16_MASK
+                packet_gap = (
+                    frame.packet_sequence - expected_packet
+                ) & UINT16_MASK
+                if 0 < packet_gap < 0x8000:
+                    self.lost_packets += packet_gap
+                    discontinuity_reason = (
+                        discontinuity_reason or "packet_gap"
+                    )
+                elif packet_gap >= 0x8000:
+                    self.out_of_order_packet_count += 1
+                    return False
+
+            first_sample = frame.samples[0]
+            if self.last_continuity_sample_sequence is not None:
+                expected_sample = (
+                    self.last_continuity_sample_sequence + 1
+                ) & UINT32_MASK
+                sample_gap = (
+                    first_sample.sequence - expected_sample
+                ) & UINT32_MASK
+                if 0 < sample_gap < 0x80000000:
+                    discontinuity_reason = (
+                        discontinuity_reason or "sample_gap"
+                    )
+                elif sample_gap >= 0x80000000:
+                    self.out_of_order_packet_count += 1
+                    return False
+
+            if self.last_sample_tick is not None:
+                sample_gap_seconds = _tick_seconds(
+                    first_sample.tick_32k,
+                    self.last_sample_tick,
+                )
+                if (
+                    sample_gap_seconds <= 0.0
+                    or sample_gap_seconds
+                    > MAX_CONTINUOUS_SAMPLE_GAP_SECONDS
+                ):
+                    discontinuity_reason = (
+                        discontinuity_reason or "sample_time_gap"
+                    )
+
+        if discontinuity_reason is not None:
+            if discontinuity_reason != "session_changed":
+                self.continuity_gap_count += 1
+            self._break_analysis_segment(
+                discontinuity_reason,
+                frame_epoch,
+            )
+
         last_sample_tick = frame.samples[-1].tick_32k
         if self.clock_anchor_tick is None or self.clock_anchor_epoch is None:
             self.clock_anchor_tick = last_sample_tick
@@ -1986,17 +2153,9 @@ class DeviceState:
             self.clock_anchor_tick = last_sample_tick
             self.clock_anchor_epoch = frame_epoch
             timeline_epoch = frame_epoch
-        if (
-            frame.source == "motion-v1-100b"
-            and self.last_packet_sequence is not None
-            and frame.packet_sequence != self.last_packet_sequence
-        ):
-            expected = (self.last_packet_sequence + 1) & 0xFFFF
-            gap = (frame.packet_sequence - expected) & 0xFFFF
-            if 0 < gap < 0x8000:
-                self.lost_packets += gap
-
-        self.last_packet_sequence = frame.packet_sequence
+        if full_motion_frame:
+            self.last_packet_sequence = frame.packet_sequence
+            self.last_arrival_monotonic = frame_arrival_monotonic
         self.packet_count += 1
         self.last_seen = frame_epoch
         self.source = frame.source
@@ -2026,6 +2185,10 @@ class DeviceState:
             )
             self.last_sample_sequence = sample.sequence
             self.sample_count += 1
+        if full_motion_frame:
+            self.last_continuity_sample_sequence = frame.samples[-1].sequence
+            self.last_sample_tick = frame.samples[-1].tick_32k
+        return True
 
     def snapshot(self) -> dict[str, Any]:
         age = time.time() - self.last_seen if self.last_seen else None
@@ -2040,6 +2203,13 @@ class DeviceState:
             "packet_count": self.packet_count,
             "sample_count": self.sample_count,
             "lost_packets": self.lost_packets,
+            "duplicate_packet_count": self.duplicate_packet_count,
+            "out_of_order_packet_count": self.out_of_order_packet_count,
+            "continuity_gap_count": self.continuity_gap_count,
+            "discontinuity_count": self.discontinuity_count,
+            "last_discontinuity_reason": self.last_discontinuity_reason,
+            "last_discontinuity_epoch": self.last_discontinuity_epoch,
+            "session_id": self.current_session_id,
             "last_packet_sequence": self.last_packet_sequence,
             "last_sample_sequence": self.last_sample_sequence,
             "flags": self.last_flags,
@@ -2079,6 +2249,9 @@ class DeviceState:
             "age_seconds": age,
             "source": self.source,
             "last_sample_sequence": self.last_sample_sequence,
+            "session_id": self.current_session_id,
+            "discontinuity_count": self.discontinuity_count,
+            "last_discontinuity_reason": self.last_discontinuity_reason,
             "analysis_mode": self.analysis_mode,
             "analysis_mode_label": ANALYSIS_MODE_LABELS[self.analysis_mode],
             "device_reference_state": _device_state_label(
@@ -2086,6 +2259,16 @@ class DeviceState:
             ),
             "accel_mps2": latest_accel,
             "gyro_dps": latest_gyro,
+            "accel_sample": (
+                list(self.accel_history[-1])
+                if self.accel_history
+                else None
+            ),
+            "gyro_sample": (
+                list(self.gyro_history[-1])
+                if self.gyro_history
+                else None
+            ),
             **active.live_snapshot(),
         }
 
@@ -2194,8 +2377,12 @@ class MotionStore:
         if frame.device_id not in self._devices:
             return False
         with self._lock:
-            self._devices[frame.device_id].process(frame)
-        return True
+            return self._devices[frame.device_id].process(frame)
+
+    def transport_discontinuity(self, reason: str) -> None:
+        with self._lock:
+            for state in self._devices.values():
+                state.transport_discontinuity(reason)
 
     def reset_analysis(self, device_id: int) -> bool:
         with self._lock:

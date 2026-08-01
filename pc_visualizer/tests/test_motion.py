@@ -60,6 +60,7 @@ def make_frame(
     accel_raw: tuple[int, int, int] = (0, 0, 4096),
     gyro_raw: tuple[int, int, int] = (0, 0, 0),
     coordinate_source_sequence: int | None = None,
+    session_id: int = 1,
 ) -> MotionFrame:
     samples = tuple(
         ImuSample(
@@ -73,7 +74,7 @@ def make_frame(
     return MotionFrame(
         device_id=1,
         packet_sequence=packet_sequence,
-        session_id=1,
+        session_id=session_id,
         flags=0x41,
         samples=samples,
         coordinate_source_sequence=(
@@ -439,6 +440,120 @@ class MotionProtocolTests(unittest.TestCase):
         rebased = store.snapshot(1)
         self.assertEqual(rebased["packet_count"], 1)
         self.assertEqual(rebased["lost_packets"], 0)
+
+    def test_session_change_discards_active_segment_and_recalibrates(self) -> None:
+        store = MotionStore(minimum_movement_seconds=0.0)
+        store.set_analysis_mode(1, "device")
+        self.assertTrue(
+            store.process(
+                make_frame(
+                    10,
+                    0x0002,
+                    10000,
+                    gyro_raw=(0, 0, 1200),
+                    session_id=10,
+                )
+            )
+        )
+        self.assertIsNotNone(store.snapshot(1)["current_movement"])
+
+        self.assertTrue(
+            store.process(
+                make_frame(
+                    0,
+                    0x0001,
+                    0,
+                    session_id=11,
+                )
+            )
+        )
+        snapshot = store.snapshot(1)
+
+        self.assertEqual(snapshot["session_id"], 11)
+        self.assertEqual(snapshot["discontinuity_count"], 1)
+        self.assertEqual(snapshot["last_discontinuity_reason"], "session_changed")
+        self.assertEqual(snapshot["interrupted_movement_count"], 1)
+        self.assertIsNone(snapshot["current_movement"])
+        self.assertEqual(snapshot["calculated_path"], [])
+
+    def test_duplicate_and_out_of_order_packets_are_rejected(self) -> None:
+        store = MotionStore()
+        first = make_frame(10, 0x0001, 0)
+
+        self.assertTrue(store.process(first))
+        self.assertFalse(store.process(first))
+        self.assertFalse(store.process(make_frame(9, 0x0001, 0)))
+        snapshot = store.snapshot(1)
+
+        self.assertEqual(snapshot["packet_count"], 1)
+        self.assertEqual(snapshot["sample_count"], 4)
+        self.assertEqual(snapshot["duplicate_packet_count"], 1)
+        self.assertEqual(snapshot["out_of_order_packet_count"], 1)
+
+    def test_packet_gap_breaks_active_segment_before_new_samples(self) -> None:
+        store = MotionStore(minimum_movement_seconds=0.0)
+        store.set_analysis_mode(1, "device")
+        self.assertTrue(store.process(make_frame(10, 0x0002, 0)))
+        before = store.snapshot(1)
+        self.assertEqual(before["current_movement"]["sample_count"], 4)
+
+        self.assertTrue(store.process(make_frame(12, 0x0002, 8 * 328)))
+        after = store.snapshot(1)
+
+        self.assertEqual(after["packet_count"], 2)
+        self.assertEqual(after["lost_packets"], 1)
+        self.assertEqual(after["continuity_gap_count"], 1)
+        self.assertEqual(after["last_discontinuity_reason"], "packet_gap")
+        self.assertEqual(after["interrupted_movement_count"], 1)
+        self.assertEqual(after["current_movement"]["sample_count"], 4)
+
+    def test_transport_disconnect_restarts_stream_without_stitching(self) -> None:
+        store = MotionStore(minimum_movement_seconds=0.0)
+        store.set_analysis_mode(1, "device")
+        self.assertTrue(store.process(make_frame(0, 0x0002, 0)))
+
+        store.transport_discontinuity("serial_closed")
+        disconnected = store.snapshot(1)
+
+        self.assertFalse(disconnected["online"])
+        self.assertIsNone(disconnected["session_id"])
+        self.assertIsNone(disconnected["current_movement"])
+        self.assertEqual(disconnected["calculated_path"], [])
+        self.assertEqual(disconnected["last_discontinuity_reason"], "serial_closed")
+        self.assertEqual(disconnected["interrupted_movement_count"], 1)
+
+        self.assertTrue(store.process(make_frame(1, 0x0002, 100000)))
+        resumed = store.snapshot(1)
+        self.assertEqual(resumed["session_id"], 1)
+        self.assertEqual(resumed["current_movement"]["sample_count"], 4)
+
+    def test_rtc_time_gap_breaks_segment_even_when_sequences_are_continuous(self) -> None:
+        store = MotionStore(minimum_movement_seconds=0.0)
+        store.set_analysis_mode(1, "device")
+        self.assertTrue(store.process(make_frame(0, 0x0002, 0)))
+        self.assertTrue(store.process(make_frame(1, 0x0002, 100000)))
+        snapshot = store.snapshot(1)
+
+        self.assertEqual(snapshot["lost_packets"], 0)
+        self.assertEqual(snapshot["continuity_gap_count"], 1)
+        self.assertEqual(snapshot["last_discontinuity_reason"], "sample_time_gap")
+        self.assertEqual(snapshot["interrupted_movement_count"], 1)
+        self.assertEqual(snapshot["current_movement"]["sample_count"], 4)
+
+    def test_host_arrival_gap_breaks_even_when_buffered_data_is_continuous(self) -> None:
+        store = MotionStore(minimum_movement_seconds=0.0)
+        store.set_analysis_mode(1, "device")
+        self.assertTrue(store.process(make_frame(0, 0x0002, 0)))
+        store._devices[1].last_arrival_monotonic -= 2.0
+
+        self.assertTrue(store.process(make_frame(1, 0x0002, 4 * 328)))
+        snapshot = store.snapshot(1)
+
+        self.assertEqual(snapshot["lost_packets"], 0)
+        self.assertEqual(snapshot["continuity_gap_count"], 1)
+        self.assertEqual(snapshot["last_discontinuity_reason"], "host_arrival_gap")
+        self.assertEqual(snapshot["interrupted_movement_count"], 1)
+        self.assertEqual(snapshot["current_movement"]["sample_count"], 4)
 
     def test_shake_and_flip_are_counted_independently(self) -> None:
         movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
@@ -950,6 +1065,8 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(live["device_id"], 1)
         self.assertEqual(len(live["accel_mps2"]), 3)
         self.assertEqual(len(live["gyro_dps"]), 3)
+        self.assertEqual(len(live["accel_sample"]), 4)
+        self.assertEqual(len(live["gyro_sample"]), 4)
         self.assertIn("orientation", live)
         self.assertIn("calculated_position_m", live)
         self.assertFalse(live["position_semantics"]["pc_metric_reliable"])

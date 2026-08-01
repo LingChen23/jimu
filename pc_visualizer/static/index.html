@@ -554,7 +554,7 @@
             <h2>实时姿态</h2>
             <div class="muted">PC 四元数姿态估计</div>
           </div>
-          <span class="live-badge">20 Hz 实时刷新</span>
+          <span class="live-badge">25 Hz 低延迟刷新</span>
         </div>
         <div class="orientation-canvas-wrap">
           <canvas id="orientationCanvas" aria-label="实时设备朝向"></canvas>
@@ -734,6 +734,8 @@
     let latestLive = null;
     let trajectoryView = "iso";
     let trajectoryDisplayMode = "shape";
+    let liveSignalRows = {accel: [], gyro: []};
+    let rawPaths = {received: [], calculated: []};
     let displayPaths = {received: [], calculated: []};
     let displayTransforms = {
       received: {origin: [0, 0, 0], scale: 1},
@@ -743,6 +745,12 @@
     let renderQuaternion = [1, 0, 0, 0];
     let snapNextQuaternion = true;
     let plotCameraRevision = 0;
+    let trajectoryRevision = null;
+    let trajectoryRenderTimer = null;
+    let lastTrajectoryRenderMs = 0;
+    let signalRenderTimer = null;
+    let lastSignalRenderMs = 0;
+    let lastAnimationFrameMs = performance.now();
 
     function detectWebGL() {
       try {
@@ -848,11 +856,14 @@
           selectedDevice = id;
           latestSnapshot = null;
           latestLive = null;
+          liveSignalRows = {accel: [], gyro: []};
+          rawPaths = {received: [], calculated: []};
           displayPaths = {received: [], calculated: []};
           displayTransforms = {
             received: {origin: [0, 0, 0], scale: 1},
             calculated: {origin: [0, 0, 0], scale: 1}
           };
+          trajectoryRevision = null;
           plotCameraRevision += 1;
           targetQuaternion = [1, 0, 0, 0];
           renderQuaternion = [1, 0, 0, 0];
@@ -1086,6 +1097,55 @@
       });
     }
 
+    function validSignalRow(row) {
+      return Array.isArray(row) && row.length === 4 && row.every(Number.isFinite);
+    }
+
+    function appendLiveSignalRow(rows, row) {
+      if (!validSignalRow(row)) return false;
+      const last = rows.at(-1);
+      if (last && row[0] < last[0]) {
+        rows.length = 0;
+      } else if (last && Math.abs(row[0] - last[0]) < 1e-9) {
+        const changed = last.some((value, index) => Math.abs(value - row[index]) >= 1e-9);
+        if (changed) rows[rows.length - 1] = [...row];
+        return changed;
+      }
+      rows.push([...row]);
+      if (rows.length > 1000) rows.splice(0, rows.length - 1000);
+      return true;
+    }
+
+    function scheduleLiveSignalRender(immediate = false) {
+      if (signalRenderTimer !== null) {
+        if (!immediate) return;
+        clearTimeout(signalRenderTimer);
+        signalRenderTimer = null;
+      }
+      const minimumIntervalMs = 40;
+      const elapsed = performance.now() - lastSignalRenderMs;
+      const delay = immediate ? 0 : Math.max(0, minimumIntervalMs - elapsed);
+      signalRenderTimer = window.setTimeout(() => {
+        signalRenderTimer = null;
+        drawTimeSeries(elements.accel, liveSignalRows.accel, "m/s²");
+        drawTimeSeries(elements.gyro, liveSignalRows.gyro, "°/s");
+        lastSignalRenderMs = performance.now();
+      }, delay);
+    }
+
+    function updateLiveSignals(live) {
+      if (!live.accel_sample && !live.gyro_sample && live.source === "waiting") {
+        if (liveSignalRows.accel.length || liveSignalRows.gyro.length) {
+          liveSignalRows = {accel: [], gyro: []};
+          scheduleLiveSignalRender(true);
+        }
+        return;
+      }
+      const accelChanged = appendLiveSignalRow(liveSignalRows.accel, live.accel_sample);
+      const gyroChanged = appendLiveSignalRow(liveSignalRows.gyro, live.gyro_sample);
+      if (accelChanged || gyroChanged) scheduleLiveSignalRender();
+    }
+
     function validPoint(point) {
       return Array.isArray(point) && point.length === 3 && point.every(Number.isFinite);
     }
@@ -1289,9 +1349,9 @@
       });
     }
 
-    function updateDisplayPaths(snapshot) {
-      const received = trajectoryTransform(snapshot.received_path || []);
-      const calculated = trajectoryTransform(snapshot.calculated_path || []);
+    function refreshDisplayPaths(snapshot = latestSnapshot) {
+      const received = trajectoryTransform(rawPaths.received);
+      const calculated = trajectoryTransform(rawPaths.calculated);
       displayTransforms = {
         received: {origin: received.origin, scale: received.scale},
         calculated: {origin: calculated.origin, scale: calculated.scale}
@@ -1302,6 +1362,75 @@
       };
       updateTrajectoryLabels();
       renderTrajectoryPlot(snapshot);
+      lastTrajectoryRenderMs = performance.now();
+    }
+
+    function updateDisplayPaths(snapshot) {
+      if (trajectoryRenderTimer !== null) {
+        clearTimeout(trajectoryRenderTimer);
+        trajectoryRenderTimer = null;
+      }
+      rawPaths = {
+        received: (snapshot.received_path || []).filter(validPoint).map(point => [...point]),
+        calculated: (snapshot.calculated_path || []).filter(validPoint).map(point => [...point])
+      };
+      trajectoryRevision = Number.isFinite(snapshot.trajectory_revision)
+        ? snapshot.trajectory_revision
+        : trajectoryRevision;
+      refreshDisplayPaths(snapshot);
+    }
+
+    function appendLivePathPoint(path, point) {
+      if (!validPoint(point)) return false;
+      const last = path.at(-1);
+      if (last && last.every((value, axis) => Math.abs(value - point[axis]) < 1e-9)) {
+        return false;
+      }
+      path.push([...point]);
+      if (path.length > 3000) {
+        path.splice(1, path.length - 3000);
+      }
+      return true;
+    }
+
+    function scheduleLiveTrajectoryRender(immediate = false) {
+      if (trajectoryRenderTimer !== null) {
+        if (!immediate) return;
+        clearTimeout(trajectoryRenderTimer);
+        trajectoryRenderTimer = null;
+      }
+      const minimumIntervalMs = 80;
+      const elapsed = performance.now() - lastTrajectoryRenderMs;
+      const delay = immediate ? 0 : Math.max(0, minimumIntervalMs - elapsed);
+      trajectoryRenderTimer = window.setTimeout(() => {
+        trajectoryRenderTimer = null;
+        refreshDisplayPaths(latestSnapshot);
+      }, delay);
+    }
+
+    function updateLiveTrajectory(live) {
+      const revision = Number.isFinite(live.trajectory_revision)
+        ? live.trajectory_revision
+        : trajectoryRevision;
+      if (revision !== trajectoryRevision) {
+        trajectoryRevision = revision;
+        rawPaths = {received: [], calculated: []};
+        displayPaths = {received: [], calculated: []};
+        plotCameraRevision += 1;
+        scheduleLiveTrajectoryRender(true);
+      }
+      if (!live.movement_active) return;
+      const receivedChanged = appendLivePathPoint(
+        rawPaths.received,
+        live.received_position_m
+      );
+      const calculatedChanged = appendLivePathPoint(
+        rawPaths.calculated,
+        live.calculated_position_m
+      );
+      if (receivedChanged || calculatedChanged) {
+        scheduleLiveTrajectoryRender();
+      }
     }
 
     function drawArrow(context, start, end, color, label, width = 2) {
@@ -1797,6 +1926,8 @@
     function renderLive(live) {
       if (!live) return;
       latestLive = live;
+      updateLiveSignals(live);
+      updateLiveTrajectory(live);
       const orientation = live.orientation || {};
       setTargetQuaternion(orientation.quaternion_wxyz || [1, 0, 0, 0]);
       const q = normalizeQuaternion(orientation.quaternion_wxyz || [1, 0, 0, 0]);
@@ -1830,7 +1961,7 @@
       const link = control.link || {};
       const serialOpen = Boolean(snapshot.serial?.open);
       elements.commandButtons.querySelectorAll("button").forEach(button => {
-        button.disabled = !serialOpen;
+        button.disabled = !serialOpen || button.dataset.pending === "true";
       });
       elements.batteryMv.textContent = Number.isFinite(status.battery_mV)
         ? `${status.battery_mV} mV${status.battery_low ? " · 低电压" : ""}`
@@ -1928,8 +2059,11 @@
           `选择设备 ${device.device_id}，${device.online ? "在线" : "离线"}`);
       });
       renderMovement(snapshot);
-      drawTimeSeries(elements.accel, snapshot.accel || [], "m/s²");
-      drawTimeSeries(elements.gyro, snapshot.gyro || [], "°/s");
+      liveSignalRows = {
+        accel: (snapshot.accel || []).filter(validSignalRow).map(row => [...row]),
+        gyro: (snapshot.gyro || []).filter(validSignalRow).map(row => [...row])
+      };
+      scheduleLiveSignalRender(true);
       updateDisplayPaths(snapshot);
       if (snapshot.orientation) {
         renderLive({
@@ -1937,6 +2071,19 @@
           orientation: snapshot.orientation,
           calculated_position_m: snapshot.calculated_path?.at(-1) || snapshot.orientation.position_m
         });
+      }
+    }
+
+    async function refreshStatusInBackground(deviceId) {
+      await new Promise(resolve => window.setTimeout(resolve, 120));
+      try {
+        await api("/api/device/command", {
+          method: "POST",
+          body: JSON.stringify({device: deviceId, command: "GET_STATUS"})
+        });
+        if (selectedDevice === deviceId) pollSnapshot();
+      } catch (error) {
+        if (selectedDevice === deviceId) elements.error.textContent = error.message;
       }
     }
 
@@ -1951,32 +2098,27 @@
       }
       elements.error.textContent = "";
       elements.commandResult.textContent = `正在执行 ${command}…`;
-      elements.commandButtons.querySelectorAll("button").forEach(item => {
-        item.disabled = true;
-      });
+      button.dataset.pending = "true";
+      button.disabled = true;
       try {
-        let result = await api("/api/device/command", {
+        const commandDevice = selectedDevice;
+        const result = await api("/api/device/command", {
           method: "POST",
-          body: JSON.stringify({device: selectedDevice, command})
+          body: JSON.stringify({device: commandDevice, command})
         });
         if (!result.ok) throw new Error(`${command}：${result.message}`);
         elements.commandResult.textContent = `${command}：${result.message}`;
         if (!["GET_INFO", "GET_STATUS", "REBOOT"].includes(command)) {
-          result = await api("/api/device/command", {
-            method: "POST",
-            body: JSON.stringify({device: selectedDevice, command: "GET_STATUS"})
-          });
-          if (!result.ok) throw new Error(`GET_STATUS：${result.message}`);
+          void refreshStatusInBackground(commandDevice);
         }
-        await pollSnapshot();
+        pollSnapshot();
       } catch (error) {
         elements.error.textContent = error.message;
         elements.commandResult.textContent = `${command}：失败`;
       } finally {
+        button.dataset.pending = "false";
         const serialOpen = Boolean(latestSnapshot?.serial?.open);
-        elements.commandButtons.querySelectorAll("button").forEach(item => {
-          item.disabled = !serialOpen;
-        });
+        button.disabled = !serialOpen;
       }
     }
 
@@ -2087,8 +2229,12 @@
       }
     }
 
-    function animationLoop() {
-      renderQuaternion = quaternionSlerp(renderQuaternion, targetQuaternion, 0.18);
+    function animationLoop(nowMs) {
+      const elapsedMs = Math.max(0, Math.min(100, nowMs - lastAnimationFrameMs));
+      lastAnimationFrameMs = nowMs;
+      const smoothingTimeConstantMs = 24;
+      const amount = 1 - Math.exp(-elapsedMs / smoothingTimeConstantMs);
+      renderQuaternion = quaternionSlerp(renderQuaternion, targetQuaternion, amount);
       drawOrientationFrame();
       requestAnimationFrame(animationLoop);
     }
@@ -2120,7 +2266,7 @@
         });
         plotCameraRevision += 1;
         if (latestSnapshot) {
-          updateDisplayPaths(latestSnapshot);
+          refreshDisplayPaths(latestSnapshot);
           if (latestLive) renderLive(latestLive);
         }
       });
@@ -2147,8 +2293,8 @@
     loadPorts();
     pollSnapshot();
     pollLive();
-    setInterval(pollSnapshot, 250);
-    setInterval(pollLive, 50);
+    setInterval(pollSnapshot, 500);
+    setInterval(pollLive, 40);
     requestAnimationFrame(animationLoop);
   </script>
 </body>

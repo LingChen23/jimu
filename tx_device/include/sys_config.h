@@ -24,8 +24,22 @@
 #define APP_TIMER_OP_QUEUE_SIZE         4                                           /**< Size of timer operation queues. */
 
 #define BLE_TX_POWER_DBM                4                                           /**< Explicit nRF52832 BLE transmit power (+4 dBm maximum). */
-#define MIN_CONN_INTERVAL               MSEC_TO_UNITS(30, UNIT_1_25_MS)             /**< All SmartBlock devices use a 30 ms connection interval. */
-#define MAX_CONN_INTERVAL               MSEC_TO_UNITS(30, UNIT_1_25_MS)             /**< All SmartBlock devices use a 30 ms connection interval. */
+
+/*
+ * Keep independent gateways on different steady periods so their connection
+ * events do not remain phase-locked when the gateway antennas are colocated.
+ * BLE connection intervals use 1.25 ms units.
+ */
+#if (TX_DEVICE_ID <= 4U)
+#define SMARTBLOCK_CONN_INTERVAL_UNITS  24U                                         /**< Gateway A: 30 ms. */
+#elif (TX_DEVICE_ID <= 8U)
+#define SMARTBLOCK_CONN_INTERVAL_UNITS  26U                                         /**< Gateway B: 32.5 ms. */
+#else
+#define SMARTBLOCK_CONN_INTERVAL_UNITS  28U                                         /**< Gateway C: 35 ms. */
+#endif
+
+#define MIN_CONN_INTERVAL               SMARTBLOCK_CONN_INTERVAL_UNITS
+#define MAX_CONN_INTERVAL               SMARTBLOCK_CONN_INTERVAL_UNITS
 #define SLAVE_LATENCY                   0                                           /**< Slave latency. */
 #define CONN_SUP_TIMEOUT                MSEC_TO_UNITS(4000, UNIT_10_MS)             /**< Connection supervisory timeout (4 seconds), Supervision Timeout uses 10 ms units. */
 #define FIRST_CONN_PARAMS_UPDATE_DELAY  APP_TIMER_TICKS(5000, APP_TIMER_PRESCALER)  /**< Time from initiating event (connect or start of notification) to first time sd_ble_gap_conn_param_update is called (5 seconds). */
@@ -33,9 +47,9 @@
 #define MAX_CONN_PARAMS_UPDATE_COUNT    3                                           /**< Number of attempts before giving up the connection parameter negotiation. */
 
 /*
- * Every SmartBlock requests the preferred 30 ms connection interval about
- * five seconds after connecting. Keeping the behavior identical across all
- * device IDs avoids leaving device 1 on a gateway-selected interval.
+ * Every SmartBlock requests its gateway group's preferred interval about five
+ * seconds after connecting. This also restores the intended interval after a
+ * reconnect without collapsing all three gateway groups back to 30 ms.
  */
 #define TX_CONN_PARAMS_UPDATE_ENABLED   1U
 

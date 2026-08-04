@@ -1,0 +1,19 @@
+{
+  "mapping_version": "initial-a-to-l-v1",
+  "status": "preliminary_configurable",
+  "description": "初步映射；确认实际安装关系后修改本文件并更新 mapping_version，重启 PC 后端生效。",
+  "devices": [
+    {"device_id": 1, "block_id": "A"},
+    {"device_id": 2, "block_id": "B"},
+    {"device_id": 3, "block_id": "C"},
+    {"device_id": 4, "block_id": "D"},
+    {"device_id": 5, "block_id": "E"},
+    {"device_id": 6, "block_id": "F"},
+    {"device_id": 7, "block_id": "G"},
+    {"device_id": 8, "block_id": "H"},
+    {"device_id": 9, "block_id": "I"},
+    {"device_id": 10, "block_id": "J"},
+    {"device_id": 11, "block_id": "K"},
+    {"device_id": 12, "block_id": "L"}
+  ]
+}

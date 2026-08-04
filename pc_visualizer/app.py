@@ -18,10 +18,12 @@ from serial_service import SerialService
 ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = ROOT / "static"
 SETTINGS_PATH = ROOT / "motion_settings.json"
+BLOCK_MAPPING_PATH = ROOT / "block_device_mapping.json"
 STORE = MotionStore(
     device_count=12,
     default_analysis_mode=ANALYSIS_MODE_PC,
     settings_path=SETTINGS_PATH,
+    mapping_path=BLOCK_MAPPING_PATH,
 )
 SERIAL = SerialService(STORE)
 
@@ -88,6 +90,9 @@ class ApiHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/settings":
             self._json_response(STORE.settings_snapshot())
+            return
+        if path == "/api/block-mapping":
+            self._json_response(STORE.block_mapping_snapshot())
             return
         if path == "/api/snapshot":
             device_id = max(1, min(12, self._integer(query, "device", 1)))
@@ -238,6 +243,7 @@ def main() -> None:
         pass
     finally:
         SERIAL.close()
+        STORE.wait_for_finalizations(timeout_seconds=2.0)
         server.server_close()
 
 

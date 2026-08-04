@@ -441,7 +441,7 @@
     <nav id="deviceStrip" class="device-strip" aria-label="选择设备"></nav>
 
     <section class="status-row" aria-label="当前设备状态">
-      <div class="panel stat"><div class="stat-label">选中设备</div><div id="deviceValue" class="stat-value">设备 1</div></div>
+      <div class="panel stat"><div class="stat-label">积木 / nRF 设备</div><div id="deviceValue" class="stat-value">积木 A / nRF 1</div></div>
       <div class="panel stat"><div class="stat-label">解析数据包 / 丢包</div><div id="packetValue" class="stat-value">0 / 0</div></div>
       <div class="panel stat"><div class="stat-label">最新样本序号</div><div id="sampleValue" class="stat-value">—</div></div>
       <div class="panel stat"><div class="stat-label">数据源</div><div id="sourceValue" class="stat-value">等待数据</div></div>
@@ -514,7 +514,8 @@
         <div class="metric"><div class="metric-label">5%分位速度（估算）</div><div id="p05Speed" class="metric-value">0.000 m/s</div></div>
         <div class="metric"><div class="metric-label">平均 / 中位速度</div><div id="meanMedianSpeed" class="metric-value">0.000 / 0.000</div></div>
         <div class="metric"><div class="metric-label">速度标准差</div><div id="speedStd" class="metric-value">0.000 m/s</div></div>
-        <div class="metric"><div class="metric-label">完整旋转</div><div id="rotationCount" class="metric-value">0 次</div></div>
+        <div class="metric"><div class="metric-label">完整一轴旋转</div><div id="rotationCount" class="metric-value">0 次</div></div>
+        <div class="metric"><div class="metric-label">累计空间旋转</div><div id="spatialRotation" class="metric-value">0.00 圈 / 0°</div></div>
         <div class="metric"><div class="metric-label">翻转</div><div id="flipCount" class="metric-value">0 次</div></div>
         <div class="metric"><div class="metric-label">停顿（≥0.8s）</div><div id="pauseCount" class="metric-value">0 次</div></div>
         <div class="metric"><div class="metric-label">掉落</div><div id="dropCount" class="metric-value">0 次</div></div>
@@ -524,8 +525,8 @@
       </div>
       <div class="movement-table-wrap">
         <table class="movement-table">
-          <thead><tr><th>移动</th><th>开始时间（北京）</th><th>时长(s)</th><th>最大 / 平均速度</th><th>旋转</th><th>翻转</th><th>停顿</th><th>掉落</th><th>震颤主频</th><th>震颤强度</th><th>详情</th></tr></thead>
-          <tbody id="movementRows"><tr><td colspan="11" class="movement-empty">尚无完整移动</td></tr></tbody>
+          <thead><tr><th>移动</th><th>开始时间（北京）</th><th>时长(s)</th><th>最大 / 平均速度</th><th>完整一轴旋转</th><th>累计空间旋转</th><th>翻转</th><th>停顿</th><th>掉落</th><th>震颤主频</th><th>震颤强度</th><th>详情</th></tr></thead>
+          <tbody id="movementRows"><tr><td colspan="12" class="movement-empty">尚无完整移动</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -689,6 +690,7 @@
       meanMedianSpeed: document.getElementById("meanMedianSpeed"),
       speedStd: document.getElementById("speedStd"),
       rotationCount: document.getElementById("rotationCount"),
+      spatialRotation: document.getElementById("spatialRotation"),
       flipCount: document.getElementById("flipCount"),
       pauseCount: document.getElementById("pauseCount"),
       dropCount: document.getElementById("dropCount"),
@@ -1561,6 +1563,11 @@
     }
 
     function movementValue(snapshot) {
+      const pendingId = snapshot.finalization?.latest_pending_movement_id;
+      const completedId = snapshot.completed_movements?.[0]?.movement_id || 0;
+      if (!snapshot.current_movement && pendingId && pendingId > completedId) {
+        return null;
+      }
       return snapshot.current_movement || snapshot.completed_movements?.[0] || null;
     }
 
@@ -1583,12 +1590,16 @@
       const movement = movementValue(snapshot);
       const session = snapshot.session_tremor_average || {};
       const movementFilter = snapshot.movement_filter || {};
+      const finalization = snapshot.finalization || {};
+      const pendingCount = finalization.pending_count || 0;
       const minimumSeconds = finiteNumber(movementFilter.minimum_seconds, 0.3);
       elements.ignoredShortCount.textContent = `${movementFilter.ignored_short_count || 0} 段`;
       if (document.activeElement !== elements.minimumMovementSeconds) {
         elements.minimumMovementSeconds.value = minimumSeconds.toFixed(2);
       }
-      elements.movementState.textContent = snapshot.motion_state || "等待";
+      elements.movementState.textContent = pendingCount
+        ? `${snapshot.motion_state || "静止"} · 后台计算 ${pendingCount}`
+        : (snapshot.motion_state || "等待");
       elements.sessionTremorFrequency.textContent = optionalFixed(
         session.mean_frequency_hz, 2, " Hz"
       );
@@ -1597,7 +1608,10 @@
       );
 
       if (!movement) {
-        if (snapshot.analysis_mode === "pc" && snapshot.pc_detector?.state === "calibrating") {
+        if (pendingCount) {
+          elements.movementCaption.textContent =
+            `第 ${finalization.latest_pending_movement_id} 次移动已结束，正在后台完成轨迹修正、统计和 FFT；实时接收未暂停`;
+        } else if (snapshot.analysis_mode === "pc" && snapshot.pc_detector?.state === "calibrating") {
           elements.movementCaption.textContent =
             `PC 静止校准 ${snapshot.pc_detector.calibration_samples}`
             + ` / ${snapshot.pc_detector.calibration_required}，请保持设备静止`;
@@ -1611,6 +1625,7 @@
         elements.meanMedianSpeed.textContent = "0.000 / 0.000";
         elements.speedStd.textContent = "0.000 m/s";
         elements.rotationCount.textContent = "0 次";
+        elements.spatialRotation.textContent = "0.00 圈 / 0°";
         elements.flipCount.textContent = "0 次";
         elements.pauseCount.textContent = "0 次";
         elements.dropCount.textContent = "0 次";
@@ -1620,7 +1635,8 @@
         const speed = movement.speed || {};
         const tremor = movement.tremor || {};
         elements.movementCaption.textContent =
-          `${live ? "候选" : "第"} ${movement.movement_id} 次移动 · ${live ? "达到阈值后才记录" : "最近完成"}`
+          `积木 ${movement.block_id || snapshot.block_id || "未映射"} · `
+          + `${live ? "候选" : "第"} ${movement.movement_id} 次移动 · ${live ? "达到阈值后才记录" : "最近完成"}`
           + ` · 最短有效 ${minimumSeconds.toFixed(2)} s`;
         elements.movementTime.textContent = `${finiteNumber(movement.moving_seconds).toFixed(2)} s`;
         elements.maxSpeed.textContent = `${finiteNumber(speed.max).toFixed(3)} m/s`;
@@ -1629,6 +1645,9 @@
           `${finiteNumber(speed.mean).toFixed(3)} / ${finiteNumber(speed.median).toFixed(3)}`;
         elements.speedStd.textContent = `${finiteNumber(speed.std).toFixed(3)} m/s`;
         elements.rotationCount.textContent = `${movement.rotation_count || 0} 次`;
+        elements.spatialRotation.textContent =
+          `${finiteNumber(movement.spatial_rotation_turns).toFixed(2)} 圈 / `
+          + `${finiteNumber(movement.spatial_rotation_degrees).toFixed(0)}°`;
         elements.flipCount.textContent = `${movement.flip_count || 0} 次`;
         elements.pauseCount.textContent =
           `${movement.pause_count || 0} 次 · ${finiteNumber(movement.pause_total_seconds).toFixed(1)} s`;
@@ -1642,7 +1661,7 @@
       elements.movementRows.replaceChildren();
       if (!completed.length) {
         const row = document.createElement("tr");
-        row.innerHTML = '<td colspan="11" class="movement-empty">尚无完整移动</td>';
+        row.innerHTML = '<td colspan="12" class="movement-empty">尚无完整移动</td>';
         elements.movementRows.appendChild(row);
         return;
       }
@@ -1650,15 +1669,16 @@
         const row = document.createElement("tr");
         row.className = "history-row";
         row.tabIndex = 0;
-        row.setAttribute("aria-label", `查看第 ${item.movement_id} 次移动详情`);
+        row.setAttribute("aria-label", `查看积木 ${item.block_id || "未映射"} 第 ${item.movement_id} 次移动详情`);
         const speed = item.speed || {};
         const tremor = item.tremor || {};
         const values = [
-          `第 ${item.movement_id} 次`,
+          `${item.block_id || "?"} · 第 ${item.movement_id} 次`,
           compactTime(item.time?.start?.beijing),
           finiteNumber(item.moving_seconds).toFixed(2),
           `${finiteNumber(speed.max).toFixed(3)} / ${finiteNumber(speed.mean).toFixed(3)}`,
           `${item.rotation_count || 0} 次`,
+          `${finiteNumber(item.spatial_rotation_turns).toFixed(2)} 圈`,
           `${item.flip_count || 0} 次`,
           `${item.pause_count || 0} 次`,
           `${item.drop_count || 0} 次`,
@@ -1832,9 +1852,11 @@
       const speed = detail.speed || {};
       const tremor = detail.tremor || {};
       const session = detail.session_tremor_average || {};
-      elements.detailTitle.textContent = `第 ${detail.movement_id} 次移动详情`;
+      elements.detailTitle.textContent =
+        `积木 ${detail.block_id || "未映射"} · 第 ${detail.movement_id} 次移动详情`;
       elements.detailSubtitle.textContent =
-        `${detail.analysis_mode_label || ""} · ${finiteNumber(detail.sample_count)} 个样本`;
+        `nRF ${selectedDevice} · 映射 ${detail.mapping_version || "未知"} · `
+        + `${detail.analysis_mode_label || ""} · ${finiteNumber(detail.sample_count)} 个样本`;
       elements.detailGrid.replaceChildren();
       [
         ["开始时间（北京）", compactTime(detail.time?.start?.beijing)],
@@ -1847,7 +1869,8 @@
         ["平均速度（估算）", `${finiteNumber(speed.mean).toFixed(4)} m/s`],
         ["速度中位数", `${finiteNumber(speed.median).toFixed(4)} m/s`],
         ["速度标准差", `${finiteNumber(speed.std).toFixed(4)} m/s`],
-        ["完整旋转", `${detail.rotation_count || 0} 次`],
+        ["完整一轴旋转", `${detail.rotation_count || 0} 次`],
+        ["累计空间旋转", `${finiteNumber(detail.spatial_rotation_degrees).toFixed(1)}°；${finiteNumber(detail.spatial_rotation_turns).toFixed(3)} 圈；完整 360° ${detail.spatial_rotation_count || 0} 次`],
         ["翻转", `${detail.flip_count || 0} 次`],
         ["停顿（≥0.8s后恢复）", `${detail.pause_count || 0} 次；累计 ${finiteNumber(detail.pause_total_seconds).toFixed(3)} s`],
         ["掉落", `${detail.drop_count || 0} 次`],
@@ -2043,7 +2066,8 @@
       latestSnapshot = snapshot;
       updateSerialStatus(snapshot.serial);
       renderDeviceControl(snapshot);
-      elements.device.textContent = `设备 ${snapshot.device_id}`;
+      elements.device.textContent =
+        `积木 ${snapshot.block_id || "未映射"} / nRF ${snapshot.device_id}`;
       elements.packet.textContent = `${snapshot.packet_count} / ${snapshot.lost_packets}`;
       elements.sample.textContent = snapshot.last_sample_sequence ?? "—";
       elements.source.textContent = sourceLabel(snapshot.source);
@@ -2054,9 +2078,10 @@
         : "切换到 PC 独立判定";
       snapshot.devices.forEach((device, index) => {
         const button = elements.strip.children[index];
+        button.textContent = `${device.device_id}/${device.block_id || "?"}`;
         button.classList.toggle("online", device.online);
         button.setAttribute("aria-label",
-          `选择设备 ${device.device_id}，${device.online ? "在线" : "离线"}`);
+          `选择积木 ${device.block_id || "未映射"}，nRF ${device.device_id}，${device.online ? "在线" : "离线"}`);
       });
       renderMovement(snapshot);
       liveSignalRows = {

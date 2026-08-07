@@ -1,4 +1,8 @@
-# Motion V1 TX
+# Motion V1 TX (legacy compatibility)
+
+Motion V1 is the deployed firmware 0.1.4 layout. New builds use Motion V2;
+this document remains for the rolling upgrade and historical captures. See
+`README_MOTION_V2.md` for firmware 0.2.1.
 
 Open and build:
 

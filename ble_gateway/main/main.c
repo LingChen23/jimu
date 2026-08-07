@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "esp_err.h"
+#include "esp_bt.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
@@ -12,6 +13,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "host/ble_hs.h"
+#include "host/ble_hs_hci.h"
 #include "host/util/util.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -55,6 +57,11 @@
 #define LINK_FLAG_PHY_VALID      0x40U
 #define LINK_DLE_TX_OCTETS       251U
 #define LINK_DLE_TX_TIME_US      2120U
+#define DEFAULT_CONN_TX_POWER    ESP_PWR_LVL_N0
+#define DEFAULT_MAX_CE_LEN_UNITS 8U  /* 5 ms */
+#define GATEWAY_B_MAX_CE_LEN_UNITS 12U /* 7.5 ms */
+#define DEVICE_1_MAX_CE_LEN_UNITS 16U /* 10 ms */
+#define BLE_CHANNEL_MAP_SIZE     5U
 #define MOTION_CONTROL_VERSION   1U
 #define MOTION_CONTROL_HEADER_SIZE 4U
 #define MOTION_RESPONSE_HEADER_SIZE 5U
@@ -201,6 +208,39 @@ static int service_discovery_cb(uint16_t conn_handle,
                                 void *arg);
 static void gateway_transport_rx_task(void *param);
 static void link_diagnostic_task(void *param);
+
+static int configure_colocated_gateway_channels(void)
+{
+    uint8_t channel_map[BLE_CHANNEL_MAP_SIZE] = {0U};
+    static const uint8_t channel_offset_by_gateway[] = {0U, 1U, 2U};
+    uint8_t channel;
+
+    if (GATEWAY_ID >= 3U) {
+        return BLE_HS_EINVAL;
+    }
+
+    /*
+     * Give each colocated controller a disjoint interleaved third of the 37
+     * BLE data channels. Every profile retains full-band frequency diversity,
+     * while two local gateways never use the same data-channel index.
+     */
+    for (channel = channel_offset_by_gateway[GATEWAY_ID];
+         channel < 37U;
+         channel = (uint8_t)(channel + 3U)) {
+        channel_map[channel / 8U] |=
+            (uint8_t)(1U << (channel % 8U));
+    }
+    return ble_hs_hci_set_chan_class(channel_map);
+}
+
+static uint16_t target_max_ce_len_units(uint8_t target_index)
+{
+    if (TARGETS[target_index].expected_device_id == 1U) {
+        return DEVICE_1_MAX_CE_LEN_UNITS;
+    }
+    return GATEWAY_ID == 1U ? GATEWAY_B_MAX_CE_LEN_UNITS
+                            : DEFAULT_MAX_CE_LEN_UNITS;
+}
 
 static void gateway_put_le16(uint8_t *dst, uint16_t value)
 {
@@ -1018,7 +1058,7 @@ static void consume_notification(mahjong_peer_t *peer, struct os_mbuf *om)
     if (!motion_packet_decode(packet_bytes, packet_len, &packet)) {
         peer->invalid_frames++;
         link_stats_on_invalid(peer->target_index);
-        ESP_LOGW(TAG, "Invalid Motion V1 packet header: conn=%u",
+        ESP_LOGW(TAG, "Invalid Motion packet header: conn=%u",
                  peer->conn_handle);
         return;
     }
@@ -1462,8 +1502,8 @@ static bool matches_target(const struct ble_gap_disc_desc *disc,
     return true;
 }
 
-static void build_target_conn_params(
-    struct ble_gap_conn_params *params)
+static void build_target_conn_params(struct ble_gap_conn_params *params,
+                                     uint8_t target_index)
 {
     memset(params, 0, sizeof(*params));
     params->scan_itvl = BLE_GAP_SCAN_FAST_INTERVAL_MIN;
@@ -1474,8 +1514,7 @@ static void build_target_conn_params(
     params->supervision_timeout =
         BLE_GAP_SUPERVISION_TIMEOUT_MS(4000);
     params->min_ce_len = 0U;
-    /* Eight 0.625 ms units keep every connection event at or below 5 ms. */
-    params->max_ce_len = 8U;
+    params->max_ce_len = target_max_ce_len_units(target_index);
 }
 
 static void connect_target(const struct ble_gap_disc_desc *disc,
@@ -1516,7 +1555,7 @@ static void connect_target(const struct ble_gap_disc_desc *disc,
     }
     s_scanning = false;
 
-    build_target_conn_params(&conn_params);
+    build_target_conn_params(&conn_params, match->target_index);
     rc = ble_gap_connect(s_own_addr_type, &peer->addr, CONNECT_TIMEOUT_MS,
                          &conn_params,
                          gap_event_handler, peer);
@@ -1798,6 +1837,7 @@ static void ble_on_reset(int reason)
 
 static void ble_on_sync(void)
 {
+    esp_err_t power_err;
     int rc;
 
     rc = ble_hs_util_ensure_addr(0);
@@ -1810,6 +1850,20 @@ static void ble_on_sync(void)
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to select own BLE address: rc=%d", rc);
         return;
+    }
+
+    power_err = esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT,
+                                     DEFAULT_CONN_TX_POWER);
+    if (power_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set default BLE TX power: err=%d", power_err);
+    }
+
+    rc = configure_colocated_gateway_channels();
+    if (rc != 0) {
+        ESP_LOGE(TAG,
+                 "Failed to configure gateway %s BLE channel class: rc=%d",
+                 s_profile->name,
+                 rc);
     }
 
     start_scan();

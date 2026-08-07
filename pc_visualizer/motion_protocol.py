@@ -1,4 +1,4 @@
-"""Motion V1 packet and ESP32 diagnostic-line decoding."""
+"""Motion V1/V2 packet and ESP32 diagnostic-line decoding."""
 
 from __future__ import annotations
 
@@ -11,9 +11,13 @@ import zlib
 
 
 MOTION_PACKET_SIZE = 100
-MOTION_PROTOCOL_VERSION = 1
+MOTION_PROTOCOL_VERSION_V1 = 1
+MOTION_PROTOCOL_VERSION_V2 = 2
+MOTION_PROTOCOL_VERSION = MOTION_PROTOCOL_VERSION_V2
 MOTION_PACKET_TYPE_DATA = 0x10
-MOTION_SAMPLE_COUNT = 4
+MOTION_V1_SAMPLE_COUNT = 4
+MOTION_V2_SAMPLE_COUNT = 6
+MOTION_SAMPLE_COUNT = MOTION_V2_SAMPLE_COUNT
 ACCEL_LSB_PER_G = 4096.0
 GYRO_LSB_PER_DPS = 32.8
 TICK_HZ = 32768.0
@@ -23,6 +27,8 @@ GATEWAY_FRAME_CONTROL_REQUEST = 0x20
 GATEWAY_FRAME_CONTROL_RESPONSE = 0x21
 GATEWAY_FRAME_LINK_DIAGNOSTIC = 0x30
 GATEWAY_FRAME_AGGREGATOR_DIAGNOSTIC = 0x31
+GATEWAY_FRAME_HOST_CONTROL = 0x32
+GATEWAY_FRAME_HOST_CONTROL_RESPONSE = 0x33
 GATEWAY_HEADER_SIZE = 10
 GATEWAY_CRC_SIZE = 4
 GATEWAY_MAX_RAW_FRAME_SIZE = 114
@@ -34,6 +40,10 @@ LINK_DIAGNOSTIC_PAYLOAD_SIZE = 64
 AGGREGATOR_DIAGNOSTIC_VERSION = 1
 AGGREGATOR_DIAGNOSTIC_PAYLOAD_SIZE = 100
 AGGREGATOR_LINK_COUNT = 3
+AGGREGATOR_HOST_CONTROL_VERSION = 1
+AGGREGATOR_HOST_CONTROL_START = 1
+AGGREGATOR_HOST_CONTROL_STOP = 2
+AGGREGATOR_HOST_CONTROL_PAYLOAD_SIZE = 8
 
 
 class MotionCommand(IntEnum):
@@ -164,6 +174,14 @@ class AggregatorDiagnostic:
 
 
 @dataclass(frozen=True)
+class AggregatorHostControlResponse:
+    command: int
+    result: int
+    flags: int
+    session_id: int
+
+
+@dataclass(frozen=True)
 class GatewayFrame:
     gateway_id: int
     gateway_sequence: int
@@ -172,6 +190,7 @@ class GatewayFrame:
     control_response: ControlResponse | None = None
     link_diagnostic: LinkDiagnostic | None = None
     aggregator_diagnostic: AggregatorDiagnostic | None = None
+    aggregator_host_control: AggregatorHostControlResponse | None = None
 
 
 class CobsDecodeError(ValueError):
@@ -300,6 +319,28 @@ def encode_gateway_command(
     )
 
 
+def encode_aggregator_host_control(command: int, session_id: int) -> bytes:
+    """Start or stop one PC-facing aggregator stream session."""
+    if command not in (
+        AGGREGATOR_HOST_CONTROL_START,
+        AGGREGATOR_HOST_CONTROL_STOP,
+    ):
+        raise ValueError("unsupported aggregator host command")
+    payload = struct.pack(
+        "<BBHI",
+        AGGREGATOR_HOST_CONTROL_VERSION,
+        command,
+        0,
+        session_id & 0xFFFFFFFF,
+    )
+    return encode_gateway_payload(
+        GATEWAY_FRAME_HOST_CONTROL,
+        payload,
+        gateway_id=0xFF,
+        gateway_sequence=session_id & 0xFFFFFFFF,
+    )
+
+
 def decode_gateway_frame(raw: bytes) -> GatewayFrame:
     """Validate one decoded variable-length gateway frame."""
     if not GATEWAY_HEADER_SIZE + GATEWAY_CRC_SIZE <= len(raw) <= (
@@ -322,6 +363,7 @@ def decode_gateway_frame(raw: bytes) -> GatewayFrame:
         GATEWAY_FRAME_CONTROL_RESPONSE,
         GATEWAY_FRAME_LINK_DIAGNOSTIC,
         GATEWAY_FRAME_AGGREGATOR_DIAGNOSTIC,
+        GATEWAY_FRAME_HOST_CONTROL_RESPONSE,
     }:
         raise GatewayFrameError("unsupported gateway frame type")
     if reserved != 0:
@@ -339,6 +381,37 @@ def decode_gateway_frame(raw: bytes) -> GatewayFrame:
     payload = raw[
         GATEWAY_HEADER_SIZE : GATEWAY_HEADER_SIZE + payload_length
     ]
+    if frame_type == GATEWAY_FRAME_HOST_CONTROL_RESPONSE:
+        if payload_length != AGGREGATOR_HOST_CONTROL_PAYLOAD_SIZE:
+            raise GatewayFrameError(
+                "unexpected aggregator host-control response length"
+            )
+        version, command, result, flags, session_id = struct.unpack(
+            "<BBBBI", payload
+        )
+        if version != AGGREGATOR_HOST_CONTROL_VERSION:
+            raise GatewayFrameError(
+                "unsupported aggregator host-control version"
+            )
+        if command not in (
+            AGGREGATOR_HOST_CONTROL_START,
+            AGGREGATOR_HOST_CONTROL_STOP,
+        ):
+            raise GatewayFrameError(
+                "unsupported aggregator host-control response"
+            )
+        return GatewayFrame(
+            gateway_id=gateway_id,
+            gateway_sequence=gateway_sequence,
+            frame_type=frame_type,
+            aggregator_host_control=AggregatorHostControlResponse(
+                command=command,
+                result=result,
+                flags=flags,
+                session_id=session_id,
+            ),
+        )
+
     if frame_type == GATEWAY_FRAME_MOTION_DATA:
         if payload_length != MOTION_PACKET_SIZE:
             raise GatewayFrameError("unexpected motion payload length")
@@ -632,38 +705,69 @@ class GatewayStreamDecoder:
 
 
 def decode_motion_packet(data: bytes) -> MotionFrame:
-    """Decode one fixed-size Motion V1 packet."""
+    """Decode one fixed-size Motion V1 or Motion V2 packet."""
     if len(data) != MOTION_PACKET_SIZE:
         raise ValueError(f"expected 100 bytes, received {len(data)}")
-    if data[0] != MOTION_PROTOCOL_VERSION or data[1] != MOTION_PACKET_TYPE_DATA:
+    if data[1] != MOTION_PACKET_TYPE_DATA:
         raise ValueError("unsupported Motion packet header")
-    if data[22] != MOTION_SAMPLE_COUNT or data[23] != 1:
-        raise ValueError("unsupported Motion sample layout")
 
+    version = data[0]
     device_id = data[2]
     flags = data[3]
     session_id, first_sequence = struct.unpack_from("<II", data, 4)
-    first_tick = struct.unpack_from("<Q", data, 12)[0]
-    packet_sequence = struct.unpack_from("<H", data, 20)[0]
     samples: list[ImuSample] = []
 
-    for index in range(MOTION_SAMPLE_COUNT):
-        offset = 24 + index * 14
-        tick_offset, ax, ay, az, gx, gy, gz = struct.unpack_from(
-            "<Hhhhhhh", data, offset
-        )
-        samples.append(
-            ImuSample(
-                sequence=(first_sequence + index) & 0xFFFFFFFF,
-                tick_32k=first_tick + tick_offset,
-                accel_raw=(ax, ay, az),
-                gyro_raw=(gx, gy, gz),
+    if version == MOTION_PROTOCOL_VERSION_V1:
+        if data[22] != MOTION_V1_SAMPLE_COUNT or data[23] != 1:
+            raise ValueError("unsupported Motion V1 sample layout")
+        first_tick = struct.unpack_from("<Q", data, 12)[0]
+        packet_sequence = struct.unpack_from("<H", data, 20)[0]
+        for index in range(MOTION_V1_SAMPLE_COUNT):
+            offset = 24 + index * 14
+            tick_offset, ax, ay, az, gx, gy, gz = struct.unpack_from(
+                "<Hhhhhhh", data, offset
             )
-        )
+            samples.append(
+                ImuSample(
+                    sequence=(first_sequence + index) & 0xFFFFFFFF,
+                    tick_32k=first_tick + tick_offset,
+                    accel_raw=(ax, ay, az),
+                    gyro_raw=(gx, gy, gz),
+                )
+            )
+        coordinate_source_sequence = struct.unpack_from("<I", data, 80)[0]
+        position_mm = struct.unpack_from("<iii", data, 84)
+        coordinate_flags = struct.unpack_from("<H", data, 96)[0]
+        source = "motion-v1-100b"
+    elif version == MOTION_PROTOCOL_VERSION_V2:
+        if data[18] != MOTION_V2_SAMPLE_COUNT or data[19] != 1:
+            raise ValueError("unsupported Motion V2 sample layout")
+        first_tick = struct.unpack_from("<I", data, 12)[0]
+        packet_sequence = struct.unpack_from("<H", data, 16)[0]
+        for index in range(MOTION_V2_SAMPLE_COUNT):
+            offset = 20 + index * 12
+            ax, ay, az, gx, gy, gz = struct.unpack_from(
+                "<hhhhhh", data, offset
+            )
+            tick_offset = round(index * TICK_HZ / 100.0)
+            samples.append(
+                ImuSample(
+                    sequence=(first_sequence + index) & 0xFFFFFFFF,
+                    tick_32k=(first_tick + tick_offset) & 0xFFFFFFFF,
+                    accel_raw=(ax, ay, az),
+                    gyro_raw=(gx, gy, gz),
+                )
+            )
+        coordinate_age = data[98]
+        coordinate_source_sequence = (
+            first_sequence + MOTION_V2_SAMPLE_COUNT - 1 - coordinate_age
+        ) & 0xFFFFFFFF
+        position_mm = struct.unpack_from("<hhh", data, 92)
+        coordinate_flags = data[99]
+        source = "motion-v2-100b"
+    else:
+        raise ValueError(f"unsupported Motion protocol version {version}")
 
-    coordinate_source_sequence = struct.unpack_from("<I", data, 80)[0]
-    position_mm = struct.unpack_from("<iii", data, 84)
-    coordinate_flags = struct.unpack_from("<H", data, 96)[0]
     return MotionFrame(
         device_id=device_id,
         packet_sequence=packet_sequence,
@@ -673,7 +777,7 @@ def decode_motion_packet(data: bytes) -> MotionFrame:
         coordinate_source_sequence=coordinate_source_sequence,
         position_mm=position_mm,
         coordinate_flags=coordinate_flags,
-        source="motion-v1-100b",
+        source=source,
     )
 
 

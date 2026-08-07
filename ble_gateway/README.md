@@ -9,7 +9,7 @@ connect:
 | --- | ---: | --- | --- |
 | A | 0 | 1-4 | Configured and enabled |
 | B | 1 | 5-8 | Configured and enabled |
-| C | 2 | 9-12 | Empty and disabled |
+| C | 2 | 9-12 | Configured and enabled |
 
 Gateway A currently uses this fixed device-ID/address map:
 
@@ -29,11 +29,14 @@ device 7: E1:69:9E:5A:1D:B3
 device 8: C1:2F:3F:19:FB:92
 ```
 
-Profile C retains device IDs 9 through 12 but uses an all-zero address with
-`enabled=false`. Disabled slots are skipped by matching, scanning and
-reconnect decisions. Therefore a C image is safe to run before those devices
-exist: it emits offline diagnostics for its four IDs but cannot accidentally
-connect to another SmartBlock.
+Gateway C uses:
+
+```text
+device 9:  FC:B0:29:81:12:1E
+device 10: C1:58:2F:B8:BB:A5
+device 11: D8:92:8D:B8:89:1C
+device 12: E4:DF:A9:0B:F9:6E
+```
 
 The gateway repeats the connection flow until all four targets are ready:
 
@@ -42,10 +45,11 @@ scan -> connect -> request DLE 251 -> exchange MTU 185 -> discover Motion Servic
      -> discover Motion Data -> enable notifications -> validate and decode
 ```
 
-Motion Data is a fixed 100-byte little-endian packet. Every packet contains
-four 100 Hz six-axis IMU samples plus the latest coordinate, so the BLE
-notification rate is 25 packets/s. Every packet is decoded, checked and
-forwarded unchanged as a COBS + CRC32 gateway frame. The default build uses
+Motion Data is a fixed 100-byte little-endian packet. The gateway accepts both
+Motion V1 (four 100 Hz samples, 25 notifications/s) and Motion V2 (six 100 Hz
+samples, about 16.67 notifications/s) during the rolling firmware upgrade.
+Every packet is decoded, checked and forwarded unchanged as a COBS + CRC32
+gateway frame. The default build uses
 native USB Serial/JTAG CDC directly to PC. A separate UART build uses UART1
 at 921600 8N1 to connect to the SmartBlock aggregator.
 
@@ -108,17 +112,10 @@ UART mode uses UART1, TX GPIO17, RX GPIO18, 921600 baud, 8N1 and no hardware
 flow control. See `../aggregator/README.md` for three-link wiring and
 acceptance procedures.
 
-## Assign devices 9 through 12
+## Assign devices
 
 All target assignments live in `main/gateway_profile.c`; do not create or
-copy another ESP-IDF project. After measuring a device address, replace only
-its disabled entry. For example, if device 9 is `AA:BB:CC:DD:EE:FF`, change:
-
-```c
-DISABLED_TARGET(9U)
-```
-
-to:
+copy another ESP-IDF project. An assigned random-static address is written as:
 
 ```c
 RANDOM_TARGET(9U, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff)
@@ -126,9 +123,8 @@ RANDOM_TARGET(9U, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff)
 
 The macro accepts the same left-to-right address order displayed by a BLE
 scanner and performs NimBLE's byte-order conversion internally. Rebuild the
-C profile afterward. Startup validation rejects wrong
-device-number ranges, duplicate enabled addresses, zero enabled addresses,
-and nonzero disabled placeholders.
+corresponding profile afterward. Startup validation rejects wrong device-number
+ranges, duplicate enabled addresses and zero enabled addresses.
 
 ## Hardware validation
 
@@ -176,10 +172,11 @@ devices 2..4: approximately 25 packets/s, zero gaps
 ESP USB queue drop delta: 0
 ```
 
-Based on that result, every connection retains a 5 ms maximum connection-event
-length, enough for a complete 100-byte notification and weak-signal retries
-with the negotiated DLE. The ESP32 controller honors this HCI connection-event
-value rather than use its original internal length algorithm.
+Every connection uses a 5 ms maximum connection-event length, enough for a
+complete 100-byte notification and weak-signal retries with the negotiated
+DLE. A 2.5 ms A/B test reduced throughput on many links and was rejected. The
+ESP32 controller honors the 5 ms HCI value rather than use its original
+internal length algorithm.
 
 The multi-gateway production configuration intentionally uses a different
 steady interval for each independent radio:
@@ -217,12 +214,33 @@ sensor/sample errors: 0
 negotiated links: MTU 185, DLE 189 octets, PHY 1M
 ```
 
-## Link-budget and reconnect protection
+## Colocated-radio isolation and reconnect protection
 
-The gateway uses the ESP-IDF controller `P9` transmit-power selector. Lowering
-the colocated gateway radios from the previous maximum selector reduces
-receiver blocking while the matching nRF52832 application keeps its supported
-maximum of +4 dBm.
+A 12-node isolation test showed that gateway A delivered all four streams with
+zero new gaps when gateways B/C stopped their notifications, while the same
+four links overflowed nRF queues when all three colocated gateways streamed.
+The UART, aggregator and PC counters remained at zero. This identifies
+same-site BLE radio interference rather than a serial or queue-throughput
+bottleneck.
+
+Production gateway builds therefore use two RF isolation controls:
+
+- All ESP32-S3 gateways use `0 dBm`; the nearby nRF52832 nodes continue to
+  send the sensor-data uplink at `+4 dBm`. Raising gateway B alone to `+3 dBm`
+  moved loss into A/C during field testing and was rejected. Runtime
+  per-connection handle changes are deliberately avoided.
+- Each profile uses a disjoint interleaved third of the 37 BLE data channels:
+  A uses `0,3,...,36`, B uses `1,4,...,34`, and C uses `2,5,...,35`. Every
+  profile retains full-band diversity while local gateways avoid the same
+  channel index. Contiguous narrow-band and guarded-block A/B tests moved loss
+  to nodes whose assigned bands had poor RF conditions and were rejected.
+
+The 30/32.5/35 ms connection periods remain unchanged. Device 1 uses a 10 ms
+connection-event cap, all gateway B links use 7.5 ms, and the remaining links
+retain 5 ms. This gives the measured low-margin links more retransmission time
+without lengthening every A/C event. The channel and event-length controls
+require only gateway A/B/C firmware. Motion V2's lower notification rate
+additionally requires nRF firmware 0.2.1 and the V1/V2-aware aggregator build.
 
 BLE startup is offset by profile so gateways powered from the same module do
 not establish all connection anchors at the same instant:
@@ -244,7 +262,7 @@ pause before next retry: 4 seconds
 ```
 
 The 10% in-burst scan duty cycle and the longer pause between retries preserve radio
-time for links that remain connected. The existing 5 ms per-link connection
+time for links that remain connected. The 5 ms per-link connection
 event cap remains enabled so a weak link cannot monopolize the controller.
 
 Successful `STOP_STREAM` and `START_STREAM` commands reset only the ESP32

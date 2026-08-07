@@ -2475,21 +2475,47 @@ class DeviceState:
         self.last_continuity_sample_sequence = None
         self.last_sample_tick = None
 
+    def _reset_stream_continuity(self) -> None:
+        """Forget sequence anchors before accepting a new stream segment."""
+        self.last_packet_sequence = None
+        self.last_sample_sequence = None
+        self.last_continuity_sample_sequence = None
+        self.last_sample_tick = None
+
     def process(self, frame: MotionFrame) -> bool:
         frame_epoch = time.time()
         frame_arrival_monotonic = time.monotonic()
         if not frame.samples:
             return False
-        full_motion_frame = frame.source == "motion-v1-100b"
+        full_motion_frame = frame.source in {
+            "motion-v1-100b",
+            "motion-v2-100b",
+        }
         discontinuity_reason: str | None = None
 
         if full_motion_frame:
+            reset_stream_continuity = False
             if (
                 self.last_arrival_monotonic > 0.0
                 and frame_arrival_monotonic - self.last_arrival_monotonic
                 > MAX_HOST_ARRIVAL_GAP_SECONDS
             ):
                 discontinuity_reason = "host_arrival_gap"
+                reset_stream_continuity = True
+
+            if (
+                self.source in {"motion-v1-100b", "motion-v2-100b"}
+                and frame.source != self.source
+            ):
+                discontinuity_reason = "stream_format_changed"
+                reset_stream_continuity = True
+
+            # A reboot can reuse a session ID on older firmware.  Once the
+            # host has observed a real input gap (or a protocol transition),
+            # the next frame is the start of a new segment and must not be
+            # rejected against stale packet/sample sequence anchors.
+            if reset_stream_continuity:
+                self._reset_stream_continuity()
 
             if self.current_session_id is None:
                 self.current_session_id = frame.session_id

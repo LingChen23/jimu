@@ -66,6 +66,6 @@
 #define SYS_CONFIG_FLASH_ADDR           (NRF_FICR->CODEPAGESIZE * SYS_CONFIG_PAGE)
 #define CONFIG_VALID_MAGIC              0XABBA
 
-#define FW_VER                          "V0.1.0"
+#define FW_VER                          "V0.2.1"
 
 #endif

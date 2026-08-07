@@ -924,6 +924,13 @@
     }
 
     function renderAggregatorStatus(status) {
+      if (status?.open && !status?.host_session_ready) {
+        elements.aggregatorSummary.textContent = "正在建立聚合器数据会话";
+        elements.aggregatorLinks.forEach(element => {
+          element.textContent = "—";
+        });
+        return;
+      }
       const diagnostic = status?.aggregator;
       if (!diagnostic) {
         elements.aggregatorSummary.textContent = "未检测到聚合器状态帧";
@@ -966,6 +973,7 @@
       elements.dot.classList.toggle("open", open);
       elements.connection.textContent = open
         ? `${status.port} · ${status.baud} · ${status.frame_count} 帧`
+          + `${status.host_session_ready ? "" : " · 会话建立中"}`
           + ` · GW丢 ${status.gateway_lost_frames || 0}`
           + ` · CRC错 ${status.crc_error_count || 0}`
         : "串口未打开";
@@ -1557,7 +1565,8 @@
     }
 
     function sourceLabel(source) {
-      if (source === "motion-v1-100b") return "完整 100B";
+      if (source === "motion-v1-100b") return "完整 100B（V1/4样本）";
+      if (source === "motion-v2-100b") return "完整 100B（V2/6样本）";
       if (source === "esp32-diagnostic-s0") return "诊断 S0";
       return "等待数据";
     }

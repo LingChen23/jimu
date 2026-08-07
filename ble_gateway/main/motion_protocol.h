@@ -5,10 +5,15 @@
 #include <stdint.h>
 
 #define MOTION_PACKET_SIZE          100U
-#define MOTION_PROTOCOL_VERSION     1U
+#define MOTION_PROTOCOL_VERSION_V1  1U
+#define MOTION_PROTOCOL_VERSION_V2  2U
 #define MOTION_PACKET_TYPE_DATA     0x10U
-#define MOTION_SAMPLE_COUNT         4U
+#define MOTION_V1_SAMPLE_COUNT      4U
+#define MOTION_V2_SAMPLE_COUNT      6U
+#define MOTION_MAX_SAMPLE_COUNT     MOTION_V2_SAMPLE_COUNT
 #define MOTION_IMU_FORMAT_RAW_INT16 1U
+#define MOTION_SAMPLE_RATE_HZ       100U
+#define MOTION_TICK_HZ              32768U
 
 typedef struct {
     uint16_t tick_offset_32k;
@@ -17,13 +22,15 @@ typedef struct {
 } motion_imu_sample_t;
 
 typedef struct {
+    uint8_t protocol_version;
     uint8_t device_id;
     uint8_t flags;
+    uint8_t sample_count;
     uint32_t session_id;
     uint32_t first_sample_sequence;
     uint64_t first_sample_tick_32k;
     uint16_t packet_sequence;
-    motion_imu_sample_t samples[MOTION_SAMPLE_COUNT];
+    motion_imu_sample_t samples[MOTION_MAX_SAMPLE_COUNT];
     uint32_t coordinate_source_sequence;
     int32_t position_mm[3];
     uint16_t coordinate_flags;
@@ -62,39 +69,75 @@ static inline bool motion_packet_decode(const uint8_t *data,
     const uint8_t *sample;
 
     if (data == NULL || packet == NULL || length != MOTION_PACKET_SIZE ||
-        data[0] != MOTION_PROTOCOL_VERSION ||
-        data[1] != MOTION_PACKET_TYPE_DATA ||
-        data[22] != MOTION_SAMPLE_COUNT ||
-        data[23] != MOTION_IMU_FORMAT_RAW_INT16) {
+        data[1] != MOTION_PACKET_TYPE_DATA) {
         return false;
     }
 
+    packet->protocol_version = data[0];
     packet->device_id = data[2];
     packet->flags = data[3];
     packet->session_id = motion_get_le32(&data[4]);
     packet->first_sample_sequence = motion_get_le32(&data[8]);
-    packet->first_sample_tick_32k = motion_get_le64(&data[12]);
-    packet->packet_sequence = motion_get_le16(&data[20]);
 
-    for (sample_index = 0; sample_index < MOTION_SAMPLE_COUNT;
+    if (data[0] == MOTION_PROTOCOL_VERSION_V1) {
+        if (data[22] != MOTION_V1_SAMPLE_COUNT ||
+            data[23] != MOTION_IMU_FORMAT_RAW_INT16) {
+            return false;
+        }
+        packet->sample_count = MOTION_V1_SAMPLE_COUNT;
+        packet->first_sample_tick_32k = motion_get_le64(&data[12]);
+        packet->packet_sequence = motion_get_le16(&data[20]);
+        for (sample_index = 0; sample_index < MOTION_V1_SAMPLE_COUNT;
+             sample_index++) {
+            sample = &data[24U + 14U * sample_index];
+            packet->samples[sample_index].tick_offset_32k =
+                motion_get_le16(sample);
+            for (axis = 0; axis < 3U; axis++) {
+                packet->samples[sample_index].accel[axis] =
+                    (int16_t)motion_get_le16(&sample[2U + 2U * axis]);
+                packet->samples[sample_index].gyro[axis] =
+                    (int16_t)motion_get_le16(&sample[8U + 2U * axis]);
+            }
+        }
+        packet->coordinate_source_sequence = motion_get_le32(&data[80]);
+        for (axis = 0; axis < 3U; axis++) {
+            packet->position_mm[axis] =
+                (int32_t)motion_get_le32(&data[84U + 4U * axis]);
+        }
+        packet->coordinate_flags = motion_get_le16(&data[96]);
+        return true;
+    }
+
+    if (data[0] != MOTION_PROTOCOL_VERSION_V2 ||
+        data[18] != MOTION_V2_SAMPLE_COUNT ||
+        data[19] != MOTION_IMU_FORMAT_RAW_INT16) {
+        return false;
+    }
+    packet->sample_count = MOTION_V2_SAMPLE_COUNT;
+    packet->first_sample_tick_32k = motion_get_le32(&data[12]);
+    packet->packet_sequence = motion_get_le16(&data[16]);
+    for (sample_index = 0; sample_index < MOTION_V2_SAMPLE_COUNT;
          sample_index++) {
-        sample = &data[24U + 14U * sample_index];
+        sample = &data[20U + 12U * sample_index];
         packet->samples[sample_index].tick_offset_32k =
-            motion_get_le16(sample);
+            (uint16_t)(((uint32_t)sample_index * MOTION_TICK_HZ +
+                        (MOTION_SAMPLE_RATE_HZ / 2U)) /
+                       MOTION_SAMPLE_RATE_HZ);
         for (axis = 0; axis < 3U; axis++) {
             packet->samples[sample_index].accel[axis] =
-                (int16_t)motion_get_le16(&sample[2U + 2U * axis]);
+                (int16_t)motion_get_le16(&sample[2U * axis]);
             packet->samples[sample_index].gyro[axis] =
-                (int16_t)motion_get_le16(&sample[8U + 2U * axis]);
+                (int16_t)motion_get_le16(&sample[6U + 2U * axis]);
         }
     }
-
-    packet->coordinate_source_sequence = motion_get_le32(&data[80]);
+    packet->coordinate_source_sequence =
+        packet->first_sample_sequence + MOTION_V2_SAMPLE_COUNT - 1U -
+        data[98];
     for (axis = 0; axis < 3U; axis++) {
         packet->position_mm[axis] =
-            (int32_t)motion_get_le32(&data[84U + 4U * axis]);
+            (int16_t)motion_get_le16(&data[92U + 2U * axis]);
     }
-    packet->coordinate_flags = motion_get_le16(&data[96]);
+    packet->coordinate_flags = data[99];
     return true;
 }
 

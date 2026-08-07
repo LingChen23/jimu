@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import secrets
 import struct
 import threading
 import time
@@ -13,11 +14,14 @@ from serial.tools import list_ports
 
 from motion_model import MotionStore
 from motion_protocol import (
+    AGGREGATOR_HOST_CONTROL_START,
+    AGGREGATOR_HOST_CONTROL_STOP,
     AggregatorDiagnostic,
     ControlResponse,
     GatewayStreamDecoder,
     LinkDiagnostic,
     MotionCommand,
+    encode_aggregator_host_control,
     encode_gateway_command,
 )
 
@@ -86,6 +90,8 @@ class SerialService:
         self._responses: dict[tuple[int, int], ControlResponse] = {}
         self._device_control: dict[int, dict[str, Any]] = {}
         self._aggregator_diagnostic: dict[str, Any] | None = None
+        self._host_session_id = 0
+        self._host_session_ready = False
 
     @staticmethod
     def ports() -> list[dict[str, Any]]:
@@ -119,6 +125,7 @@ class SerialService:
         connection.rts = False
         connection.open()
         connection.reset_input_buffer()
+        host_session_id = secrets.randbits(32) or 1
         with self._lock:
             self._serial = connection
             self._port = port
@@ -132,6 +139,8 @@ class SerialService:
             self._responses = {}
             self._device_control = {}
             self._aggregator_diagnostic = None
+            self._host_session_id = host_session_id
+            self._host_session_ready = False
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._reader_loop,
@@ -139,13 +148,38 @@ class SerialService:
             daemon=True,
         )
         self._thread.start()
+        try:
+            connection.write(
+                encode_aggregator_host_control(
+                    AGGREGATOR_HOST_CONTROL_START,
+                    host_session_id,
+                )
+            )
+            connection.flush()
+        except (serial.SerialException, OSError) as error:
+            self.close()
+            raise OSError(str(error)) from error
         return self.status()
 
     def close(self) -> dict[str, Any]:
         self._stop.set()
-        with self._response_condition:
+        with self._lock:
             connection = self._serial
+            host_session_id = self._host_session_id
+        if connection is not None and connection.is_open:
+            try:
+                connection.write(
+                    encode_aggregator_host_control(
+                        AGGREGATOR_HOST_CONTROL_STOP,
+                        host_session_id,
+                    )
+                )
+                connection.flush()
+            except (serial.SerialException, OSError):
+                pass
+        with self._response_condition:
             self._serial = None
+            self._host_session_ready = False
             self._response_condition.notify_all()
         if connection is not None:
             try:
@@ -176,6 +210,8 @@ class SerialService:
                 "crc_error_count": self._decoder.crc_error_count,
                 "frame_error_count": self._decoder.frame_error_count,
                 "overflow_count": self._decoder.overflow_count,
+                "host_session_ready": self._host_session_ready,
+                "host_session_id": self._host_session_id,
                 "aggregator": self._aggregator_snapshot_locked(),
             }
 
@@ -326,6 +362,8 @@ class SerialService:
             connection = self._serial
             if connection is None or not connection.is_open:
                 raise ValueError("串口未打开")
+            if not self._host_session_ready:
+                raise ValueError("聚合器会话尚未就绪")
             self._request_id = (self._request_id % 255) + 1
             request_id = self._request_id
             key = (device_id, request_id)
@@ -385,6 +423,33 @@ class SerialService:
                 with self._lock:
                     self._byte_count += len(raw)
                 for gateway_frame in self._decoder.feed(raw):
+                    host_control = gateway_frame.aggregator_host_control
+                    if host_control is not None:
+                        with self._response_condition:
+                            if (
+                                host_control.command
+                                == AGGREGATOR_HOST_CONTROL_START
+                                and host_control.session_id
+                                == self._host_session_id
+                            ):
+                                self._host_session_ready = (
+                                    host_control.result == 0
+                                )
+                                self._last_gateway_sequence = {}
+                                if host_control.result != 0:
+                                    self._error = (
+                                        "聚合器拒绝启动 USB 数据会话"
+                                    )
+                                self._response_condition.notify_all()
+                        if self._host_session_ready:
+                            self._store.transport_discontinuity(
+                                "aggregator_session_started"
+                            )
+                        continue
+                    with self._lock:
+                        host_session_ready = self._host_session_ready
+                    if not host_session_ready:
+                        continue
                     previous = self._last_gateway_sequence.get(
                         gateway_frame.gateway_id
                     )

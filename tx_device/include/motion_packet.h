@@ -4,9 +4,9 @@
 #include <stdint.h>
 
 #define MOTION_PACKET_SIZE              100U
-#define MOTION_PROTOCOL_VERSION         1U
+#define MOTION_PROTOCOL_VERSION         2U
 #define MOTION_PACKET_TYPE_DATA         0x10U
-#define MOTION_SAMPLE_COUNT             4U
+#define MOTION_SAMPLE_COUNT             6U
 #define MOTION_IMU_FORMAT_RAW_INT16     1U
 
 #define MOTION_PACKET_FLAG_CALIBRATED       0x01U

@@ -69,10 +69,10 @@ static const gateway_profile_t PROFILE = {
     .preferred_conn_interval_units = 28U, /* 35 ms */
     .ble_startup_delay_ms = 3000U,
     .targets = {
-        DISABLED_TARGET(9U),
-        DISABLED_TARGET(10U),
-        DISABLED_TARGET(11U),
-        DISABLED_TARGET(12U),
+        RANDOM_TARGET(9U, 0xfc, 0xb0, 0x29, 0x81, 0x12, 0x1e),
+        RANDOM_TARGET(10U, 0xc1, 0x58, 0x2f, 0xb8, 0xbb, 0xa5),
+        RANDOM_TARGET(11U, 0xd8, 0x92, 0x8d, 0xb8, 0x89, 0x1c),
+        RANDOM_TARGET(12U, 0xe4, 0xdf, 0xa9, 0x0b, 0xf9, 0x6e),
     },
 };
 

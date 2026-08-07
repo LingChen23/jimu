@@ -1265,6 +1265,49 @@ static void motion_put_le32(uint8_t* dst, uint32_t value)
     dst[3] = (uint8_t)(value >> 24);
 }
 
+static uint32_t motion_session_id_generate(uint32_t domain)
+{
+    uint8_t random_bytes[4] = {0U, 0U, 0U, 0U};
+    uint8_t bytes_available = 0U;
+    uint32_t random_word = 0U;
+    uint32_t session_id;
+    uint32_t err_code;
+    uint32_t attempts;
+
+    /*
+     * app_timer_cnt_get() is almost deterministic during boot and can repeat
+     * after a reset.  Mix four bytes from the SoftDevice RNG so that a reboot
+     * always starts a genuinely new host-visible stream session.
+     */
+    for (attempts = 0U; attempts < 100U; attempts++) {
+        err_code =
+          sd_rand_application_bytes_available_get(&bytes_available);
+        if ((err_code == NRF_SUCCESS) &&
+            (bytes_available >= sizeof(random_bytes))) {
+            err_code = sd_rand_application_vector_get(
+              random_bytes, (uint8_t)sizeof(random_bytes));
+            if (err_code == NRF_SUCCESS) {
+                break;
+            }
+        }
+        nrf_delay_ms(1U);
+        watchdog_feed_enabled_channels();
+    }
+
+    random_word =
+      ((uint32_t)random_bytes[0]) |
+      ((uint32_t)random_bytes[1] << 8U) |
+      ((uint32_t)random_bytes[2] << 16U) |
+      ((uint32_t)random_bytes[3] << 24U);
+    session_id =
+      NRF_FICR->DEVICEID[0] ^ NRF_FICR->DEVICEID[1] ^
+      app_timer_cnt_get() ^ domain ^ random_word;
+    if (session_id == 0U) {
+        session_id = domain ^ 0x53455353UL;
+    }
+    return session_id;
+}
+
 static uint16_t motion_saturate_u16(uint32_t value)
 {
     return value > 0xffffUL ? 0xffffU : (uint16_t)value;
@@ -1384,9 +1427,9 @@ static void motion_build_info_payload(uint8_t payload[MOTION_INFO_PAYLOAD_SIZE])
     memset(payload, 0, MOTION_INFO_PAYLOAD_SIZE);
     payload[0] = (uint8_t)TX_DEVICE_ID;
     payload[1] = 0U;
-    payload[2] = 1U;
-    /* Firmware 0.1.4: gateway groups use 30, 32.5 and 35 ms intervals. */
-    payload[3] = 4U;
+    payload[2] = 2U;
+    /* Firmware 0.2.1 adds a random session ID on every stream restart. */
+    payload[3] = 1U;
     payload[4] = MOTION_PROTOCOL_VERSION;
     payload[5] = 8U;
     motion_put_le16(&payload[6], 1000U);
@@ -1632,9 +1675,7 @@ int main(void)
     device_id = (uint8_t)TX_DEVICE_ID;
     memset(&packet_fields, 0, sizeof(packet_fields));
     packet_fields.device_id = device_id;
-    session_id =
-      NRF_FICR->DEVICEID[0] ^ NRF_FICR->DEVICEID[1] ^
-      app_timer_cnt_get() ^ 0x4d4f544eUL;
+    session_id = motion_session_id_generate(0x4d4f544eUL);
     m_current_session_id = session_id;
     advertising_init();
     conn_params_init();
@@ -1675,9 +1716,7 @@ int main(void)
             sample_sequence = 0U;
             m_latest_sample_sequence = 0U;
             motion_queue_clear();
-            session_id =
-              NRF_FICR->DEVICEID[0] ^ NRF_FICR->DEVICEID[1] ^
-              app_timer_cnt_get() ^ 0x52454341UL;
+            session_id = motion_session_id_generate(0x52454341UL);
             m_current_session_id = session_id;
         }
 

@@ -17,8 +17,14 @@
 #define GATEWAY_FRAME_CONTROL_RESPONSE         0x21U
 #define GATEWAY_FRAME_LINK_DIAGNOSTIC          0x30U
 #define GATEWAY_FRAME_AGGREGATOR_DIAGNOSTIC    0x31U
+#define GATEWAY_FRAME_HOST_CONTROL             0x32U
+#define GATEWAY_FRAME_HOST_CONTROL_RESPONSE    0x33U
 #define AGGREGATOR_DIAGNOSTIC_GATEWAY_ID        0xffU
 #define AGGREGATOR_DIAGNOSTIC_VERSION           1U
+#define AGGREGATOR_HOST_CONTROL_VERSION          1U
+#define AGGREGATOR_HOST_CONTROL_START            1U
+#define AGGREGATOR_HOST_CONTROL_STOP             2U
+#define AGGREGATOR_HOST_CONTROL_PAYLOAD_SIZE     8U
 
 #define GATEWAY_HEADER_SIZE                    10U
 #define GATEWAY_CRC_SIZE                       4U
@@ -29,7 +35,8 @@
 #define GATEWAY_MAX_WIRE_SIZE                  (GATEWAY_MAX_ENCODED_SIZE + 1U)
 
 #define MOTION_PACKET_SIZE                     100U
-#define MOTION_PROTOCOL_VERSION                1U
+#define MOTION_PROTOCOL_VERSION_V1             1U
+#define MOTION_PROTOCOL_VERSION_V2             2U
 #define MOTION_PACKET_TYPE_DATA                0x10U
 #define MOTION_CONTROL_VERSION                 1U
 #define MOTION_CONTROL_HEADER_SIZE             4U
@@ -43,6 +50,7 @@
 #define DEVICE_ID_MAX                          \
     (AGGREGATOR_LINK_COUNT * DEVICES_PER_GATEWAY)
 #define NO_SOURCE_LINK                         0xffU
+#define HOST_CONTROL_SOURCE                    0xfeU
 
 #define USB_RX_DRIVER_BUFFER_SIZE              512U
 #define USB_TX_DRIVER_BUFFER_SIZE              32768U
@@ -69,6 +77,7 @@ typedef struct {
     uint16_t length;
     uint8_t source_link;
     uint8_t reserved;
+    uint32_t host_session_id;
     uint8_t bytes[GATEWAY_MAX_WIRE_SIZE];
 } wire_frame_t;
 
@@ -169,6 +178,8 @@ static QueueHandle_t s_usb_tx_queue;
 static TaskHandle_t s_merge_task_handle;
 static aggregator_stats_t s_stats;
 static uint32_t s_health_sequence;
+static uint32_t s_host_session_id;
+static bool s_host_stream_active;
 static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static uint16_t get_le16(const uint8_t *src)
@@ -211,6 +222,25 @@ static uint8_t saturate_u8(uint32_t value)
 static uint32_t ticks_to_ms(TickType_t ticks)
 {
     return (uint32_t)ticks * (uint32_t)portTICK_PERIOD_MS;
+}
+
+static bool host_stream_snapshot(uint32_t *session_id)
+{
+    bool active;
+
+    portENTER_CRITICAL(&s_stats_mux);
+    active = s_host_stream_active;
+    *session_id = s_host_session_id;
+    portEXIT_CRITICAL(&s_stats_mux);
+    return active;
+}
+
+static void set_host_stream_state(bool active, uint32_t session_id)
+{
+    portENTER_CRITICAL(&s_stats_mux);
+    s_host_stream_active = active;
+    s_host_session_id = session_id;
+    portEXIT_CRITICAL(&s_stats_mux);
 }
 
 static uint32_t crc32(const uint8_t *data, size_t length)
@@ -361,7 +391,8 @@ static frame_check_result_t validate_gateway_output(
     payload = &raw[GATEWAY_HEADER_SIZE];
     if (raw[2] == GATEWAY_FRAME_MOTION) {
         if (payload_length != MOTION_PACKET_SIZE ||
-            payload[0] != MOTION_PROTOCOL_VERSION ||
+            (payload[0] != MOTION_PROTOCOL_VERSION_V1 &&
+             payload[0] != MOTION_PROTOCOL_VERSION_V2) ||
             payload[1] != MOTION_PACKET_TYPE_DATA) {
             return FRAME_CHECK_FORMAT_ERROR;
         }
@@ -458,7 +489,8 @@ static frame_check_result_t prepare_pc_command(
 static bool queue_wire_frame(QueueHandle_t queue,
                              const uint8_t *encoded,
                              size_t encoded_length,
-                             uint8_t source_link)
+                             uint8_t source_link,
+                             uint32_t host_session_id)
 {
     wire_frame_t frame;
 
@@ -469,9 +501,133 @@ static bool queue_wire_frame(QueueHandle_t queue,
     frame.length = (uint16_t)(encoded_length + 1U);
     frame.source_link = source_link;
     frame.reserved = 0U;
+    frame.host_session_id = host_session_id;
     memcpy(frame.bytes, encoded, encoded_length);
     frame.bytes[encoded_length] = 0U;
     return xQueueSend(queue, &frame, 0) == pdTRUE;
+}
+
+static void reset_host_session_queues(void)
+{
+    uint8_t link_index;
+
+    (void)xQueueReset(s_usb_tx_queue);
+    for (link_index = 0U;
+         link_index < AGGREGATOR_LINK_COUNT;
+         link_index++) {
+        (void)xQueueReset(s_links[link_index].rx_frame_queue);
+        (void)xQueueReset(s_links[link_index].tx_command_queue);
+    }
+}
+
+static void reset_host_session_queue_stats(void)
+{
+    uint8_t link_index;
+
+    portENTER_CRITICAL(&s_stats_mux);
+    s_stats.usb_output_drops = 0U;
+    s_stats.usb_write_failures = 0U;
+    s_stats.usb_queue_high_watermark = 0U;
+    for (link_index = 0U;
+         link_index < AGGREGATOR_LINK_COUNT;
+         link_index++) {
+        s_links[link_index].stats.rx_queue_drops = 0U;
+        s_links[link_index].stats.usb_output_drops = 0U;
+        s_links[link_index].stats.rx_queue_high_watermark = 0U;
+    }
+    portEXIT_CRITICAL(&s_stats_mux);
+}
+
+static bool queue_host_control_response(uint8_t command,
+                                        uint32_t session_id)
+{
+    uint8_t raw[GATEWAY_MAX_RAW_FRAME_SIZE];
+    uint8_t encoded[GATEWAY_MAX_ENCODED_SIZE];
+    uint8_t *payload = &raw[GATEWAY_HEADER_SIZE];
+    size_t raw_length;
+    size_t encoded_length;
+
+    raw[0] = GATEWAY_FRAME_VERSION;
+    raw[1] = AGGREGATOR_DIAGNOSTIC_GATEWAY_ID;
+    raw[2] = GATEWAY_FRAME_HOST_CONTROL_RESPONSE;
+    raw[3] = 0U;
+    put_le32(&raw[4], session_id);
+    put_le16(&raw[8], AGGREGATOR_HOST_CONTROL_PAYLOAD_SIZE);
+    payload[0] = AGGREGATOR_HOST_CONTROL_VERSION;
+    payload[1] = command;
+    payload[2] = 0U;
+    payload[3] = 0U;
+    put_le32(&payload[4], session_id);
+    raw_length = GATEWAY_HEADER_SIZE +
+                 AGGREGATOR_HOST_CONTROL_PAYLOAD_SIZE +
+                 GATEWAY_CRC_SIZE;
+    put_le32(&raw[raw_length - GATEWAY_CRC_SIZE],
+             crc32(raw, raw_length - GATEWAY_CRC_SIZE));
+    encoded_length = cobs_encode(raw, raw_length, encoded);
+    return queue_wire_frame(s_usb_tx_queue,
+                            encoded,
+                            encoded_length,
+                            HOST_CONTROL_SOURCE,
+                            session_id);
+}
+
+static bool begin_host_session(uint32_t session_id)
+{
+    /*
+     * Mark the old session inactive before touching queues. Any frame already
+     * held by merge/USB tasks carries its old session ID and is discarded by
+     * usb_tx_task. The response marker is queued before new gateway traffic is
+     * enabled, so the PC can ignore every stale byte preceding that marker.
+     */
+    set_host_stream_state(false, session_id);
+    reset_host_session_queues();
+    reset_host_session_queue_stats();
+    if (!queue_host_control_response(AGGREGATOR_HOST_CONTROL_START,
+                                     session_id)) {
+        return false;
+    }
+    set_host_stream_state(true, session_id);
+    if (s_merge_task_handle != NULL) {
+        xTaskNotifyGive(s_merge_task_handle);
+    }
+    return true;
+}
+
+static void end_host_session(uint32_t session_id)
+{
+    set_host_stream_state(false, session_id);
+    reset_host_session_queues();
+}
+
+static frame_check_result_t handle_host_control(
+    const uint8_t *raw,
+    size_t raw_length)
+{
+    const uint8_t *payload = &raw[GATEWAY_HEADER_SIZE];
+    uint16_t payload_length = get_le16(&raw[8]);
+    uint32_t session_id;
+    uint8_t command;
+
+    (void)raw_length;
+    if (raw[1] != AGGREGATOR_DIAGNOSTIC_GATEWAY_ID ||
+        raw[2] != GATEWAY_FRAME_HOST_CONTROL ||
+        payload_length != AGGREGATOR_HOST_CONTROL_PAYLOAD_SIZE ||
+        payload[0] != AGGREGATOR_HOST_CONTROL_VERSION ||
+        get_le16(&payload[2]) != 0U) {
+        return FRAME_CHECK_FORMAT_ERROR;
+    }
+    command = payload[1];
+    session_id = get_le32(&payload[4]);
+    if (command == AGGREGATOR_HOST_CONTROL_START) {
+        return begin_host_session(session_id)
+                   ? FRAME_CHECK_OK
+                   : FRAME_CHECK_FORMAT_ERROR;
+    }
+    if (command == AGGREGATOR_HOST_CONTROL_STOP) {
+        end_host_session(session_id);
+        return FRAME_CHECK_OK;
+    }
+    return FRAME_CHECK_FORMAT_ERROR;
 }
 
 static void record_link_validation(link_context_t *link,
@@ -570,12 +726,18 @@ static bool uart_write_all(link_context_t *link,
 static void usb_tx_task(void *param)
 {
     wire_frame_t frame;
+    uint32_t current_session_id;
 
     (void)param;
     for (;;) {
         if (xQueueReceive(s_usb_tx_queue,
                           &frame,
                           portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (frame.source_link != HOST_CONTROL_SOURCE &&
+            (!host_stream_snapshot(&current_session_id) ||
+             frame.host_session_id != current_session_id)) {
             continue;
         }
         if (!usb_write_all(frame.bytes, frame.length)) {
@@ -681,6 +843,7 @@ static void uart_rx_task(void *param)
     size_t encoded_length = 0U;
     bool overflow = false;
     TickType_t valid_frame_tick;
+    uint32_t host_session_id;
     int read_length;
     int index;
 
@@ -712,18 +875,22 @@ static void uart_rx_task(void *param)
                         link->stats.saw_valid_frame = true;
                         portEXIT_CRITICAL(&s_stats_mux);
 
-                        if (queue_wire_frame(link->rx_frame_queue,
-                                             encoded,
-                                             encoded_length,
-                                             link->gateway_id)) {
-                            update_link_rx_queue_high_watermark(link);
-                            if (s_merge_task_handle != NULL) {
-                                xTaskNotifyGive(s_merge_task_handle);
+                        if (host_stream_snapshot(&host_session_id)) {
+                            if (queue_wire_frame(
+                                    link->rx_frame_queue,
+                                    encoded,
+                                    encoded_length,
+                                    link->gateway_id,
+                                    host_session_id)) {
+                                update_link_rx_queue_high_watermark(link);
+                                if (s_merge_task_handle != NULL) {
+                                    xTaskNotifyGive(s_merge_task_handle);
+                                }
+                            } else {
+                                portENTER_CRITICAL(&s_stats_mux);
+                                link->stats.rx_queue_drops++;
+                                portEXIT_CRITICAL(&s_stats_mux);
                             }
-                        } else {
-                            portENTER_CRITICAL(&s_stats_mux);
-                            link->stats.rx_queue_drops++;
-                            portEXIT_CRITICAL(&s_stats_mux);
                         }
                     } else {
                         record_link_validation(link, result);
@@ -751,9 +918,12 @@ static void usb_rx_task(void *param)
     uint8_t read_buffer[128];
     uint8_t encoded[GATEWAY_MAX_ENCODED_SIZE];
     uint8_t routed_encoded[GATEWAY_MAX_ENCODED_SIZE];
+    uint8_t raw[GATEWAY_MAX_RAW_FRAME_SIZE];
     size_t encoded_length = 0U;
     size_t routed_encoded_length;
+    size_t raw_length;
     uint8_t route_index;
+    uint32_t host_session_id;
     bool overflow = false;
     int read_length;
     int index;
@@ -774,23 +944,42 @@ static void usb_rx_task(void *param)
         for (index = 0; index < read_length; index++) {
             if (read_buffer[index] == 0U) {
                 if (!overflow && encoded_length > 0U) {
-                    frame_check_result_t result =
-                        prepare_pc_command(encoded,
-                                           encoded_length,
-                                           &route_index,
-                                           routed_encoded,
-                                           &routed_encoded_length);
+                    frame_check_result_t result = validate_common_frame(
+                        encoded,
+                        encoded_length,
+                        raw,
+                        &raw_length);
+                    bool host_control =
+                        result == FRAME_CHECK_OK &&
+                        raw[2] == GATEWAY_FRAME_HOST_CONTROL;
+
+                    if (host_control) {
+                        result = handle_host_control(raw, raw_length);
+                    } else if (result == FRAME_CHECK_OK &&
+                               host_stream_snapshot(&host_session_id)) {
+                        result = prepare_pc_command(
+                            encoded,
+                            encoded_length,
+                            &route_index,
+                            routed_encoded,
+                            &routed_encoded_length);
+                    } else if (result == FRAME_CHECK_OK) {
+                        result = FRAME_CHECK_FORMAT_ERROR;
+                    }
                     if (result == FRAME_CHECK_OK) {
                         portENTER_CRITICAL(&s_stats_mux);
                         s_stats.usb_valid_commands++;
-                        s_links[route_index].stats.valid_commands++;
+                        if (!host_control) {
+                            s_links[route_index].stats.valid_commands++;
+                        }
                         portEXIT_CRITICAL(&s_stats_mux);
 
-                        if (!queue_wire_frame(
+                        if (!host_control && !queue_wire_frame(
                                 s_links[route_index].tx_command_queue,
                                 routed_encoded,
                                 routed_encoded_length,
-                                route_index)) {
+                                route_index,
+                                host_session_id)) {
                             portENTER_CRITICAL(&s_stats_mux);
                             s_links[route_index].stats.uart_output_drops++;
                             portEXIT_CRITICAL(&s_stats_mux);
@@ -826,6 +1015,8 @@ static void build_aggregator_diagnostic(
     uint32_t frame_drops;
     uint8_t link_index;
     uint8_t flags;
+    uint32_t host_session_id;
+    bool host_active;
     size_t base;
 
     portENTER_CRITICAL(&s_stats_mux);
@@ -836,11 +1027,13 @@ static void build_aggregator_diagnostic(
         link_stats[link_index] = s_links[link_index].stats;
     }
     portEXIT_CRITICAL(&s_stats_mux);
+    host_active = host_stream_snapshot(&host_session_id);
+    (void)host_session_id;
 
     memset(payload, 0, AGGREGATOR_DIAGNOSTIC_PAYLOAD_SIZE);
     payload[0] = AGGREGATOR_DIAGNOSTIC_VERSION;
     payload[1] = AGGREGATOR_LINK_COUNT;
-    payload[2] = 0x01U |
+    payload[2] = (host_active ? 0x01U : 0U) |
                  (aggregator_stats.usb_output_drops != 0U ? 0x02U : 0U);
     payload[3] =
         saturate_u8(aggregator_stats.usb_queue_high_watermark);
@@ -919,6 +1112,7 @@ static void health_task(void *param)
     uint8_t encoded[GATEWAY_MAX_ENCODED_SIZE];
     size_t raw_length;
     size_t encoded_length;
+    uint32_t host_session_id;
     TickType_t wake_tick = xTaskGetTickCount();
 
     (void)param;
@@ -926,6 +1120,10 @@ static void health_task(void *param)
         vTaskDelayUntil(
             &wake_tick,
             pdMS_TO_TICKS(AGGREGATOR_HEALTH_PERIOD_MS));
+
+        if (!host_stream_snapshot(&host_session_id)) {
+            continue;
+        }
 
         build_aggregator_diagnostic(payload);
         raw[0] = GATEWAY_FRAME_VERSION;
@@ -947,7 +1145,8 @@ static void health_task(void *param)
         if (queue_wire_frame(s_usb_tx_queue,
                              encoded,
                              encoded_length,
-                             NO_SOURCE_LINK)) {
+                             NO_SOURCE_LINK,
+                             host_session_id)) {
             update_usb_queue_high_watermark();
         } else {
             portENTER_CRITICAL(&s_stats_mux);

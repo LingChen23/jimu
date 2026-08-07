@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from motion_model import InertialEstimate, MotionStore, MovementStats
 from motion_protocol import (
+    AGGREGATOR_HOST_CONTROL_START,
     GatewayStreamDecoder,
     ImuSample,
     MotionCommand,
@@ -21,6 +22,7 @@ from motion_protocol import (
     cobs_decode,
     cobs_encode,
     decode_motion_packet,
+    encode_aggregator_host_control,
     encode_gateway_command,
     encode_gateway_frame,
     encode_gateway_payload,
@@ -61,6 +63,38 @@ def make_motion_packet(device_id: int = 7, packet_sequence: int = 9) -> bytes:
     return bytes(data)
 
 
+def make_motion_v2_packet(
+    device_id: int = 7, packet_sequence: int = 10
+) -> bytes:
+    data = bytearray(100)
+    data[0:4] = bytes((2, 0x10, device_id, 0x41))
+    struct.pack_into(
+        "<IIIHBB",
+        data,
+        4,
+        0x12345678,
+        2000,
+        0xFFFFFE00,
+        packet_sequence,
+        6,
+        1,
+    )
+    for index in range(6):
+        struct.pack_into(
+            "<hhhhhh",
+            data,
+            20 + index * 12,
+            100 + index,
+            200 + index,
+            300 + index,
+            -10 - index,
+            -20 - index,
+            -30 - index,
+        )
+    struct.pack_into("<hhhBB", data, 92, 10, -20, 30, 2, 0x02)
+    return bytes(data)
+
+
 def make_frame(
     packet_sequence: int,
     coordinate_flags: int,
@@ -71,6 +105,7 @@ def make_frame(
     coordinate_source_sequence: int | None = None,
     session_id: int = 1,
     device_id: int = 1,
+    source: str = "motion-v1-100b",
 ) -> MotionFrame:
     samples = tuple(
         ImuSample(
@@ -94,7 +129,7 @@ def make_frame(
         ),
         position_mm=(x_mm, 0, 0),
         coordinate_flags=coordinate_flags,
-        source="motion-v1-100b",
+        source=source,
     )
 
 
@@ -108,6 +143,32 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(frame.samples[3].sequence, 1003)
         self.assertEqual(frame.samples[3].tick_32k, 50984)
         self.assertEqual(frame.position_mm, (10, -20, 30))
+
+    def test_decode_v2_six_sample_packet(self) -> None:
+        frame = decode_motion_packet(make_motion_v2_packet())
+
+        self.assertEqual(frame.device_id, 7)
+        self.assertEqual(frame.packet_sequence, 10)
+        self.assertEqual(len(frame.samples), 6)
+        self.assertEqual(frame.samples[5].sequence, 2005)
+        self.assertEqual(frame.samples[5].tick_32k, 0x00000466)
+        self.assertEqual(frame.coordinate_source_sequence, 2003)
+        self.assertEqual(frame.position_mm, (10, -20, 30))
+        self.assertEqual(frame.coordinate_flags, 0x02)
+        self.assertEqual(frame.source, "motion-v2-100b")
+
+    def test_gateway_decoder_accepts_mixed_v1_v2_stream(self) -> None:
+        decoder = GatewayStreamDecoder()
+        stream = encode_gateway_frame(
+            make_motion_packet(device_id=1), gateway_id=0
+        ) + encode_gateway_frame(
+            make_motion_v2_packet(device_id=5), gateway_id=1
+        )
+
+        frames = decoder.feed(stream)
+
+        self.assertEqual([frame.motion.device_id for frame in frames], [1, 5])
+        self.assertEqual([len(frame.motion.samples) for frame in frames], [4, 6])
 
     def test_cobs_round_trip(self) -> None:
         source = bytes(range(256)) + b"\x00\x00hello"
@@ -156,6 +217,37 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(raw[2], 0x20)
         self.assertEqual(struct.unpack_from("<H", raw, 8)[0], 9)
         self.assertEqual(raw[10:19], bytes((1, 1, 1, 9, 4, 100, 0, 50, 7)))
+
+    def test_aggregator_host_session_round_trip(self) -> None:
+        session_id = 0x12345678
+        request = encode_aggregator_host_control(
+            AGGREGATOR_HOST_CONTROL_START,
+            session_id,
+        )
+        request_raw = cobs_decode(request[:-1])
+
+        self.assertEqual(request_raw[1], 0xFF)
+        self.assertEqual(request_raw[2], 0x32)
+        self.assertEqual(
+            struct.unpack_from("<BBHI", request_raw, 10),
+            (1, 1, 0, session_id),
+        )
+
+        response = encode_gateway_payload(
+            0x33,
+            struct.pack("<BBBBI", 1, 1, 0, 0, session_id),
+            gateway_id=0xFF,
+            gateway_sequence=session_id,
+        )
+        frames = GatewayStreamDecoder().feed(response)
+
+        self.assertEqual(len(frames), 1)
+        host_control = frames[0].aggregator_host_control
+        self.assertIsNotNone(host_control)
+        assert host_control is not None
+        self.assertEqual(host_control.command, 1)
+        self.assertEqual(host_control.result, 0)
+        self.assertEqual(host_control.session_id, session_id)
 
     def test_gateway_control_response_decoding(self) -> None:
         status_payload = bytes(range(29))
@@ -564,6 +656,45 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot["last_discontinuity_reason"], "host_arrival_gap")
         self.assertEqual(snapshot["interrupted_movement_count"], 1)
         self.assertEqual(snapshot["current_movement"]["sample_count"], 4)
+
+    def test_host_arrival_gap_accepts_same_session_sequence_restart(self) -> None:
+        store = MotionStore(minimum_movement_seconds=0.0)
+        store.set_analysis_mode(1, "device")
+        self.assertTrue(store.process(make_frame(50000, 0x0002, 100000)))
+        store._devices[1].last_arrival_monotonic -= 2.0
+
+        self.assertTrue(store.process(make_frame(0, 0x0002, 0)))
+        snapshot = store.snapshot(1)
+
+        self.assertEqual(snapshot["packet_count"], 2)
+        self.assertEqual(snapshot["lost_packets"], 0)
+        self.assertEqual(snapshot["out_of_order_packet_count"], 0)
+        self.assertEqual(snapshot["last_packet_sequence"], 0)
+        self.assertEqual(snapshot["last_discontinuity_reason"], "host_arrival_gap")
+
+    def test_stream_format_change_accepts_same_session_sequence_restart(self) -> None:
+        store = MotionStore(minimum_movement_seconds=0.0)
+        self.assertTrue(store.process(make_frame(50000, 0x0001, 100000)))
+
+        self.assertTrue(
+            store.process(
+                make_frame(
+                    0,
+                    0x0001,
+                    0,
+                    source="motion-v2-100b",
+                )
+            )
+        )
+        snapshot = store.snapshot(1)
+
+        self.assertEqual(snapshot["packet_count"], 2)
+        self.assertEqual(snapshot["lost_packets"], 0)
+        self.assertEqual(snapshot["out_of_order_packet_count"], 0)
+        self.assertEqual(snapshot["source"], "motion-v2-100b")
+        self.assertEqual(
+            snapshot["last_discontinuity_reason"], "stream_format_changed"
+        )
 
     def test_shake_and_flip_are_counted_independently(self) -> None:
         movement = MovementStats(1, 0, [0.0, 0.0, 1.0])

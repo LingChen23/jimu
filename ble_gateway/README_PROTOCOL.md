@@ -24,11 +24,31 @@ Frame types:
 
 | Type | Direction | Payload |
 | ---: | --- | --- |
-| `0x10` | ESP32 → PC | original 100-byte Motion V1 packet |
+| `0x10` | ESP32 → PC | original 100-byte Motion V1 or Motion V2 packet |
 | `0x20` | PC → ESP32 | device ID + BLE control request |
 | `0x21` | ESP32 → PC | device ID + BLE control response |
 | `0x30` | ESP32 → PC | 64-byte per-device BLE link diagnostic |
 | `0x31` | Aggregator → PC | 100-byte three-link aggregator diagnostic |
+| `0x32` | PC → Aggregator | PC host-session start/stop request |
+| `0x33` | Aggregator → PC | host-session start acknowledgement marker |
+
+The PC opens each aggregator connection with a unique host session. Both
+`0x32` and `0x33` use an 8-byte payload:
+
+| Offset | Size | Request / response field |
+| ---: | ---: | --- |
+| 0 | 1 | version = 1 |
+| 1 | 1 | command: START = 1, STOP = 2 |
+| 2 | 1 | request reserved = 0 / response result = 0 on success |
+| 3 | 1 | request reserved = 0 / response flags |
+| 4 | 4 | random PC session ID |
+
+On START the aggregator first disables forwarding, clears stale USB, link and
+command queues, emits the matching `0x33` marker, and only then forwards new
+gateway frames. The PC ignores data preceding the marker. On STOP the
+aggregator disables forwarding and clears its queues. This prevents a closed
+or temporarily unread USB port from turning old buffered data into apparent
+packet loss after the next open.
 
 The ESP32 sends one version 2 `0x30` diagnostic frame per configured device
 per second. The PC decoder also accepts the legacy 44-byte version 1 frame.
@@ -78,7 +98,7 @@ The three-link aggregator sends one `0x31` diagnostic frame per second with
 | ---: | ---: | --- |
 | 0 | 1 | diagnostic version = 1 |
 | 1 | 1 | link count = 3 |
-| 2 | 1 | flags: USB ready / output drop observed |
+| 2 | 1 | flags: PC host session active / output drop observed |
 | 3 | 1 | USB output queue high-water mark |
 | 4 | 4 | aggregator uptime in milliseconds |
 | 8 | 4 | USB RX bytes |

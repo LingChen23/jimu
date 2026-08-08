@@ -1428,8 +1428,8 @@ static void motion_build_info_payload(uint8_t payload[MOTION_INFO_PAYLOAD_SIZE])
     payload[0] = (uint8_t)TX_DEVICE_ID;
     payload[1] = 0U;
     payload[2] = 2U;
-    /* Firmware 0.2.1 adds a random session ID on every stream restart. */
-    payload[3] = 1U;
+    /* Firmware 0.2.2 aligns gateway A and devices 1..4 at 31.25 ms. */
+    payload[3] = 2U;
     payload[4] = MOTION_PROTOCOL_VERSION;
     payload[5] = 8U;
     motion_put_le16(&payload[6], 1000U);

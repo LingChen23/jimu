@@ -14,11 +14,11 @@ Change only this line before building each physical TX:
 
 Use a unique value from 1 through 12 for every TX. Do not use 0.
 
-Firmware 0.1.4 selects the steady connection interval from the device ID and
+Firmware 0.2.2 selects the steady connection interval from the device ID and
 requests it approximately five seconds after connecting:
 
 ```text
-devices 1..4:   30 ms
+devices 1..4: 31.25 ms
 devices 5..8: 32.5 ms
 devices 9..12:  35 ms
 ```

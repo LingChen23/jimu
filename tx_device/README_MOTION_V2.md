@@ -63,8 +63,11 @@ the wrap continuous.
 Open `tx.uvprojx`, select target `nrf52832_xxaa`, and set the correct
 `TX_DEVICE_ID` before each rebuild and download. After each device reconnects:
 
-1. `GET_INFO` must show firmware `0.2.1`, protocol `2`, sample rate `100 Hz`;
+1. `GET_INFO` must show firmware `0.2.2` for devices 1..4, protocol `2`, and
+   sample rate `100 Hz`; devices 5..12 may retain compatible firmware `0.2.1`
+   until their next planned upgrade;
 2. the PC data source must show `完整 100B（V2/6样本）`;
-3. after all 12 devices are upgraded, clear device and PC packet counters;
+3. after devices 1..4 are upgraded and all 12 devices are online, clear device
+   and PC packet counters;
 4. run a 60-second all-device test and require zero sequence gaps, zero nRF
    queue drops, zero gateway/aggregator drops and no disconnects.

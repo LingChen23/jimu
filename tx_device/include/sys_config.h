@@ -31,7 +31,7 @@
  * BLE connection intervals use 1.25 ms units.
  */
 #if (TX_DEVICE_ID <= 4U)
-#define SMARTBLOCK_CONN_INTERVAL_UNITS  24U                                         /**< Gateway A: 30 ms. */
+#define SMARTBLOCK_CONN_INTERVAL_UNITS  25U                                         /**< Gateway A: 31.25 ms; avoids a 60 ms packet-cadence lockstep. */
 #elif (TX_DEVICE_ID <= 8U)
 #define SMARTBLOCK_CONN_INTERVAL_UNITS  26U                                         /**< Gateway B: 32.5 ms. */
 #else
@@ -66,6 +66,6 @@
 #define SYS_CONFIG_FLASH_ADDR           (NRF_FICR->CODEPAGESIZE * SYS_CONFIG_PAGE)
 #define CONFIG_VALID_MAGIC              0XABBA
 
-#define FW_VER                          "V0.2.1"
+#define FW_VER                          "V0.2.2"
 
 #endif

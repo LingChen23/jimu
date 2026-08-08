@@ -182,16 +182,15 @@ The multi-gateway production configuration intentionally uses a different
 steady interval for each independent radio:
 
 ```text
-gateway A / devices 1..4:   30 ms (24 BLE units)
+gateway A / devices 1..4: 31.25 ms (25 BLE units)
 gateway B / devices 5..8: 32.5 ms (26 BLE units)
 gateway C / devices 9..12:  35 ms (28 BLE units)
 ```
 
-Each gateway requests its group interval from the first connection. Firmware
-0.1.4 on every nRF requests the same group interval after approximately five
-seconds, so a reconnect cannot collapse all colocated gateways back to a
-phase-locked 30 ms period. The web diagnostics should therefore report 30,
-32.5 or 35 ms according to the device group.
+Each gateway requests its group interval from the first connection. Matching
+nRF firmware requests the same group interval after approximately five
+seconds, so reconnects restore the intended profile. The web diagnostics
+should therefore report 31.25, 32.5 or 35 ms according to the device group.
 
 The four-link follow-up on 2026-07-26 showed why both controls are required:
 starting all four links directly at 30 ms caused one link to remain near
@@ -235,12 +234,12 @@ Production gateway builds therefore use two RF isolation controls:
   channel index. Contiguous narrow-band and guarded-block A/B tests moved loss
   to nodes whose assigned bands had poor RF conditions and were rejected.
 
-The 30/32.5/35 ms connection periods remain unchanged. Device 1 uses a 10 ms
-connection-event cap, all gateway B links use 7.5 ms, and the remaining links
-retain 5 ms. This gives the measured low-margin links more retransmission time
-without lengthening every A/C event. The channel and event-length controls
-require only gateway A/B/C firmware. Motion V2's lower notification rate
-additionally requires nRF firmware 0.2.1 and the V1/V2-aware aggregator build.
+The production connection periods are 31.25/32.5/35 ms. Every link uses a
+5 ms connection-event cap so a weak node cannot monopolize radio time. Gateway
+A and devices 1..4 use 31.25 ms to avoid phase-locking with Motion V2's 60 ms
+packet cadence; this requires nRF firmware 0.2.2 on devices 1..4. Devices 5..12
+retain their existing 32.5/35 ms behavior under firmware 0.2.1. Motion V2 also
+requires the V1/V2-aware aggregator build.
 
 BLE startup is offset by profile so gateways powered from the same module do
 not establish all connection anchors at the same instant:

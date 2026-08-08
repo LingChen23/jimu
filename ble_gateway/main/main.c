@@ -58,9 +58,7 @@
 #define LINK_DLE_TX_OCTETS       251U
 #define LINK_DLE_TX_TIME_US      2120U
 #define DEFAULT_CONN_TX_POWER    ESP_PWR_LVL_N0
-#define DEFAULT_MAX_CE_LEN_UNITS 8U  /* 5 ms */
-#define GATEWAY_B_MAX_CE_LEN_UNITS 12U /* 7.5 ms */
-#define DEVICE_1_MAX_CE_LEN_UNITS 16U /* 10 ms */
+#define DEFAULT_MAX_CE_LEN_UNITS 8U  /* 5 ms for every connection */
 #define BLE_CHANNEL_MAP_SIZE     5U
 #define MOTION_CONTROL_VERSION   1U
 #define MOTION_CONTROL_HEADER_SIZE 4U
@@ -235,11 +233,8 @@ static int configure_colocated_gateway_channels(void)
 
 static uint16_t target_max_ce_len_units(uint8_t target_index)
 {
-    if (TARGETS[target_index].expected_device_id == 1U) {
-        return DEVICE_1_MAX_CE_LEN_UNITS;
-    }
-    return GATEWAY_ID == 1U ? GATEWAY_B_MAX_CE_LEN_UNITS
-                            : DEFAULT_MAX_CE_LEN_UNITS;
+    (void)target_index;
+    return DEFAULT_MAX_CE_LEN_UNITS;
 }
 
 static void gateway_put_le16(uint8_t *dst, uint16_t value)
@@ -1745,6 +1740,59 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
         if (peer != NULL && event->conn_update.status == 0 &&
             ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
             link_stats_on_conn_update(peer->target_index, desc.conn_itvl);
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_CONN_UPDATE_REQ:
+        peer = find_peer_by_conn_handle(
+            event->conn_update_req.conn_handle);
+        if (peer != NULL) {
+            struct ble_gap_upd_params *params =
+                event->conn_update_req.self_params;
+
+            params->itvl_min =
+                s_profile->preferred_conn_interval_units;
+            params->itvl_max =
+                s_profile->preferred_conn_interval_units;
+            params->latency = 0U;
+            params->supervision_timeout =
+                BLE_GAP_SUPERVISION_TIMEOUT_MS(4000);
+            params->min_ce_len = 0U;
+            params->max_ce_len =
+                target_max_ce_len_units(peer->target_index);
+            ESP_LOGI(TAG,
+                     "Connection parameter request: conn=%u id=%u "
+                     "peer=%u-%u reply=%u ce_max=%u",
+                     peer->conn_handle,
+                     TARGETS[peer->target_index].expected_device_id,
+                     event->conn_update_req.peer_params->itvl_min,
+                     event->conn_update_req.peer_params->itvl_max,
+                     params->itvl_min,
+                     params->max_ce_len);
+        }
+        return 0;
+
+    case BLE_GAP_EVENT_L2CAP_UPDATE_REQ:
+        /*
+         * Unlike BLE_GAP_EVENT_CONN_UPDATE_REQ, NimBLE does not provide a
+         * writable self_params object for an L2CAP update request.  The
+         * peripheral firmware uses this procedure, so dereferencing
+         * self_params here would reset the gateway when its five-second
+         * connection-parameter timer expires.  Accept the request as-is.
+         * Production SmartBlock firmware requests the same fixed interval as
+         * its gateway profile, so no interval change is expected.
+         */
+        peer = find_peer_by_conn_handle(
+            event->conn_update_req.conn_handle);
+        if (peer != NULL) {
+            ESP_LOGI(TAG,
+                     "L2CAP connection parameter request: conn=%u id=%u "
+                     "peer=%u-%u expected=%u",
+                     peer->conn_handle,
+                     TARGETS[peer->target_index].expected_device_id,
+                     event->conn_update_req.peer_params->itvl_min,
+                     event->conn_update_req.peer_params->itvl_max,
+                     s_profile->preferred_conn_interval_units);
         }
         return 0;
 

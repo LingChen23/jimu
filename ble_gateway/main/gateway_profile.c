@@ -36,7 +36,7 @@
 static const gateway_profile_t PROFILE = {
     .name = "A",
     .gateway_id = 0U,
-    .preferred_conn_interval_units = 24U, /* 30 ms */
+    .preferred_conn_interval_units = 25U, /* 31.25 ms; avoid 60 ms lockstep */
     .ble_startup_delay_ms = 0U,
     .targets = {
         RANDOM_TARGET(1U, 0xe0, 0xcf, 0xe0, 0xe7, 0xf7, 0x4b),
@@ -113,7 +113,11 @@ uint8_t gateway_profile_enabled_target_count(
 
 bool gateway_profile_validate(const gateway_profile_t *profile)
 {
-    uint16_t expected_interval_units;
+    static const uint16_t EXPECTED_INTERVAL_UNITS[] = {
+        25U, /* A: 31.25 ms */
+        26U, /* B: 32.5 ms */
+        28U, /* C: 35 ms */
+    };
     uint16_t expected_startup_delay_ms;
     size_t first;
     size_t second;
@@ -126,12 +130,10 @@ bool gateway_profile_validate(const gateway_profile_t *profile)
         return false;
     }
 
-    expected_interval_units =
-        (uint16_t)(24U + 2U * profile->gateway_id);
     expected_startup_delay_ms =
         (uint16_t)(1500U * profile->gateway_id);
     if (profile->preferred_conn_interval_units !=
-            expected_interval_units ||
+            EXPECTED_INTERVAL_UNITS[profile->gateway_id] ||
         profile->ble_startup_delay_ms !=
             expected_startup_delay_ms) {
         return false;

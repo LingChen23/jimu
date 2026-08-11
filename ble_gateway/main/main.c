@@ -57,7 +57,7 @@
 #define LINK_FLAG_PHY_VALID      0x40U
 #define LINK_DLE_TX_OCTETS       251U
 #define LINK_DLE_TX_TIME_US      2120U
-#define DEFAULT_CONN_TX_POWER    ESP_PWR_LVL_N0
+#define DEFAULT_CONN_TX_POWER    ESP_PWR_LVL_N6
 #define DEFAULT_MAX_CE_LEN_UNITS 8U  /* 5 ms for every connection */
 #define BLE_CHANNEL_MAP_SIZE     5U
 #define MOTION_CONTROL_VERSION   1U

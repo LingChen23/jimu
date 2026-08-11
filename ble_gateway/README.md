@@ -224,15 +224,25 @@ bottleneck.
 
 Production gateway builds therefore use two RF isolation controls:
 
-- All ESP32-S3 gateways use `0 dBm`; the nearby nRF52832 nodes continue to
-  send the sensor-data uplink at `+4 dBm`. Raising gateway B alone to `+3 dBm`
-  moved loss into A/C during field testing and was rejected. Runtime
+- All ESP32-S3 gateways use `-6 dBm`; the nearby nRF52832 nodes continue to
+  send the sensor-data uplink at `+4 dBm`. A 12-node full-load test showed
+  that `0 dBm` still allowed the three colocated gateway transmitters to
+  desensitize one another's receivers. Raising gateway B alone to `+3 dBm`
+  moved loss into A/C during earlier field testing and was rejected. Runtime
   per-connection handle changes are deliberately avoided.
 - Each profile uses a disjoint interleaved third of the 37 BLE data channels:
   A uses `0,3,...,36`, B uses `1,4,...,34`, and C uses `2,5,...,35`. Every
   profile retains full-band diversity while local gateways avoid the same
   channel index. Contiguous narrow-band and guarded-block A/B tests moved loss
   to nodes whose assigned bands had poor RF conditions and were rejected.
+
+The `-6 dBm` setting was verified with all 12 nodes streaming.  At `0 dBm`, a
+60-second baseline lost 13.14% / 22.50% / 9.72% on devices 3 / 9 / 12, with
+the losses matching nRF queue drops while every UART, aggregator and USB error
+counter remained zero.  After changing all three gateways to `-6 dBm`, two
+60-second tests (including a hard reset of every gateway and a complete BLE
+reconnect between runs) reported zero sequence gaps, zero nRF queue drops and
+zero downstream transport errors on devices 1 through 12.
 
 The production connection periods are 31.25/32.5/35 ms. Every link uses a
 5 ms connection-event cap so a weak node cannot monopolize radio time. Gateway

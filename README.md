@@ -8,6 +8,8 @@
 - `ble_gateway/`：ESP32-S3 四连接 BLE 网关 ESP-IDF 工程，单工程生成 A/B/C 三套固件。
 - `aggregator/`：ESP32-S3 三路双向 UART 聚合器 ESP-IDF 工程。
 - `pc_visualizer/`：支持 12 台设备的接收、控制、可视化和运动分析程序。
+- `vue_frontend/`：独立的 Vue 采集与评分前端，开发端口为 5173。
+- `vue_backend/`：Vue 前端专用后端，端口为 8766；不读写 `pc_visualizer/`。
 - `nrf52832_12nodes_ble_gateway_aggregator方案.md`：12 台传感器、3 台 BLE 网关和1台聚合器的总体方案。
 
 ## 当前完成状态
@@ -117,6 +119,24 @@ python app.py
 ```
 
 业务串口为聚合器原生 USB 串口，当前使用921600波特率打开 COM23。
+
+### Vue 采集与评分系统
+
+```powershell
+cd vue_frontend
+npm install
+npm run dev:backend
+```
+
+另开一个终端：
+
+```powershell
+cd vue_frontend
+npm run dev
+```
+
+访问 `http://127.0.0.1:5173`。Vue 系统使用独立的 `vue_backend/`，不会读取或
+修改原 `pc_visualizer/`。同一时刻只有一个后端可以打开同一个串口。
 
 ## 下一步
 

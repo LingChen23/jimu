@@ -1,0 +1,30 @@
+{
+  "name": "block-motion-review",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:backend": "python ../vue_backend/app.py --no-browser --host 127.0.0.1 --port 8766",
+    "build": "vue-tsc -b && vite build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "smoke:mock": "vite build --config vite.smoke.config.ts && node .smoke-dist/mock-motion-data-service.smoke.mjs",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "echarts": "^5.6.0",
+    "echarts-gl": "^2.1.0",
+    "pinia": "^3.0.3",
+    "vue": "^3.5.17",
+    "vue-router": "^4.5.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "@vitejs/plugin-vue": "^6.0.1",
+    "typescript": "^5.8.3",
+    "vite": "^7.0.4",
+    "vitest": "^4.1.10",
+    "vue-tsc": "^3.0.1"
+  }
+}

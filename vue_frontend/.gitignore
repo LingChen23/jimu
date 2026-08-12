@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.smoke-dist/
+*.tsbuildinfo
+*.log
+__pycache__/
+*.pyc
+
+.env
+.env.*
+!.env.example

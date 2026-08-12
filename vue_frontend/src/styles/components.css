@@ -1,0 +1,127 @@
+.card {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: var(--shadow);
+}
+
+.card-title {
+  font-weight: 800;
+  font-size: 16px;
+}
+
+.card-subtitle {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--gray);
+}
+
+.section-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+
+.btn {
+  border-radius: 10px;
+  padding: 11px 18px;
+  border: 0;
+  font-weight: 800;
+}
+
+.btn.primary {
+  background: linear-gradient(135deg, #1d73f4, #155bd1);
+  color: #fff;
+}
+
+.btn.secondary {
+  background: #fff;
+  border: 1px solid #ced8e6;
+  color: #354259;
+}
+
+.btn.block {
+  width: 100%;
+  margin-top: 18px;
+}
+
+.badge {
+  display: inline-flex;
+  border-radius: 7px;
+  padding: 5px 9px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.badge--green {
+  background: #e8f8ef;
+  color: var(--green);
+}
+
+.badge--blue {
+  background: #eaf2ff;
+  color: var(--primary);
+}
+
+.badge--orange {
+  background: #fff3e5;
+  color: var(--orange);
+}
+
+.badge--red {
+  background: #ffecec;
+  color: var(--red);
+}
+
+.badge--gray {
+  background: #eef2f6;
+  color: var(--gray);
+}
+
+.badge--purple {
+  background: #f2edff;
+  color: var(--purple);
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(4, 22, 43, .52);
+  display: grid;
+  place-items: center;
+  z-index: 100;
+  padding: 20px;
+}
+
+.modal {
+  width: min(540px, 100%);
+  background: #fff;
+  border-radius: 18px;
+  padding: 22px;
+  display: grid;
+  gap: 15px;
+}
+
+.modal h2 {
+  margin: 0;
+}
+
+.modal p {
+  margin: 6px 0 0;
+  color: var(--gray);
+  font-size: 12px;
+}
+
+.close {
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 9px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}

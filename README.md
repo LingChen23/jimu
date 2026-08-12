@@ -122,21 +122,57 @@ python app.py
 
 ### Vue 采集与评分系统
 
+Vue 系统由两个相互独立的目录组成：
+
+- `vue_frontend/`：Vue 3 + TypeScript + Vite 页面；
+- `vue_backend/`：串口、设备控制、运动分析和采集任务 API。
+
+它不会读取或修改 `pc_visualizer/`。`vue_backend/runtime/` 独立保存积木绑定、
+运动设置和采集任务记录，该目录不会提交到 Git；首次运行时会根据
+`vue_backend/defaults/` 自动创建默认配置。
+
+运行环境：Node.js 20+、Python 3.11+。首次使用先安装依赖：
+
 ```powershell
 cd vue_frontend
-npm install
+npm ci
+
+python -m pip install -r ../vue_backend/requirements.txt
+```
+
+启动 Vue 配套后端：
+
+```powershell
+cd vue_frontend
 npm run dev:backend
 ```
 
-另开一个终端：
+另开一个终端启动前端：
 
 ```powershell
 cd vue_frontend
 npm run dev
 ```
 
-访问 `http://127.0.0.1:5173`。Vue 系统使用独立的 `vue_backend/`，不会读取或
-修改原 `pc_visualizer/`。同一时刻只有一个后端可以打开同一个串口。
+服务地址：
+
+- 前端：`http://127.0.0.1:5173`
+- Vue 配套后端：`http://127.0.0.1:8766`
+- 原 PC 可视化程序：`http://127.0.0.1:8765`
+
+`vue_backend` 与 `pc_visualizer` 可以同时启动，但同一时刻只能有一个后端打开
+同一个串口。需要切换系统时，先在当前页面关闭串口。
+
+验证命令：
+
+```powershell
+cd vue_frontend
+npm test
+npm run build
+
+cd ../vue_backend
+python -m unittest discover -s tests -v
+```
 
 ## 下一步
 

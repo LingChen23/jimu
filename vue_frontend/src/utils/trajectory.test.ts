@@ -11,10 +11,8 @@ describe('trajectory helpers', () => {
     { timestamp: 2, x: 12, y: 24, z: 36 },
   ]
 
-  it('preserves metric coordinates and normalizes shape coordinates', () => {
-    expect(prepareTrajectory(points, 'metric').points).toEqual([[10, 20, 30], [12, 24, 36]])
-    const shape = prepareTrajectory(points, 'shape')
-    expect(shape.origin).toEqual([10, 20, 30])
+  it('normalizes coordinates around the starting point', () => {
+    const shape = prepareTrajectory(points)
     expect(shape.points[0]).toEqual([0, 0, 0])
   })
 

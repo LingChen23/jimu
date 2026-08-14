@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from motion_model import InertialEstimate, MotionStore, MovementStats
+from motion_model import AnalysisPipeline, InertialEstimate, MotionStore, MovementStats
 from motion_protocol import (
     AGGREGATOR_HOST_CONTROL_START,
     GatewayStreamDecoder,
@@ -431,11 +431,11 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(frame.samples[0].gyro_raw, (-11, 51, 3))
         self.assertTrue(frame.coordinate_valid)
 
-    def test_store_reserves_twelve_devices(self) -> None:
-        store = MotionStore(12)
-        snapshot = store.snapshot(12)
-        self.assertEqual(len(snapshot["devices"]), 12)
-        self.assertEqual(snapshot["device_id"], 12)
+    def test_store_reserves_ten_devices(self) -> None:
+        store = MotionStore(10)
+        snapshot = store.snapshot(10)
+        self.assertEqual(len(snapshot["devices"]), 10)
+        self.assertEqual(snapshot["device_id"], 10)
 
     def test_sparse_diagnostic_output_does_not_report_packet_loss(self) -> None:
         store = MotionStore()
@@ -801,6 +801,54 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(movement["pause_count"], 1)
         self.assertGreaterEqual(movement["pause_total_seconds"], 0.8)
 
+    def test_pc_live_path_excludes_stop_confirmation_window(self) -> None:
+        store = MotionStore(minimum_movement_seconds=0.0)
+        store.set_analysis_mode(1, "pc")
+        packet = 0
+        tick = 0
+
+        # Calibrate, then create a movement long enough to expose a live path.
+        for accel, gyro, count in (
+            ((0, 0, 4096), (0, 0, 0), 25),
+            ((0, 0, 4096), (0, 0, 1200), 5),
+        ):
+            for _ in range(count):
+                store.process(
+                    make_frame(
+                        packet,
+                        0x0001,
+                        tick,
+                        accel_raw=accel,
+                        gyro_raw=gyro,
+                    )
+                )
+                packet += 1
+                tick += 4 * 328
+
+        before_quiet = store.snapshot(1)
+        path_before_quiet = list(before_quiet["calculated_path"])
+        self.assertGreater(len(path_before_quiet), 1)
+
+        # Five quiet frames accept the backdated stop; additional quiet frames
+        # are the three-second end hold and must not extend the visible path.
+        for _ in range(15):
+            store.process(
+                make_frame(
+                    packet,
+                    0x0001,
+                    tick,
+                    accel_raw=(0, 0, 4096),
+                    gyro_raw=(0, 0, 0),
+                )
+            )
+            packet += 1
+            tick += 4 * 328
+
+        during_hold = store.snapshot(1)
+        self.assertIsNotNone(during_hold["current_movement"])
+        self.assertIn(during_hold["motion_state"], {"停止确认", "停顿中"})
+        self.assertEqual(during_hold["calculated_path"], path_before_quiet)
+
     def test_flip_back_counts_as_a_second_flip(self) -> None:
         movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
 
@@ -1052,6 +1100,60 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(corrected[-1][1], 0.0, places=8)
         self.assertAlmostEqual(corrected[-1][2], 0.0, places=8)
 
+    def test_archived_movement_cache_keeps_summaries_and_two_recent_details(self) -> None:
+        pipeline = AnalysisPipeline("pc")
+        movements: list[MovementStats] = []
+        for movement_id in range(1, 5):
+            movement = MovementStats(movement_id, 0, [0.0, 0.0, 1.0])
+            movement.finalized = True
+            movement.sample_records = [
+                {"sample_index": index} for index in range(10)
+            ]
+            movement.device_coordinate_records = [[0.0, 0.0, 0.0]]
+            movement.calculated_path_final = [[0.0, 0.0, 0.0]]
+            movement.received_path_final = [[0.0, 0.0, 0.0]]
+            movements.append(movement)
+        pipeline.completed_movements.extend(reversed(movements))
+
+        for movement_id in range(1, 5):
+            pipeline.mark_movement_archived(movement_id)
+
+        by_id = {
+            movement.movement_id: movement
+            for movement in pipeline.completed_movements
+        }
+        self.assertTrue(by_id[1].high_frequency_released)
+        self.assertTrue(by_id[2].high_frequency_released)
+        self.assertEqual(by_id[1].sample_records, [])
+        self.assertFalse(by_id[3].high_frequency_released)
+        self.assertFalse(by_id[4].high_frequency_released)
+        self.assertEqual(len(pipeline.completed_movements), 4)
+        self.assertEqual(pipeline.finalization_snapshot()["detail_cache_count"], 2)
+
+    def test_task_external_cache_releases_old_unarchived_details(self) -> None:
+        pipeline = AnalysisPipeline("pc")
+        pipeline.set_task_collection_active(True)
+        movements: list[MovementStats] = []
+        for movement_id in range(1, 5):
+            movement = MovementStats(movement_id, 0, [0.0, 0.0, 1.0])
+            movement.finalized = True
+            movement.sample_records = [
+                {"sample_index": index} for index in range(10)
+            ]
+            movement.calculated_path_final = [[0.0, 0.0, 0.0]]
+            movements.append(movement)
+        pipeline.completed_movements.extend(reversed(movements))
+
+        self.assertTrue(all(not item.high_frequency_released for item in movements))
+        released = pipeline.set_task_collection_active(False)
+
+        self.assertEqual(released, 2)
+        self.assertTrue(movements[0].high_frequency_released)
+        self.assertTrue(movements[1].high_frequency_released)
+        self.assertFalse(movements[2].high_frequency_released)
+        self.assertFalse(movements[3].high_frequency_released)
+        self.assertEqual(len(pipeline.completed_movements), 4)
+
     def test_completed_movement_speed_statistics_uses_core_p05(self) -> None:
         movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
         speeds = [0.0] * 10 + [1.0 + index / 100.0 for index in range(80)] + [0.0] * 10
@@ -1142,6 +1244,8 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertIsNotNone(detail)
         assert detail is not None
         self.assertIn("acceleration_series", detail)
+        self.assertIn("gyroscope_series", detail)
+        self.assertEqual(len(detail["gyroscope_series"]), len(detail["acceleration_series"]))
         self.assertIn("session_tremor_average", detail)
         self.assertIsNotNone(detail["time"]["start"]["beijing"])
         self.assertAlmostEqual(
@@ -1375,6 +1479,40 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertNotIn("calculated_path", live)
         self.assertNotIn("accel", live)
 
+    def test_live_snapshot_returns_trajectory_points_after_cursor(self) -> None:
+        store = MotionStore()
+        state = store._devices[1]
+        pipeline = state.analyses[state.analysis_mode]
+        pipeline.trajectory_revision = 4
+        pipeline.calculated_path.extend([
+            [0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0],
+            [0.2, 0.1, 0.0],
+        ])
+        pipeline.calculated_path_cursor = 3
+
+        initial = store.live_snapshot(1)
+        delta = store.live_snapshot(1, 4, 0, 1)
+
+        self.assertTrue(initial["trajectory_delta"]["reset"])
+        self.assertEqual(
+            initial["trajectory_delta"]["calculated"]["points"],
+            list(pipeline.calculated_path),
+        )
+        self.assertFalse(delta["trajectory_delta"]["reset"])
+        self.assertEqual(
+            delta["trajectory_delta"]["calculated"]["points"],
+            [[0.1, 0.0, 0.0], [0.2, 0.1, 0.0]],
+        )
+        self.assertEqual(delta["trajectory_delta"]["calculated"]["cursor"], 3)
+
+        stale = store.live_snapshot(1, 4, 0, 99)
+        self.assertTrue(stale["trajectory_delta"]["calculated"]["truncated"])
+        self.assertEqual(
+            stale["trajectory_delta"]["calculated"]["points"],
+            list(pipeline.calculated_path),
+        )
+
 
     def test_short_movement_is_ignored_without_consuming_number(self) -> None:
         store = MotionStore(minimum_movement_seconds=0.30)
@@ -1503,7 +1641,7 @@ class MotionProtocolTests(unittest.TestCase):
         mapping = store.block_mapping_snapshot()
         self.assertEqual(mapping["mapping_version"], configured_version)
         self.assertEqual(mapping["devices"][0], {"device_id": 1, "block_id": configured_blocks[1]})
-        self.assertEqual(mapping["devices"][-1], {"device_id": 12, "block_id": configured_blocks[12]})
+        self.assertEqual(mapping["devices"][-1], {"device_id": 10, "block_id": configured_blocks[10]})
         self.assertEqual(store.snapshot(1)["block_id"], configured_blocks[1])
 
         packet = 0
@@ -1543,7 +1681,7 @@ class MotionProtocolTests(unittest.TestCase):
                         "mapping_version": "test-v1",
                         "devices": [
                             {"device_id": device_id, "block_id": chr(64 + device_id)}
-                            for device_id in range(1, 13)
+                            for device_id in range(1, 11)
                         ],
                     }
                 ),
@@ -1551,19 +1689,19 @@ class MotionProtocolTests(unittest.TestCase):
             )
             store = MotionStore(mapping_path=mapping_path)
             reversed_mapping = [
-                {"device_id": device_id, "block_id": chr(77 - device_id)}
-                for device_id in range(1, 13)
+                {"device_id": device_id, "block_id": chr(75 - device_id)}
+                for device_id in range(1, 11)
             ]
 
             updated = store.update_block_mapping(reversed_mapping, "test-v2")
 
             self.assertEqual(updated["mapping_version"], "test-v2")
-            self.assertEqual(store.snapshot(1)["block_id"], "L")
+            self.assertEqual(store.snapshot(1)["block_id"], "J")
             persisted = json.loads(mapping_path.read_text(encoding="utf-8"))
-            self.assertEqual(persisted["devices"][0], {"device_id": 1, "block_id": "L"})
-            with self.assertRaisesRegex(ValueError, "A～L"):
+            self.assertEqual(persisted["devices"][0], {"device_id": 1, "block_id": "J"})
+            with self.assertRaisesRegex(ValueError, "A～J"):
                 store.update_block_mapping(
-                    [{"device_id": device_id, "block_id": "A"} for device_id in range(1, 13)],
+                    [{"device_id": device_id, "block_id": "A"} for device_id in range(1, 11)],
                     "invalid",
                 )
 

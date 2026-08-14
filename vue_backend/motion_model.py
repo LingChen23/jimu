@@ -42,6 +42,8 @@ SIGNAL_HISTORY = 1000
 PATH_HISTORY = 3000
 MAX_MOVEMENT_SAMPLES = 30000
 LIVE_SPEED_QUANTILE_SAMPLES = 512
+RECENT_MOVEMENT_DETAIL_LIMIT = 2
+RECENT_MOVEMENT_DETAIL_SAMPLE_BUDGET = 12000
 FINALIZATION_WORKERS = 2
 UINT32_MASK = 0xFFFFFFFF
 UINT16_MASK = 0xFFFF
@@ -129,7 +131,7 @@ LINEAR_ACCEL_SOFT_DEADBAND_MPS2 = 0.06
 # Movement-end trajectory correction, statistics and FFT must never execute in
 # the serial reader.  Two workers are enough to absorb simultaneous device/PC
 # pipeline completions without letting analysis compete excessively with live
-# ingestion on a 12-device session.
+# ingestion on a multi-device session.
 _FINALIZATION_EXECUTOR = ThreadPoolExecutor(
     max_workers=FINALIZATION_WORKERS,
     thread_name_prefix="motion-finalize",
@@ -884,6 +886,9 @@ class MovementStats:
     flip_reference_up: list[float] = field(default_factory=list)
     flip_candidate_seconds: float = 0.0
     pause_events: list[dict[str, Any]] = field(default_factory=list)
+    shake_events: list[dict[str, Any]] = field(default_factory=list)
+    rotation_events: list[dict[str, Any]] = field(default_factory=list)
+    flip_events: list[dict[str, Any]] = field(default_factory=list)
     drop_freefall_candidate_seconds: float = 0.0
     drop_freefall_start_s: float | None = None
     drop_armed: bool = False
@@ -911,6 +916,7 @@ class MovementStats:
     live_speed_count: int = 0
     live_speed_sample_stride: int = 1
     live_speed_samples: list[float] = field(default_factory=list, repr=False)
+    high_frequency_released: bool = False
 
     def __post_init__(self) -> None:
         self.flip_reference_up = list(self.start_up)
@@ -982,7 +988,12 @@ class MovementStats:
             return list(axis)
         return [value / tracked_norm for value in tracked_axis]
 
-    def _count_completed_axis_rotations(self) -> None:
+    def _count_completed_axis_rotations(
+        self,
+        elapsed_s: float,
+        sequence: int,
+        wall_epoch: float | None,
+    ) -> None:
         while (
             self.rotation_progress_degrees + 1e-6
             >= ROTATION_THRESHOLD_DEGREES
@@ -990,8 +1001,22 @@ class MovementStats:
             self.rotation_count += 1
             self.rotation_degrees_total += ROTATION_THRESHOLD_DEGREES
             self.rotation_progress_degrees -= ROTATION_THRESHOLD_DEGREES
+            self.rotation_events.append({
+                "rotation_index": self.rotation_count,
+                "elapsed_s": float(elapsed_s),
+                "sequence": int(sequence),
+                "degrees": ROTATION_THRESHOLD_DEGREES,
+                "time": _iso_times(wall_epoch),
+            })
 
-    def _update_rotation(self, gyro_world_dps: list[float], dt: float) -> None:
+    def _update_rotation(
+        self,
+        gyro_world_dps: list[float],
+        dt: float,
+        elapsed_s: float,
+        sequence: int,
+        wall_epoch: float | None,
+    ) -> None:
         """Count complete turns around one stable, arbitrary world-space axis.
 
         A confirmed direction change starts an independent rotation segment.
@@ -1080,7 +1105,9 @@ class MovementStats:
             self.rotation_gap_seconds = 0.0
             self._clear_rotation_candidate()
 
-        self._count_completed_axis_rotations()
+        self._count_completed_axis_rotations(
+            elapsed_s, sequence, wall_epoch
+        )
 
     def _update_spatial_rotation(
         self,
@@ -1138,7 +1165,14 @@ class MovementStats:
         )
         return self.spatial_rotation_degrees_total + live_segment
 
-    def _update_flip(self, up_world: list[float], dt: float) -> None:
+    def _update_flip(
+        self,
+        up_world: list[float],
+        dt: float,
+        elapsed_s: float,
+        sequence: int,
+        wall_epoch: float | None,
+    ) -> None:
         reference_norm = _norm(self.flip_reference_up)
         up_norm = _norm(up_world)
         if reference_norm <= 1e-9 or up_norm <= 1e-9:
@@ -1152,6 +1186,12 @@ class MovementStats:
             self.flip_candidate_seconds += dt
             if self.flip_candidate_seconds >= FLIP_CONFIRM_SECONDS:
                 self.flip_count += 1
+                self.flip_events.append({
+                    "flip_index": self.flip_count,
+                    "elapsed_s": float(elapsed_s),
+                    "sequence": int(sequence),
+                    "time": _iso_times(wall_epoch),
+                })
                 self.flip_reference_up = [
                     value / up_norm for value in up_world
                 ]
@@ -1172,6 +1212,7 @@ class MovementStats:
         self.pause_count += 1
         self.pause_events.append({
             "pause_index": self.pause_count,
+            "elapsed_s": _tick_seconds(start_tick, self.start_tick),
             "duration_seconds": duration,
             "start": _iso_times(start_epoch),
             "end": _iso_times(end_epoch),
@@ -1212,6 +1253,14 @@ class MovementStats:
             self.shake_count += 1
             self.shake_active = True
             self.last_shake_tick = tick
+            self.shake_events.append({
+                "shake_index": self.shake_count,
+                "elapsed_s": float(elapsed_s),
+                "sequence": int(sequence),
+                "dynamic_acceleration_mps2": float(linear_magnitude),
+                "angular_speed_dps": float(gyro_magnitude),
+                "time": _iso_times(wall_epoch),
+            })
         elif (
             linear_magnitude < SHAKE_END_MPS2
             and gyro_magnitude < SHAKE_GYRO_DPS * 0.5
@@ -1227,7 +1276,13 @@ class MovementStats:
             if estimate.gyro_world_dps is not None
             else estimate.corrected_gyro_dps
         )
-        self._update_rotation(rotation_gyro, estimate.dt)
+        self._update_rotation(
+            rotation_gyro,
+            estimate.dt,
+            elapsed_s,
+            sequence,
+            wall_epoch,
+        )
 
         # Spatial rotation is deliberately independent from the one-axis state
         # machine: changing axis or direction never subtracts angular travel.
@@ -1236,7 +1291,13 @@ class MovementStats:
         )
 
         # Flip counting is independent from complete 360-degree rotations.
-        self._update_flip(estimate.up_world, estimate.dt)
+        self._update_flip(
+            estimate.up_world,
+            estimate.dt,
+            elapsed_s,
+            sequence,
+            wall_epoch,
+        )
 
         # Drop: confirmed near-free-fall followed by a high-g impact within the
         # configured time window. Low-g alone is neither a pause nor a drop.
@@ -1266,6 +1327,7 @@ class MovementStats:
                         "drop_index": self.drop_count,
                         "freefall_start_s": self.drop_freefall_start_s,
                         "impact_s": elapsed_s,
+                        "sequence": int(sequence),
                         "impact_g": specific_force_g,
                         "impact_time": _iso_times(event_epoch),
                     })
@@ -1416,7 +1478,29 @@ class MovementStats:
             "dynamic_world_mps2": _axis_statistics(dynamic_rows, ("x", "y", "z")),
         }
         self.tremor = _tremor_fft(self.sample_records)
+        # The integration input duplicates values already retained in the
+        # finalized sample rows and is never needed by detail/export readers.
+        self.integration_samples.clear()
+        self.live_speed_samples.clear()
         self.finalized = True
+
+    def release_high_frequency_detail(self) -> bool:
+        """Release archived sample payload while preserving every summary.
+
+        Task archives are the durable source for historical detail.  Counts,
+        speed statistics, tremor results and event summaries stay resident so
+        snapshot/current-task APIs keep exactly the same frontend contract.
+        """
+        if not self.finalized or self.high_frequency_released:
+            return False
+        self.integration_samples.clear()
+        self.sample_records.clear()
+        self.device_coordinate_records.clear()
+        self.calculated_path_final.clear()
+        self.received_path_final.clear()
+        self.live_speed_samples.clear()
+        self.high_frequency_released = True
+        return True
 
     def _time_snapshot(self) -> dict[str, Any]:
         return {
@@ -1496,6 +1580,10 @@ class MovementStats:
             [row["elapsed_s"], *row["linear_world_mps2"]]
             for row in self.sample_records
         ]
+        gyroscope_series = [
+            [row["elapsed_s"], *row["gyro_dps"]]
+            for row in self.sample_records
+        ]
         speed_series = [
             [row["elapsed_s"], row["speed_mps"]]
             for row in self.sample_records
@@ -1505,9 +1593,21 @@ class MovementStats:
             "acceleration_statistics": self.accel_statistics,
             "acceleration_series": acceleration_series,
             "dynamic_acceleration_series": dynamic_acceleration_series,
+            "gyroscope_series": gyroscope_series,
             "speed_series": speed_series,
+            "trajectory_series": [
+                [
+                    float(row["elapsed_s"]),
+                    *row["position_m"],
+                    float(row["speed_mps"]),
+                ]
+                for row in self.sample_records
+            ],
             "pause_events": self.pause_events,
             "drop_events": self.drop_events,
+            "shake_events": self.shake_events,
+            "rotation_events": self.rotation_events,
+            "flip_events": self.flip_events,
             "calculated_path": self.calculated_path_final,
             "received_path": self.received_path_final,
             "device_coordinates": self.device_coordinate_records,
@@ -1595,6 +1695,11 @@ class MovementStats:
             self._spatial_rotation_degrees() / SPATIAL_ROTATION_TURN_DEGREES,
         ])
         writer.writerow(["metadata", "flip_count", self.flip_count])
+        writer.writerow(["metadata", "shake_events", json.dumps(self.shake_events, ensure_ascii=False)])
+        writer.writerow(["metadata", "rotation_events", json.dumps(self.rotation_events, ensure_ascii=False)])
+        writer.writerow(["metadata", "flip_events", json.dumps(self.flip_events, ensure_ascii=False)])
+        writer.writerow(["metadata", "pause_events", json.dumps(self.pause_events, ensure_ascii=False)])
+        writer.writerow(["metadata", "drop_events", json.dumps(self.drop_events, ensure_ascii=False)])
         writer.writerow(["metadata", "tremor_frequency_hz", self.tremor.get("dominant_frequency_hz")])
         writer.writerow(["metadata", "tremor_intensity_dps", self.tremor.get("intensity_dps")])
         writer.writerow(["metadata", "session_mean_tremor_frequency_hz", session_tremor.get("mean_frequency_hz")])
@@ -1692,10 +1797,14 @@ class AnalysisPipeline:
     received_origin_set: bool = False
     last_coordinate_source_sequence: int | None = None
     trajectory_revision: int = 0
+    received_path_cursor: int = 0
+    calculated_path_cursor: int = 0
     interrupted_movement_count: int = 0
     motion_state: str = "等待静止"
     analysis_generation: int = 0
     pending_finalization_ids: set[int] = field(default_factory=set)
+    archived_movement_ids: set[int] = field(default_factory=set)
+    task_collection_active: bool = False
     finalization_requests: deque = field(default_factory=deque, repr=False)
     finalization_error_count: int = 0
     last_finalization_error: str | None = None
@@ -1718,6 +1827,8 @@ class AnalysisPipeline:
         self.calculated_path.clear()
         self.received_path.append([0.0, 0.0, 0.0])
         self.calculated_path.append([0.0, 0.0, 0.0])
+        self.received_path_cursor = 1
+        self.calculated_path_cursor = 1
         self.last_coordinate_source_sequence = None
 
         if (
@@ -1762,6 +1873,8 @@ class AnalysisPipeline:
             self.motion_state = "数据中断，等待设备状态"
         self.received_path.clear()
         self.calculated_path.clear()
+        self.received_path_cursor = 0
+        self.calculated_path_cursor = 0
         self.received_origin = [0.0, 0.0, 0.0]
         self.received_origin_set = False
         self.last_coordinate_source_sequence = None
@@ -1832,6 +1945,8 @@ class AnalysisPipeline:
             self.ignored_short_movement_count += 1
             self.received_path.clear()
             self.calculated_path.clear()
+            self.received_path_cursor = 0
+            self.calculated_path_cursor = 0
             self.received_origin = [0.0, 0.0, 0.0]
             self.received_origin_set = False
             self.last_coordinate_source_sequence = None
@@ -1899,12 +2014,63 @@ class AnalysisPipeline:
                         display_path.append(movement.calculated_path_final[-1])
                 self.calculated_path.clear()
                 self.calculated_path.extend(display_path)
+                self.calculated_path_cursor = len(display_path)
             self.received_path.clear()
             self.received_path.extend(
                 movement.received_path_final[-PATH_HISTORY:]
             )
+            self.received_path_cursor = len(self.received_path)
         self.last_finalization_error = None
         self.trajectory_revision += 1
+        self._prune_detail_cache(release_unarchived=not self.task_collection_active)
+
+    def mark_movement_archived(self, movement_id: int) -> int:
+        """Mark durable detail as available and enforce the RAM cache bound."""
+        identifier = int(movement_id)
+        if not any(item.movement_id == identifier for item in self.completed_movements):
+            return 0
+        self.archived_movement_ids.add(identifier)
+        return self._prune_detail_cache(
+            release_unarchived=not self.task_collection_active
+        )
+
+    def set_task_collection_active(self, active: bool) -> int:
+        """Protect task data until archived; trim task-external detail eagerly."""
+        self.task_collection_active = bool(active)
+        if self.task_collection_active:
+            return 0
+        return self._prune_detail_cache(release_unarchived=True)
+
+    def _prune_detail_cache(self, release_unarchived: bool) -> int:
+        cached_count = 0
+        cached_samples = 0
+        released = 0
+        for movement in sorted(
+            self.completed_movements,
+            key=lambda item: item.movement_id,
+            reverse=True,
+        ):
+            if (
+                movement.movement_id not in self.archived_movement_ids
+                and not release_unarchived
+            ):
+                continue
+            sample_count = len(movement.sample_records)
+            keep = (
+                not movement.high_frequency_released
+                and cached_count < RECENT_MOVEMENT_DETAIL_LIMIT
+                and (
+                    cached_count == 0
+                    or cached_samples + sample_count
+                    <= RECENT_MOVEMENT_DETAIL_SAMPLE_BUDGET
+                )
+            )
+            if keep:
+                cached_count += 1
+                cached_samples += sample_count
+            elif movement.release_high_frequency_detail():
+                released += 1
+        return released
 
     def _check_finish(self, tick: int) -> None:
         movement = self.current_movement
@@ -1944,6 +2110,7 @@ class AnalysisPipeline:
             return
         relative = [position[axis] - self.received_origin[axis] for axis in range(3)]
         self.received_path.append(relative)
+        self.received_path_cursor += 1
         movement.add_device_coordinate(source_sequence, relative, frame_epoch)
 
     def process_device(
@@ -2008,6 +2175,7 @@ class AnalysisPipeline:
                     sample_epoch,
                 )
                 self.calculated_path.append(estimate.position)
+                self.calculated_path_cursor += 1
             if self.current_movement is not None:
                 self.current_movement.latest_tick = sample.tick_32k
                 self.current_movement.latest_epoch = sample_epoch
@@ -2086,7 +2254,16 @@ class AnalysisPipeline:
 
             movement = self.current_movement
             if movement is not None:
-                self.calculated_path.append(estimate.position)
+                # A quiet candidate is the first sample that may become the
+                # backdated stop boundary.  Keep that sample and the following
+                # stop-hold window out of the live path.  If motion resumes,
+                # trajectory collection continues from the next moving sample.
+                if (
+                    movement.pending_stop_tick is None
+                    and not decision.quiet_candidate
+                ):
+                    self.calculated_path.append(estimate.position)
+                    self.calculated_path_cursor += 1
                 if not estimate.stationary:
                     movement.add_sample(
                         estimate,
@@ -2130,6 +2307,9 @@ class AnalysisPipeline:
         if removed:
             self.ignored_short_movement_count += removed
             self.completed_movements = deque(kept)
+            self.archived_movement_ids.intersection_update(
+                movement.movement_id for movement in kept
+            )
 
         if self.current_movement is not None:
             self.current_movement.movement_id = max(
@@ -2140,10 +2320,14 @@ class AnalysisPipeline:
         if self.current_movement is None:
             self.received_path.clear()
             self.calculated_path.clear()
+            self.received_path_cursor = 0
+            self.calculated_path_cursor = 0
             if self.completed_movements:
                 latest = self.completed_movements[0]
                 self.received_path.extend(latest.received_path_final[-PATH_HISTORY:])
                 self.calculated_path.extend(latest.calculated_path_final[-PATH_HISTORY:])
+                self.received_path_cursor = len(self.received_path)
+                self.calculated_path_cursor = len(self.calculated_path)
         return removed
 
     def clear_analysis(self) -> None:
@@ -2151,7 +2335,10 @@ class AnalysisPipeline:
         self.estimator.reset_position()
         self.received_path.clear()
         self.calculated_path.clear()
+        self.received_path_cursor = 0
+        self.calculated_path_cursor = 0
         self.completed_movements.clear()
+        self.archived_movement_ids.clear()
         self.current_movement = None
         self.next_movement_id = 1
         self.ignored_short_movement_count = 0
@@ -2216,6 +2403,8 @@ class AnalysisPipeline:
     def movement_detail(self, movement_id: int) -> dict[str, Any] | None:
         for movement in self.completed_movements:
             if movement.movement_id == movement_id:
+                if movement.high_frequency_released:
+                    return None
                 detail = movement.detail_snapshot()
                 detail["session_tremor_average"] = self.session_tremor_average()
                 detail["analysis_mode"] = self.mode
@@ -2226,6 +2415,8 @@ class AnalysisPipeline:
     def movement_export(self, movement_id: int, export_format: str) -> str | None:
         for movement in self.completed_movements:
             if movement.movement_id == movement_id:
+                if movement.high_frequency_released:
+                    return None
                 session = self.session_tremor_average()
                 if export_format == "csv":
                     return movement.export_csv(session)
@@ -2236,6 +2427,10 @@ class AnalysisPipeline:
 
     def finalization_snapshot(self) -> dict[str, Any]:
         pending_ids = sorted(self.pending_finalization_ids)
+        cached = [
+            movement for movement in self.completed_movements
+            if not movement.high_frequency_released
+        ]
         return {
             "pending_count": len(pending_ids),
             "pending_movement_ids": pending_ids,
@@ -2245,9 +2440,39 @@ class AnalysisPipeline:
             "last_error": self.last_finalization_error,
             "last_elapsed_seconds": self.last_finalization_seconds,
             "execution": "background_worker",
+            "detail_cache_count": len(cached),
+            "detail_cache_samples": sum(len(item.sample_records) for item in cached),
+            "detail_cache_limit": RECENT_MOVEMENT_DETAIL_LIMIT,
+            "detail_cache_sample_budget": RECENT_MOVEMENT_DETAIL_SAMPLE_BUDGET,
         }
 
-    def live_snapshot(self) -> dict[str, Any]:
+    @staticmethod
+    def _path_delta(
+        path: deque,
+        cursor: int,
+        after: int | None,
+        reset: bool,
+    ) -> dict[str, Any]:
+        points = list(path)
+        window_start = max(0, cursor - len(points))
+        requested = window_start if reset or after is None else max(0, int(after))
+        truncated = requested < window_start or requested > cursor
+        if truncated:
+            requested = window_start
+        start = max(requested, window_start) - window_start
+        return {
+            "points": points[start:],
+            "cursor": cursor,
+            "truncated": truncated,
+        }
+
+    def live_snapshot(
+        self,
+        trajectory_revision: int | None = None,
+        received_after: int | None = None,
+        calculated_after: int | None = None,
+    ) -> dict[str, Any]:
+        reset = trajectory_revision != self.trajectory_revision
         return {
             "motion_state": self.motion_state,
             "movement_active": self.current_movement is not None,
@@ -2274,6 +2499,21 @@ class AnalysisPipeline:
                 if self.received_path
                 else [0.0, 0.0, 0.0]
             ),
+            "trajectory_delta": {
+                "reset": reset,
+                "received": self._path_delta(
+                    self.received_path,
+                    self.received_path_cursor,
+                    received_after,
+                    reset,
+                ),
+                "calculated": self._path_delta(
+                    self.calculated_path,
+                    self.calculated_path_cursor,
+                    calculated_after,
+                    reset,
+                ),
+            },
             "position_semantics": {
                 "default_display": "relative_shape",
                 "pc_metric_reliable": False,
@@ -2701,7 +2941,12 @@ class DeviceState:
             "motion_state": active.motion_state,
         }
 
-    def live_snapshot(self) -> dict[str, Any]:
+    def live_snapshot(
+        self,
+        trajectory_revision: int | None = None,
+        received_after: int | None = None,
+        calculated_after: int | None = None,
+    ) -> dict[str, Any]:
         age = time.time() - self.last_seen if self.last_seen else None
         active = self.analyses[self.analysis_mode]
         latest_accel = (
@@ -2742,7 +2987,11 @@ class DeviceState:
                 if self.gyro_history
                 else None
             ),
-            **active.live_snapshot(),
+            **active.live_snapshot(
+                trajectory_revision,
+                received_after,
+                calculated_after,
+            ),
         }
 
 
@@ -2764,11 +3013,22 @@ class DeviceState:
             movement_id, export_format
         )
 
+    def mark_movement_archived(self, movement_id: int, mode: str) -> int:
+        if mode not in ANALYSIS_MODES:
+            raise ValueError("未知分析模式")
+        return self.analyses[mode].mark_movement_archived(movement_id)
+
+    def set_task_collection_active(self, active: bool) -> int:
+        return sum(
+            analysis.set_task_collection_active(active)
+            for analysis in self.analyses.values()
+        )
+
 
 class MotionStore:
     def __init__(
         self,
-        device_count: int = 12,
+        device_count: int = 10,
         default_analysis_mode: str = ANALYSIS_MODE_DEVICE,
         minimum_movement_seconds: float = DEFAULT_MINIMUM_MOVEMENT_SECONDS,
         settings_path: str | Path | None = None,
@@ -2976,10 +3236,13 @@ class MotionStore:
             raise ValueError(f"积木/nRF 映射配置无效：{exc}") from exc
         expected_ids = set(self._devices)
         if set(mapping) != expected_ids or len(devices) != len(expected_ids):
-            raise ValueError("积木/nRF 映射必须完整包含 device_id 1～12")
+            raise ValueError(
+                f"积木/nRF 映射必须完整包含 device_id 1～{len(expected_ids)}"
+            )
         allowed_blocks = {chr(ord("A") + index) for index in range(len(expected_ids))}
         if set(mapping.values()) != allowed_blocks:
-            raise ValueError("积木编号必须完整且唯一地使用 A～L")
+            last_block = chr(ord("A") + len(expected_ids) - 1)
+            raise ValueError(f"积木编号必须完整且唯一地使用 A～{last_block}")
 
         with self._lock:
             self._drain_finalizations_locked()
@@ -3146,8 +3409,41 @@ class MotionStore:
                 return None
             return state.movement_export(movement_id, export_format, mode)
 
-    def live_snapshot(self, device_id: int) -> dict[str, Any]:
+    def mark_movement_archived(
+        self,
+        device_id: int,
+        movement_id: int,
+        mode: str,
+    ) -> int:
+        """Release older detail only after TaskService confirms persistence."""
+        with self._lock:
+            self._drain_finalizations_locked()
+            state = self._devices.get(int(device_id))
+            if state is None:
+                return 0
+            return state.mark_movement_archived(int(movement_id), str(mode))
+
+    def set_task_collection_active(self, active: bool) -> int:
+        """Switch every pipeline between task-safe and rolling-cache modes."""
+        with self._lock:
+            self._drain_finalizations_locked()
+            return sum(
+                state.set_task_collection_active(active)
+                for state in self._devices.values()
+            )
+
+    def live_snapshot(
+        self,
+        device_id: int,
+        trajectory_revision: int | None = None,
+        received_after: int | None = None,
+        calculated_after: int | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             self._drain_finalizations_locked()
             selected = self._devices.get(device_id, self._devices[1])
-            return selected.live_snapshot()
+            return selected.live_snapshot(
+                trajectory_revision,
+                received_after,
+                calculated_after,
+            )

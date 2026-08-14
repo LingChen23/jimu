@@ -21,14 +21,14 @@
  * An unassigned slot has an all-zero address and is explicitly disabled.
  * It cannot match an advertisement until its real address is configured.
  */
-#define DISABLED_TARGET(device_id_)                  \
+#define DISABLED_TARGET                              \
     {                                                \
         .enabled = false,                            \
         .addr = {                                    \
             .type = BLE_ADDR_RANDOM,                 \
             .val = {0, 0, 0, 0, 0, 0},              \
         },                                           \
-        .expected_device_id = (device_id_),          \
+        .expected_device_id = 0U,                    \
     }
 
 #if defined(CONFIG_SMARTBLOCK_GATEWAY_PROFILE_A)
@@ -57,7 +57,7 @@ static const gateway_profile_t PROFILE = {
         RANDOM_TARGET(5U, 0xde, 0x7a, 0xa0, 0xa1, 0x06, 0x5c),
         RANDOM_TARGET(6U, 0xfc, 0xd9, 0x6a, 0xdf, 0xb3, 0xe4),
         RANDOM_TARGET(7U, 0xe1, 0x69, 0x9e, 0x5a, 0x1d, 0xb3),
-        RANDOM_TARGET(8U, 0xc1, 0x2f, 0x3f, 0x19, 0xfb, 0x92),
+        DISABLED_TARGET,
     },
 };
 
@@ -69,10 +69,10 @@ static const gateway_profile_t PROFILE = {
     .preferred_conn_interval_units = 28U, /* 35 ms */
     .ble_startup_delay_ms = 3000U,
     .targets = {
+        RANDOM_TARGET(8U, 0xc1, 0x2f, 0x3f, 0x19, 0xfb, 0x92),
         RANDOM_TARGET(9U, 0xfc, 0xb0, 0x29, 0x81, 0x12, 0x1e),
         RANDOM_TARGET(10U, 0xc1, 0x58, 0x2f, 0xb8, 0xbb, 0xa5),
-        RANDOM_TARGET(11U, 0xd8, 0x92, 0x8d, 0xb8, 0x89, 0x1c),
-        RANDOM_TARGET(12U, 0xe4, 0xdf, 0xa9, 0x0b, 0xf9, 0x6e),
+        DISABLED_TARGET,
     },
 };
 
@@ -113,6 +113,11 @@ uint8_t gateway_profile_enabled_target_count(
 
 bool gateway_profile_validate(const gateway_profile_t *profile)
 {
+    static const uint8_t EXPECTED_DEVICE_IDS[][GATEWAY_PROFILE_TARGET_COUNT] = {
+        {1U, 2U, 3U, 4U},
+        {5U, 6U, 7U, 0U},
+        {8U, 9U, 10U, 0U},
+    };
     static const uint16_t EXPECTED_INTERVAL_UNITS[] = {
         25U, /* A: 31.25 ms */
         26U, /* B: 32.5 ms */
@@ -142,22 +147,21 @@ bool gateway_profile_validate(const gateway_profile_t *profile)
     for (first = 0U; first < GATEWAY_PROFILE_TARGET_COUNT; first++) {
         const gateway_target_t *target = &profile->targets[first];
         uint8_t expected_device_id =
-            (uint8_t)(profile->gateway_id *
-                          GATEWAY_PROFILE_TARGET_COUNT +
-                      first + 1U);
+            EXPECTED_DEVICE_IDS[profile->gateway_id][first];
 
         if (target->expected_device_id != expected_device_id) {
             return false;
         }
 
         if (!target->enabled) {
-            if (!address_is_zero(&target->addr)) {
+            if (expected_device_id != 0U ||
+                !address_is_zero(&target->addr)) {
                 return false;
             }
             continue;
         }
 
-        if (address_is_zero(&target->addr) ||
+        if (expected_device_id == 0U || address_is_zero(&target->addr) ||
             (target->addr.type != BLE_ADDR_PUBLIC &&
              target->addr.type != BLE_ADDR_RANDOM)) {
             return false;

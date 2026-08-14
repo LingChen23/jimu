@@ -1,34 +1,82 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import ResultFeatureSummary from '@/pages/results/components/ResultFeatureSummary.vue'
+import MotionStatisticsSummary from '@/shared/components/MotionStatisticsSummary.vue'
+import type { MovementDetail } from '@/types/motion'
 import type { TaskSummary } from '@/types/task'
-import { getScoreView } from '../realtime.view-model'
+import { aggregateTaskMovements } from '../task-result-aggregate'
 
 const props = defineProps<{
   currentTask: TaskSummary | null
-  motionLabel: string
+  completedTask: TaskSummary | null
+  movementDetails: MovementDetail[]
+  resultLoading: boolean
 }>()
 
-const score = computed(() => getScoreView(props.currentTask))
+const result = computed(() => props.completedTask)
+const movements = computed(() => result.value?.movementReferences ?? [])
+const aggregate = computed(() => aggregateTaskMovements(props.movementDetails))
+const totalMovementSeconds = computed(() => movements.value.reduce(
+  (sum, item) => sum + (item.durationSeconds ?? 0),
+  0,
+))
+const movedBlockCount = computed(() => new Set(movements.value.map((item) => item.deviceId)).size)
+
+function formatSeconds(value: number): string {
+  return `${value.toFixed(1)} 秒`
+}
 </script>
 
 <template>
-  <section class="card realtime-score-panel">
-    <div class="realtime-score-head">
-      <div class="card-title">评分</div>
-    </div>
+  <div class="collection-result-stack">
+    <section class="card collection-result-panel">
+      <div class="section-head">
+        <div>
+          <div class="card-title">采集结果</div>
+          <div class="card-subtitle">任务结束后生成本次采集的总评分和全部完整移动汇总</div>
+        </div>
+      </div>
 
-    <div class="realtime-score-status">
-      <span>预估评分</span>
-      <div v-if="score.demoScore !== null" class="realtime-score-value"><strong>{{ score.demoScore }}</strong><small>分</small></div>
-      <strong v-else class="realtime-score-empty">{{ score.title }}</strong>
-    </div>
+      <div v-if="currentTask" class="collection-result-pending">
+        <strong>正在采集</strong>
+        <span>结束采集后显示评分和详细数据结果</span>
+      </div>
 
-    <div class="realtime-score-summary">
-      <div><span>运动状态</span><b>{{ motionLabel }}</b></div>
-    </div>
-  </section>
+      <template v-else-if="result">
+        <div class="result-overview">
+          <article class="score-card">
+            <span>本次采集评分</span>
+            <div v-if="result.totalScore !== null"><strong>{{ result.totalScore }}</strong><small>分</small></div>
+            <b v-else>暂无评分</b>
+          </article>
+          <article><span>完整移动</span><b>{{ movements.length }} 次</b></article>
+          <article><span>移动积木</span><b>{{ movedBlockCount }} 块</b></article>
+          <article><span>累计移动时长</span><b>{{ formatSeconds(totalMovementSeconds) }}</b></article>
+          <article><span>任务持续时长</span><b>{{ result.durationSeconds ?? 0 }} 秒</b></article>
+        </div>
+        <div v-if="resultLoading" class="result-loading-note">正在加载全部移动的详细结果…</div>
+        <div v-if="movements.length && movementDetails.length < movements.length" class="partial-result-note">
+          已加载 {{ movementDetails.length }} / {{ movements.length }} 次完整移动的详细数据。
+        </div>
+        <div v-else-if="!movements.length" class="no-movement-result">本次采集未记录到完整移动，因此不生成评分。</div>
+      </template>
+    </section>
+
+    <template v-if="result && movements.length">
+      <ResultFeatureSummary
+        :statistics="aggregate.statistics"
+        :speed="aggregate.speed"
+        :tremor="aggregate.tremor"
+      />
+      <MotionStatisticsSummary
+        v-if="aggregate.statistics"
+        class="collection-motion-statistics"
+        :statistics="aggregate.statistics"
+      />
+    </template>
+  </div>
 </template>
 
 <style scoped>
-.realtime-score-panel{width:100%;padding:18px;display:flex;min-height:100%;flex-direction:column}.realtime-score-head{display:flex;align-items:center;justify-content:space-between;gap:10px}.realtime-score-status{display:flex;min-height:clamp(210px,22vw,260px);flex:1 1 auto;flex-direction:column;justify-content:center;margin:10px 0 12px;padding:14px 16px;border:1px solid #e8ddff;border-radius:14px;background:linear-gradient(135deg,#fbf9ff,#f2ecff)}.realtime-score-status>span,.realtime-score-summary span{color:#7b879a;font-size:11px}.realtime-score-value{display:flex;align-items:baseline;gap:6px;margin-top:4px}.realtime-score-value strong{color:#6438c5;font-size:72px;line-height:1;font-variant-numeric:tabular-nums}.realtime-score-value small{color:#7e62bd;font-size:22px;font-weight:800}.realtime-score-empty{margin-top:8px;color:#6438c5;font-size:31px;letter-spacing:.02em}.realtime-score-status p{margin:13px 0 0;color:#625b71;font-size:12px;line-height:1.6}.realtime-score-summary{display:grid;gap:8px}.realtime-score-summary>div{min-width:0;padding:10px 11px;border-radius:9px;background:#f8fafc}.realtime-score-summary b{display:block;margin-top:4px;color:#354259;font-size:13px;line-height:1.5;overflow-wrap:anywhere}@media(max-width:760px){.realtime-score-head{align-items:flex-start;flex-direction:column}}
+.collection-result-stack{display:grid;gap:12px}.collection-result-panel{padding:18px}.collection-result-pending{min-height:130px;margin-top:12px;border:1px dashed #d5dfeb;border-radius:12px;background:#f8fafc;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:7px;color:#7b879a}.collection-result-pending strong{color:#354259;font-size:20px}.result-overview{display:grid;grid-template-columns:1.25fr repeat(4,minmax(0,1fr));gap:10px;margin-top:14px}.result-overview article{min-height:88px;padding:14px;border:1px solid #e3eaf3;border-radius:11px;background:#f8fafc;display:flex;justify-content:center;flex-direction:column}.result-overview span{color:#7b879a;font-size:11px}.result-overview b{margin-top:7px;color:#1d2b42;font-size:20px}.score-card{background:linear-gradient(135deg,#fbf9ff,#f2ecff)!important;border-color:#e8ddff!important}.score-card>div{display:flex;align-items:baseline;gap:5px}.score-card strong{color:#6438c5;font-size:42px;line-height:1}.score-card small{color:#7e62bd;font-weight:800}.result-loading-note,.partial-result-note,.no-movement-result{margin-top:12px;padding:10px 12px;border-radius:9px;background:#f8fafc;color:#7b879a;font-size:11px;text-align:center}.result-loading-note{background:#eef6ff;color:#1769e8}.collection-motion-statistics{padding:16px;border-radius:14px;background:#fff;box-shadow:var(--shadow)}@media(max-width:1000px){.result-overview{grid-template-columns:repeat(2,1fr)}.score-card{grid-column:span 2}}@media(max-width:650px){.result-overview{grid-template-columns:1fr}.score-card{grid-column:auto}}
 </style>

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import StatusBadge from '@/shared/components/StatusBadge.vue'
 import type { DeviceSnapshot } from '@/types/device'
+import { counterButtonState } from '../device-operation-state'
 import {
   batteryLevelText,
   batteryLevelTone,
@@ -21,7 +22,7 @@ const props = defineProps<{
   device: DeviceSnapshot
   loading: boolean
   serialOpen: boolean
-  commandBusy: boolean
+  counterResetBusy: boolean
 }>()
 const emit = defineEmits<{ refresh: []; openRealtime: [device: DeviceSnapshot]; clearCounters: [] }>()
 const tested = () => props.device.integrationStatus === 'tested'
@@ -71,8 +72,8 @@ const tested = () => props.device.integrationStatus === 'tested'
     <section class="detail-section">
       <div class="detail-section-head">
         <div class="detail-section-title">数据与错误计数</div>
-        <button class="btn secondary clear-counters-button" :disabled="!tested() || !serialOpen || commandBusy" @click="emit('clearCounters')">
-          {{ commandBusy ? '处理中…' : '清零' }}
+        <button type="button" class="btn secondary clear-counters-button" :disabled="counterButtonState(tested(), serialOpen, counterResetBusy).disabled" @click.stop="emit('clearCounters')">
+          {{ counterButtonState(tested(), serialOpen, counterResetBusy).label }}
         </button>
       </div>
       <div class="detail-grid">

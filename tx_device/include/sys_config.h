@@ -32,10 +32,10 @@
  */
 #if (TX_DEVICE_ID <= 4U)
 #define SMARTBLOCK_CONN_INTERVAL_UNITS  25U                                         /**< Gateway A: 31.25 ms; avoids a 60 ms packet-cadence lockstep. */
-#elif (TX_DEVICE_ID <= 8U)
+#elif (TX_DEVICE_ID <= 7U)
 #define SMARTBLOCK_CONN_INTERVAL_UNITS  26U                                         /**< Gateway B: 32.5 ms. */
 #else
-#define SMARTBLOCK_CONN_INTERVAL_UNITS  28U                                         /**< Gateway C: 35 ms. */
+#define SMARTBLOCK_CONN_INTERVAL_UNITS  28U                                         /**< Gateway C (devices 8..12): 35 ms. */
 #endif
 
 #define MIN_CONN_INTERVAL               SMARTBLOCK_CONN_INTERVAL_UNITS
@@ -66,6 +66,13 @@
 #define SYS_CONFIG_FLASH_ADDR           (NRF_FICR->CODEPAGESIZE * SYS_CONFIG_PAGE)
 #define CONFIG_VALID_MAGIC              0XABBA
 
-#define FW_VER                          "V0.2.2"
+#define FW_VER_MAJOR                    0
+#define FW_VER_MINOR                    2
+#define FW_VER_PATCH                    3
+#define FW_VER_STRINGIFY_INNER(value)   #value
+#define FW_VER_STRINGIFY(value)         FW_VER_STRINGIFY_INNER(value)
+#define FW_VER                          "V" FW_VER_STRINGIFY(FW_VER_MAJOR) "." \
+                                        FW_VER_STRINGIFY(FW_VER_MINOR) "." \
+                                        FW_VER_STRINGIFY(FW_VER_PATCH)
 
 #endif

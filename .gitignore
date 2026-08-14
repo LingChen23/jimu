@@ -46,7 +46,6 @@ __pycache__/
 # Vue frontend generated files
 vue_frontend/node_modules/
 vue_frontend/dist/
-vue_frontend/.smoke-dist/
 vue_frontend/*.tsbuildinfo
 vue_frontend/.env
 vue_frontend/.env.*

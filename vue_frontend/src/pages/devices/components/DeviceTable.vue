@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import StatusBadge from '@/shared/components/StatusBadge.vue'
 import type { DeviceSnapshot } from '@/types/device'
+import { batteryButtonState } from '../device-operation-state'
 import {
   batteryLevelText,
   batteryLevelTone,
@@ -18,7 +19,6 @@ defineProps<{
   selectedId: number | null
   serialOpen: boolean
   batteryRefreshing: boolean
-  commandBusy: boolean
 }>()
 const emit = defineEmits<{
   select: [device: DeviceSnapshot]
@@ -33,8 +33,8 @@ const emit = defineEmits<{
       <div><div class="card-title">积木与硬件设备列表</div><div class="card-subtitle">选择积木查看设备详情</div></div>
       <div class="table-head-actions">
         <StatusBadge tone="blue" :text="`${devices.length} / ${total} 块`" />
-        <button class="btn primary battery-button" :disabled="!serialOpen || batteryRefreshing || commandBusy" @click="emit('refreshBatteries')">
-          {{ batteryRefreshing ? '正在逐台获取…' : '一键获取电池电压' }}
+        <button type="button" class="btn primary battery-button" :disabled="batteryButtonState(serialOpen, batteryRefreshing).disabled" @click.stop="emit('refreshBatteries')">
+          {{ batteryButtonState(serialOpen, batteryRefreshing).label }}
         </button>
       </div>
     </div>

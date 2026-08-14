@@ -12,6 +12,18 @@ from serial_service import SerialService
 
 
 class BatteryRefreshTests(unittest.TestCase):
+    def test_default_scan_targets_ten_devices(self) -> None:
+        service = SerialService(None)  # type: ignore[arg-type]
+        calls: list[int] = []
+        service._command_locked = lambda device_id, *_: (  # type: ignore[method-assign]
+            calls.append(device_id)
+            or {"ok": True, "message": "成功", "data": {"battery_mV": 4000}}
+        )
+
+        service.refresh_batteries(timeout_seconds=0.1, interval_seconds=0)
+
+        self.assertEqual(calls, list(range(1, 11)))
+
     def test_queries_devices_in_order_and_skips_failures(self) -> None:
         service = SerialService(None)  # type: ignore[arg-type]
         calls: list[tuple[int, str, float]] = []

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 import { RouterLink, RouterView, useRoute } from 'vue-router'
+import { isPresentationRoute, isWorkspaceRoute } from './app-layout-route'
 
 const route = useRoute()
 const sidebarCollapsed = ref(localStorage.getItem('sidebar-collapsed') === 'true')
@@ -14,8 +15,8 @@ watch(sidebarCollapsed, (collapsed) => {
   <div
     class="app-shell"
     :class="{
-      'app-shell--presentation': route.path === '/realtime',
-      'app-shell--workspace': route.path === '/history' || route.path === '/devices',
+      'app-shell--presentation': isPresentationRoute(route.path),
+      'app-shell--workspace': isWorkspaceRoute(route.path),
       'app-shell--sidebar-collapsed': sidebarCollapsed,
     }"
   >

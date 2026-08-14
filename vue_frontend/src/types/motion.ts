@@ -97,6 +97,7 @@ export interface OrientationSnapshot {
 
 export interface TrajectoryPoint extends Vector3 {
   timestamp: number
+  speedMps?: number
 }
 
 export type DeviceTrajectory = {
@@ -191,6 +192,11 @@ export interface RealtimeMotionData {
   latestGyroscope: Vector3 | null
   orientation: OrientationSnapshot
   trajectoryRevision?: number
+  trajectoryReset?: boolean
+  deviceTrajectoryCursor?: number
+  pcTrajectoryCursor?: number
+  deviceTrajectoryTruncated?: boolean
+  pcTrajectoryTruncated?: boolean
   movementId?: number | null
   trajectories: {
     device: DeviceTrajectory

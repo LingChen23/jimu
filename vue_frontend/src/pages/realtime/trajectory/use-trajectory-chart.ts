@@ -6,11 +6,11 @@ import {
   onMounted,
   ref,
   watch,
+  type ComponentPublicInstance,
   type ComputedRef,
   type Ref,
 } from 'vue'
 import type {
-  TrajectoryDisplayMode,
   TrajectoryProjectionView,
   TrajectoryVector,
   TrajectoryView,
@@ -18,14 +18,15 @@ import type {
 import {
   buildProjectionOption,
   buildThreeDimensionalOption,
+  type TrajectoryMarker,
 } from './trajectory-chart-options'
 
 interface UseTrajectoryChartInput {
   points: ComputedRef<TrajectoryVector[]>
-  displayMode: Ref<TrajectoryDisplayMode>
   selectedView: Ref<TrajectoryView>
-  displayUnit: ComputedRef<string>
   hasTrajectory: ComputedRef<boolean>
+  speeds?: ComputedRef<number[]>
+  markers?: ComputedRef<TrajectoryMarker[]>
 }
 
 function trajectorySignature(points: TrajectoryVector[]): string {
@@ -37,6 +38,12 @@ function trajectorySignature(points: TrajectoryVector[]): string {
     }
   }
   return `${points.length}:${hash >>> 0}`
+}
+
+function analysisSignature(speeds: number[], markers: TrajectoryMarker[]): string {
+  const speedKey = speeds.map((value) => Math.round(value * 10_000)).join(',')
+  const markerKey = markers.map((marker) => `${marker.title}:${marker.point.map((value) => Math.round(value * 100_000)).join(',')}`).join('|')
+  return `${speedKey};${markerKey}`
 }
 
 function detectWebGL(): boolean {
@@ -58,6 +65,10 @@ export function useTrajectoryChart(input: UseTrajectoryChartInput) {
   let scheduledFrame: number | null = null
   let lastConfigurationKey: string | null = null
   let lastRenderSignature: string | null = null
+
+  function setChartElement(element: Element | ComponentPublicInstance | null): void {
+    chartElement.value = element instanceof HTMLDivElement ? element : null
+  }
 
   function disposeChart(): void {
     chart?.dispose()
@@ -81,17 +92,18 @@ export function useTrajectoryChart(input: UseTrajectoryChartInput) {
       renderError.value = null
       const isNewChart = chart === null
       chart ??= echarts.init(element)
-      const configurationKey = `${input.selectedView.value}:${input.displayMode.value}`
+      const configurationKey = input.selectedView.value
       const configurationChanged = lastConfigurationKey !== configurationKey
       const sizeKey = input.selectedView.value === 'iso'
         ? ''
         : `:${element.clientWidth}x${element.clientHeight}`
-      const renderSignature = `${configurationKey}:${trajectorySignature(input.points.value)}${sizeKey}`
+      const renderSignature = `${configurationKey}:${trajectorySignature(input.points.value)}:${analysisSignature(input.speeds?.value ?? [], input.markers?.value ?? [])}${sizeKey}`
       if (!isNewChart && !configurationChanged && lastRenderSignature === renderSignature) return
       const common = {
         points: input.points.value,
-        unit: input.displayUnit.value,
-        displayMode: input.displayMode.value,
+        unit: '无量纲',
+        speeds: input.speeds?.value ?? [],
+        markers: input.markers?.value ?? [],
       }
       const option = input.selectedView.value === 'iso'
         ? buildThreeDimensionalOption(common)
@@ -129,11 +141,11 @@ export function useTrajectoryChart(input: UseTrajectoryChartInput) {
   watch(
     () => [
       input.points.value,
-      input.displayMode.value,
+      input.speeds?.value,
+      input.markers?.value,
       input.selectedView.value,
     ],
     scheduleRender,
-    { deep: true },
   )
   watch(chartElement, (element, previous) => {
     if (previous) resizeObserver?.unobserve(previous)
@@ -159,5 +171,5 @@ export function useTrajectoryChart(input: UseTrajectoryChartInput) {
     disposeChart()
   })
 
-  return { chartElement, renderError, webglAvailable }
+  return { setChartElement, renderError, webglAvailable }
 }

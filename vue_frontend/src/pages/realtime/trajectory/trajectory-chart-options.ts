@@ -1,13 +1,19 @@
 import {
-  metricBoxDimensions,
   projectTrajectory,
   trajectoryProjection,
   trajectoryProjectionBounds,
-  type TrajectoryDisplayMode,
   type TrajectoryPoint2D,
   type TrajectoryProjectionView,
   type TrajectoryVector,
 } from '@/utils/trajectory'
+
+export interface TrajectoryMarker {
+  point: TrajectoryVector
+  title: string
+  description: string
+  color: string
+  speedMps?: number
+}
 
 export interface TrajectoryChartOption {
   animation: boolean
@@ -19,7 +25,8 @@ export interface TrajectoryChartOption {
 interface ThreeDimensionalOptionInput {
   points: TrajectoryVector[]
   unit: string
-  displayMode: TrajectoryDisplayMode
+  speeds?: number[]
+  markers?: TrajectoryMarker[]
 }
 
 interface ProjectionOptionInput extends ThreeDimensionalOptionInput {
@@ -54,15 +61,26 @@ function endpointSeries3D(points: TrajectoryVector[], name: string, color: strin
   }
 }
 
-function lineSeries3D(points: TrajectoryVector[], name: string, color: string) {
+function lineSeries3D(points: TrajectoryVector[], name: string, color: string, speeds: number[] = []) {
   if (!points.length) return null
   return {
     id: 'pc-trajectory-line',
     name,
     type: 'line3D',
     coordinateSystem: 'cartesian3D',
-    data: points,
+    data: points.map((point, index) => speeds.length ? [...point, speeds[index] ?? 0] : point),
     lineStyle: { color, width: 5, opacity: 0.96 },
+  }
+}
+
+function markerSeries3D(markers: TrajectoryMarker[]) {
+  if (!markers.length) return null
+  return {
+    id: 'pc-trajectory-analysis-markers', name: '轨迹事件', type: 'scatter3D', coordinateSystem: 'cartesian3D',
+    data: markers.map((marker) => ({ name: marker.title, value: [...marker.point, marker.speedMps ?? 0], description: marker.description, itemStyle: { color: marker.color } })),
+    symbolSize: 11,
+    label: { show: true, formatter: '{b}', color: '#24324a', fontSize: 10, distance: 5 },
+    emphasis: { disabled: true },
   }
 }
 
@@ -100,19 +118,49 @@ function endpointSeries2D(
   }
 }
 
-function lineSeries2D(points: TrajectoryPoint2D[], name: string, color: string) {
+function lineSeries2D(points: TrajectoryPoint2D[], name: string, color: string, speeds: number[] = []) {
   if (!points.length) return null
   return {
     id: 'pc-trajectory-line',
     name,
     type: 'line',
     coordinateSystem: 'cartesian2d',
-    data: points,
+    data: points.map((point, index) => speeds.length ? [...point, speeds[index] ?? 0] : point),
     showSymbol: false,
     lineStyle: { color, width: 3, opacity: 0.96 },
     itemStyle: { color },
     emphasis: { disabled: true },
     z: 3,
+  }
+}
+
+function markerSeries2D(markers: TrajectoryMarker[], view: TrajectoryProjectionView) {
+  if (!markers.length) return null
+  const projection = trajectoryProjection(view)
+  return {
+    id: 'pc-trajectory-analysis-markers', name: '轨迹事件', type: 'scatter', coordinateSystem: 'cartesian2d',
+    data: markers.map((marker) => ({
+      name: marker.title,
+      value: [marker.point[projection.horizontalIndex], marker.point[projection.verticalIndex], marker.speedMps ?? 0],
+      description: marker.description,
+      itemStyle: { color: marker.color },
+    })),
+    symbolSize: 11,
+    label: { show: true, formatter: '{b}', position: 'top', color: '#24324a', fontSize: 10 },
+    labelLayout: { hideOverlap: true }, emphasis: { disabled: true }, z: 6,
+  }
+}
+
+function speedVisualMap(speeds: number[], dimension: number) {
+  const finite = speeds.filter(Number.isFinite)
+  if (!finite.length) return undefined
+  const minimum = Math.min(...finite)
+  const maximum = Math.max(...finite)
+  return {
+    show: true, type: 'continuous', min: minimum, max: maximum > minimum ? maximum : minimum + 1e-6,
+    dimension, seriesIndex: [0], orient: 'horizontal', right: 18, bottom: 8,
+    itemWidth: 110, itemHeight: 8, text: ['快', '慢'], textGap: 4, calculable: false,
+    inRange: { color: ['#2563eb', '#14b8a6', '#f59e0b', '#dc2626'] },
   }
 }
 
@@ -164,29 +212,29 @@ function axis2D(name: string, unit: string, minimum: number, maximum: number, ve
 }
 
 export function buildThreeDimensionalOption(input: ThreeDimensionalOptionInput): TrajectoryChartOption {
-  const { points, unit, displayMode } = input
-  const dimensions = displayMode === 'metric'
-    ? metricBoxDimensions([points])
-    : { boxWidth: 100, boxHeight: 100, boxDepth: 100 }
+  const { points, unit, speeds = [], markers = [] } = input
   const series = [
-    lineSeries3D(points, 'PC 惯导轨迹', '#1769e8'),
+    lineSeries3D(points, 'PC 惯导轨迹', '#1769e8', speeds),
     endpointSeries3D(points, 'PC 惯导轨迹', '#1769e8'),
+    markerSeries3D(markers),
   ].filter((item) => item !== null)
 
   return {
     animation: false,
     backgroundColor: '#ffffff',
+    visualMap: speedVisualMap(speeds, 3),
     tooltip: {
       show: true,
       confine: true,
-      formatter: (params: { seriesName?: string; value?: number[] }) => {
+      formatter: (params: { seriesName?: string; name?: string; value?: number[]; data?: { description?: string } }) => {
         const value = Array.isArray(params.value) ? params.value : []
-        const suffix = displayMode === 'metric' ? ' m' : ''
+        if (params.data?.description) return `${params.name ?? '轨迹事件'}<br>${params.data.description}`
         return [
           params.seriesName ?? '轨迹点',
-          `X ${Number(value[0] ?? 0).toFixed(4)}${suffix}`,
-          `Y ${Number(value[1] ?? 0).toFixed(4)}${suffix}`,
-          `Z ${Number(value[2] ?? 0).toFixed(4)}${suffix}`,
+          `X ${Number(value[0] ?? 0).toFixed(4)}`,
+          `Y ${Number(value[1] ?? 0).toFixed(4)}`,
+          `Z ${Number(value[2] ?? 0).toFixed(4)}`,
+          ...(speeds.length ? [`速度 ${Number(value[3] ?? 0).toFixed(4)} m/s`] : []),
         ].join('<br>')
       },
     },
@@ -194,7 +242,9 @@ export function buildThreeDimensionalOption(input: ThreeDimensionalOptionInput):
     yAxis3D: axis3D('Y', unit),
     zAxis3D: axis3D('Z', unit),
     grid3D: {
-      ...dimensions,
+      boxWidth: 100,
+      boxHeight: 100,
+      boxDepth: 100,
       top: 28,
       bottom: 10,
       environment: '#ffffff',
@@ -223,7 +273,7 @@ export function buildThreeDimensionalOption(input: ThreeDimensionalOptionInput):
 }
 
 export function buildProjectionOption(input: ProjectionOptionInput): TrajectoryChartOption {
-  const { points, view, unit, displayMode, chartWidth, chartHeight } = input
+  const { points, view, unit, chartWidth, chartHeight, speeds = [], markers = [] } = input
   const projection = trajectoryProjection(view)
   const projectedPoints = projectTrajectory(points, view)
   const plotWidth = Math.max(chartWidth - projectionGrid.left - projectionGrid.right, 1)
@@ -232,26 +282,30 @@ export function buildProjectionOption(input: ProjectionOptionInput): TrajectoryC
     [points],
     view,
     plotWidth / plotHeight,
-    displayMode === 'shape' ? 1 : 0.1,
+    1,
   )
   const series = [
-    lineSeries2D(projectedPoints, 'PC 惯导轨迹', '#1769e8'),
+    lineSeries2D(projectedPoints, 'PC 惯导轨迹', '#1769e8', speeds),
     endpointSeries2D(projectedPoints, 'PC 惯导轨迹', '#1769e8', { start: 'top', current: 'right' }),
+    markerSeries2D(markers, view),
   ].filter((item) => item !== null)
 
   return {
     animation: false,
     backgroundColor: '#ffffff',
+    visualMap: speedVisualMap(speeds, 2),
     tooltip: {
       show: true,
       trigger: 'item',
       confine: true,
-      formatter: (params: { seriesName?: string; value?: number[] }) => {
+      formatter: (params: { seriesName?: string; name?: string; value?: number[]; data?: { description?: string } }) => {
         const value = Array.isArray(params.value) ? params.value : []
+        if (params.data?.description) return `${params.name ?? '轨迹事件'}<br>${params.data.description}`
         return [
           (params.seriesName ?? '轨迹点').replace(/端点$/, ''),
           `${projection.horizontalAxis} ${Number(value[0] ?? 0).toFixed(4)} ${unit}`,
           `${projection.verticalAxis} ${Number(value[1] ?? 0).toFixed(4)} ${unit}`,
+          ...(speeds.length ? [`速度 ${Number(value[2] ?? 0).toFixed(4)} m/s`] : []),
         ].join('<br>')
       },
     },

@@ -25,6 +25,8 @@ const taskTone = computed(() => {
   if (props.taskBindingMismatch) return 'orange'
   return props.currentTask ? 'purple' : 'gray'
 })
+const selectedTaskBlock = computed(() => props.currentTask?.blockBindings
+  ?.find((entry) => entry.deviceId === props.device.deviceId)?.blockId)
 
 function connectionText(): string {
   return tested.value && props.device.connectionStatus !== 'offline' ? '已连接' : '未连接'
@@ -42,7 +44,7 @@ function connectionText(): string {
     </div>
 
     <div v-if="taskBindingMismatch" class="realtime-binding-notice">
-      当前任务的设备编号或积木编号与所选积木不一致，不能结束该采集任务。
+      当前任务中的设备与积木绑定已发生变化，请恢复任务开始时的绑定后再结束任务。
     </div>
 
     <div class="realtime-info-strip" aria-label="当前积木和任务绑定信息">
@@ -50,7 +52,7 @@ function connectionText(): string {
       <div class="realtime-info-item--wide"><span>连接 / 任务</span><div class="realtime-status-pair"><StatusBadge :tone="tested && device.connectionStatus !== 'offline' ? 'green' : 'gray'" :text="connectionText()" /><StatusBadge :tone="taskTone" :text="taskState" /></div></div>
       <div><span>任务编号</span><strong>{{ currentTask?.taskId ?? '—' }}</strong></div>
       <div><span>体验者编号</span><strong>{{ currentTask?.participantId ?? '—' }}</strong></div>
-      <div><span>积木编号</span><strong>{{ currentTask?.blockId ?? device.blockId }}</strong></div>
+      <div><span>积木编号</span><strong>{{ selectedTaskBlock ?? device.blockId }}</strong></div>
     </div>
   </section>
 </template>

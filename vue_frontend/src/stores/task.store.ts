@@ -1,17 +1,17 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { motionDataService } from '@/services/data.service'
-import type { TaskResult, TaskSummary } from '@/types/task'
+import type { ParticipantProfile, TaskResult, TaskSummary } from '@/types/task'
 
 export const useTaskStore = defineStore('task', () => {
   const currentTask = ref<TaskSummary | null>(null)
+  const latestCompletedTask = ref<TaskSummary | null>(null)
   const tasks = ref<TaskSummary[]>([])
   const taskResults = ref<Record<string, TaskResult>>({})
-  const loading = ref(false)
-  const errorMessage = ref<string | null>(null)
+  const participants = ref<ParticipantProfile[]>([])
+  let currentTaskRequest = 0
 
   const completedCount = computed(() => tasks.value.filter((task) => task.status === 'completed').length)
-  const abnormalCount = computed(() => tasks.value.filter((task) => task.status === 'abnormal').length)
   const averageScore = computed(() => {
     const scores = tasks.value
       .map((task) => task.totalScore)
@@ -20,47 +20,59 @@ export const useTaskStore = defineStore('task', () => {
     return scores.reduce((sum, score) => sum + score, 0) / scores.length
   })
 
-  async function run<T>(action: () => Promise<T>): Promise<T> {
-    loading.value = true
-    errorMessage.value = null
-    try {
-      return await action()
-    } catch (error) {
-      errorMessage.value = error instanceof Error ? error.message : String(error)
-      throw error
-    } finally {
-      loading.value = false
-    }
-  }
-
   async function loadCurrentTask(deviceId: number): Promise<void> {
-    currentTask.value = await run(() => motionDataService.getCurrentTask({ deviceId }))
+    const requestId = ++currentTaskRequest
+    const task = await motionDataService.getCurrentTask({ deviceId })
+    if (requestId === currentTaskRequest) currentTask.value = task
   }
 
-  async function startTask(deviceId: number, participantId: string, note: string): Promise<TaskSummary> {
-    const task = await run(() => motionDataService.startTask({ deviceId, participantId, note }))
+  async function startTask(deviceId: number, profile: ParticipantProfile, note: string): Promise<TaskSummary> {
+    currentTaskRequest += 1
+    const task = await motionDataService.startTask({
+      deviceId,
+      participantId: profile.participantId,
+      participantProfile: profile,
+      note,
+    })
     currentTask.value = task
+    latestCompletedTask.value = null
     tasks.value = [task, ...tasks.value.filter((item) => item.taskId !== task.taskId)]
     return task
   }
 
+  async function loadParticipants(): Promise<void> {
+    participants.value = await motionDataService.listParticipants()
+  }
+
   async function finishTask(taskId: string): Promise<TaskSummary> {
-    const task = await run(() => motionDataService.finishTask({ taskId }))
+    currentTaskRequest += 1
+    const task = await motionDataService.finishTask({ taskId })
     currentTask.value = null
+    latestCompletedTask.value = task
     const index = tasks.value.findIndex((item) => item.taskId === taskId)
     if (index >= 0) tasks.value[index] = task
     else tasks.value.unshift(task)
+    delete taskResults.value[taskId]
     return task
   }
 
   async function loadTasks(): Promise<void> {
-    tasks.value = await run(() => motionDataService.listTasks())
+    tasks.value = await motionDataService.listTasks()
+    if (!latestCompletedTask.value) {
+      latestCompletedTask.value = tasks.value.find((task) => task.status === 'completed') ?? null
+    }
+  }
+
+  async function deleteTask(taskId: string): Promise<void> {
+    await motionDataService.deleteTask({ taskId })
+    tasks.value = tasks.value.filter((task) => task.taskId !== taskId)
+    delete taskResults.value[taskId]
+    if (currentTask.value?.taskId === taskId) currentTask.value = null
+    if (latestCompletedTask.value?.taskId === taskId) latestCompletedTask.value = null
   }
 
   async function loadTaskResult(taskId: string): Promise<TaskResult> {
-    const cached = taskResults.value[taskId]
-    if (cached) return cached
-    const result = await run(() => motionDataService.getTaskResult({ taskId }))
+    const result = await motionDataService.getTaskResult({ taskId })
     taskResults.value[taskId] = result
     return result
   }
@@ -71,17 +83,17 @@ export const useTaskStore = defineStore('task', () => {
 
   return {
     currentTask,
+    latestCompletedTask,
     tasks,
-    taskResults,
-    loading,
-    errorMessage,
+    participants,
     completedCount,
-    abnormalCount,
     averageScore,
     loadCurrentTask,
     startTask,
+    loadParticipants,
     finishTask,
     loadTasks,
+    deleteTask,
     loadTaskResult,
     resultById,
   }

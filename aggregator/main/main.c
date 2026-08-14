@@ -45,10 +45,8 @@
 #define LINK_DIAGNOSTIC_V2_PAYLOAD_SIZE        64U
 
 #define AGGREGATOR_LINK_COUNT                  3U
-#define DEVICES_PER_GATEWAY                    4U
 #define DEVICE_ID_MIN                          1U
-#define DEVICE_ID_MAX                          \
-    (AGGREGATOR_LINK_COUNT * DEVICES_PER_GATEWAY)
+#define DEVICE_ID_MAX                          10U
 #define NO_SOURCE_LINK                         0xffU
 #define HOST_CONTROL_SOURCE                    0xfeU
 
@@ -144,7 +142,7 @@ static link_context_t s_links[AGGREGATOR_LINK_COUNT] = {
         .name = "B",
         .gateway_id = 1U,
         .device_id_min = 5U,
-        .device_id_max = 8U,
+        .device_id_max = 7U,
         .uart_port =
             (uart_port_t)CONFIG_SMARTBLOCK_AGGREGATOR_B_UART_PORT,
         .tx_gpio = CONFIG_SMARTBLOCK_AGGREGATOR_B_TX_GPIO,
@@ -153,8 +151,8 @@ static link_context_t s_links[AGGREGATOR_LINK_COUNT] = {
     {
         .name = "C",
         .gateway_id = 2U,
-        .device_id_min = 9U,
-        .device_id_max = 12U,
+        .device_id_min = 8U,
+        .device_id_max = 10U,
         .uart_port =
             (uart_port_t)CONFIG_SMARTBLOCK_AGGREGATOR_C_UART_PORT,
         .tx_gpio = CONFIG_SMARTBLOCK_AGGREGATOR_C_TX_GPIO,
@@ -364,6 +362,19 @@ static bool device_belongs_to_link(const link_context_t *link,
            device_id <= link->device_id_max;
 }
 
+static bool find_link_for_device(uint8_t device_id, uint8_t *link_index)
+{
+    uint8_t index;
+
+    for (index = 0U; index < AGGREGATOR_LINK_COUNT; index++) {
+        if (device_belongs_to_link(&s_links[index], device_id)) {
+            *link_index = index;
+            return true;
+        }
+    }
+    return false;
+}
+
 static frame_check_result_t validate_gateway_output(
     const link_context_t *link,
     const uint8_t *encoded,
@@ -467,8 +478,7 @@ static frame_check_result_t prepare_pc_command(
         return FRAME_CHECK_FORMAT_ERROR;
     }
 
-    route = (uint8_t)((device_id - 1U) / DEVICES_PER_GATEWAY);
-    if (!device_belongs_to_link(&s_links[route], device_id)) {
+    if (!find_link_for_device(device_id, &route)) {
         return FRAME_CHECK_FORMAT_ERROR;
     }
 

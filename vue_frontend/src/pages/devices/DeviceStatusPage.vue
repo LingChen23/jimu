@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import StatusBadge from '@/shared/components/StatusBadge.vue'
 import { useAppStore } from '@/stores/app'
 import { useMotionStore } from '@/stores/motion.store'
 import type { BlockMapping, DeviceSnapshot } from '@/types/device'
@@ -26,6 +25,7 @@ const serialLoading = ref(false)
 const mappingSaving = ref(false)
 const commandBusy = ref(false)
 const batteryRefreshing = ref(false)
+const counterResetBusy = ref(false)
 let selectionRequest = 0
 let statusPollTimer: number | null = null
 let statusPollRunning = false
@@ -65,7 +65,13 @@ function scheduleStatusPoll(delay: number): void {
 async function pollDeviceStatus(): Promise<void> {
   statusPollTimer = null
   if (!pageActive) return
-  if (statusPollRunning || serialLoading.value) {
+  if (
+    statusPollRunning
+    || serialLoading.value
+    || commandBusy.value
+    || batteryRefreshing.value
+    || counterResetBusy.value
+  ) {
     scheduleStatusPoll(250)
     return
   }
@@ -153,29 +159,35 @@ async function saveMapping(mapping: BlockMapping): Promise<void> {
 }
 
 async function executeCommand(command: DeviceCommand): Promise<void> {
-  if (!selected.value) return
+  if (!selected.value || commandBusy.value || batteryRefreshing.value || counterResetBusy.value) return
   commandBusy.value = true
   const deviceId = selected.value.deviceId
-  await runOperation(async () => {
-    await motionStore.executeCommand(deviceId, command)
-    await Promise.all([motionStore.loadSerial(), selectDevice(motionStore.deviceById(deviceId) ?? selected.value!, true)])
-  }, `设备 ${deviceId} 命令 ${command} 已发送。`)
-  commandBusy.value = false
+  try {
+    await runOperation(async () => {
+      await motionStore.executeCommand(deviceId, command)
+      await Promise.all([motionStore.loadSerial(), selectDevice(motionStore.deviceById(deviceId) ?? selected.value!, true)])
+    }, `设备 ${deviceId} 命令 ${command} 已发送。`)
+  } finally {
+    commandBusy.value = false
+  }
 }
 
 async function resetDataAndErrorCounters(): Promise<void> {
-  if (!selected.value || commandBusy.value || batteryRefreshing.value) return
+  if (!selected.value || counterResetBusy.value || commandBusy.value || batteryRefreshing.value) return
   const deviceId = selected.value.deviceId
-  commandBusy.value = true
-  await runOperation(
-    () => motionStore.resetDataAndErrorCounters(deviceId),
-    `设备 ${deviceId} 的数据与错误计数已全部清零。`,
-  )
-  commandBusy.value = false
+  counterResetBusy.value = true
+  try {
+    await runOperation(
+      () => motionStore.resetDataAndErrorCounters(deviceId),
+      `设备 ${deviceId} 的数据与错误计数已全部清零。`,
+    )
+  } finally {
+    counterResetBusy.value = false
+  }
 }
 
 async function refreshBatteries(): Promise<void> {
-  if (batteryRefreshing.value || commandBusy.value) return
+  if (batteryRefreshing.value || commandBusy.value || counterResetBusy.value) return
   batteryRefreshing.value = true
   clearOperationState()
   try {
@@ -207,12 +219,12 @@ function openRealtime(device: DeviceSnapshot): void {
     <section class="page-heading">
       <div>
         <h1>设备状态</h1>
-        <p>管理 12 块设备、三路聚合器及积木绑定。</p>
+        <p>管理 10 块设备、三路聚合器及积木绑定。</p>
       </div>
     </section>
 
     <section class="summary-grid">
-      <div class="card summary"><span>设备总数</span><b>{{ motionStore.devices.length }}</b><small>设备 1～12</small></div>
+      <div class="card summary"><span>设备总数</span><b>{{ motionStore.devices.length }}</b><small>设备 1～10</small></div>
       <div class="card summary"><span>在线</span><b>{{ motionStore.onlineCount }}</b><small>警告 {{ motionStore.warningCount }} 台</small></div>
       <div class="card summary"><span>离线</span><b>{{ motionStore.offlineCount }}</b><small>以实时数据为准</small></div>
       <div class="card summary"><span>聚合器链路</span><b>{{ activeGatewayCount }} / 3</b><small>{{ motionStore.serialStatus?.isOpen ? '串口已打开' : '串口未打开' }}</small></div>
@@ -236,18 +248,17 @@ function openRealtime(device: DeviceSnapshot): void {
         :selected-id="selectedId"
         :serial-open="motionStore.serialStatus?.isOpen ?? false"
         :battery-refreshing="batteryRefreshing"
-        :command-busy="commandBusy"
         @select="selectDevice"
         @open-realtime="openRealtime"
         @refresh-batteries="refreshBatteries"
       />
       <div v-if="selected" class="device-side-column">
-        <DeviceCommandPanel :device="selected" :serial-open="motionStore.serialStatus?.isOpen ?? false" :busy="commandBusy || batteryRefreshing" :result="selectedCommandResult" @command="executeCommand" />
+        <DeviceCommandPanel :device="selected" :serial-open="motionStore.serialStatus?.isOpen ?? false" :busy="commandBusy" :result="selectedCommandResult" @command="executeCommand" />
         <DeviceDetailPanel
           :device="selected"
           :loading="detailLoading"
           :serial-open="motionStore.serialStatus?.isOpen ?? false"
-          :command-busy="commandBusy || batteryRefreshing"
+          :counter-reset-busy="counterResetBusy"
           @refresh="refreshSelected"
           @open-realtime="openRealtime"
           @clear-counters="resetDataAndErrorCounters"

@@ -5,7 +5,25 @@
 `/api` 代理到本后端的 `8766` 端口。
 
 可修改的积木绑定、运动设置和任务记录保存在 `runtime/`，该目录不会提交到
-Git；首次启动会从 `defaults/` 创建默认配置。
+Git；首次启动会从 `defaults/` 创建默认配置。完成任务时，其关联移动详情及
+CSV/JSON 导出会保存到 `runtime/task_movements/`，所以重启后历史结果仍可查看和
+导出。任务与体验者档案的权威存储为 `runtime/motion_system.sqlite3`；数据库启用
+WAL、外键、忙等待和完整同步，任务、移动引用及体验者档案均在事务中写入。
+`task_records.json` 继续作为便于人工查看的恢复快照。旧版本启动时会自动将 JSON
+任务迁移进 SQLite，并生成 `.migrated` 副本。后端异常退出后，遗留的进行中任务会
+在下次启动时标记为异常中断，不会永久占用设备任务状态。
+
+云服务器部署时必须把数据目录挂载到持久卷，可通过环境变量配置：
+
+```text
+MOTION_DATA_DIR=/data/motion-system
+MOTION_DATABASE_PATH=/data/motion-system/motion_system.sqlite3
+MOTION_MOVEMENT_ARCHIVE_DIR=/data/motion-system/task_movements
+```
+
+单实例部署直接使用 SQLite。需要多个后端实例并发写入时，应将同一数据模型迁移到
+PostgreSQL，并将移动归档切换为共享对象存储；不要让多个容器同时写入同一 SQLite
+文件。
 
 启动：
 
@@ -18,7 +36,7 @@ python app.py --no-browser --host 127.0.0.1 --port 8766
 
 # PC Motion Visualizer（WebGL 真三维、短段过滤、分段历史）
 
-这是 Motion V1/V2 的本地 PC 可视化工具，支持 1～12 号设备，并行运行：
+这是 Motion V1/V2 的本地 PC 可视化工具，支持 1～10 号设备，并行运行：
 
 1. **设备状态驱动**：沿用 TX 的 `coordinate_flags` 分段；
 2. **PC 独立判定（默认）**：设备状态仅作参考，PC 根据当前加速度和角速度独立判断移动开始和结束。
@@ -62,7 +80,7 @@ python app.py --no-browser --host 127.0.0.1 --port 8766
 ## 积木与 nRF 映射
 
 `block_device_mapping.json` 是当前映射的唯一配置源。初始版本为 nRF
-`device_id` 1～12 对应积木 A～L，页面设备条显示为 `nRF编号/积木序号`，每次
+`device_id` 1～10 对应积木 A～J，页面设备条显示为 `nRF编号/积木序号`，每次
 完整移动开始时会固化当时的 `block_id` 和 `mapping_version`。因此以后修改
 映射不会改变已经完成的历史记录和导出文件。
 

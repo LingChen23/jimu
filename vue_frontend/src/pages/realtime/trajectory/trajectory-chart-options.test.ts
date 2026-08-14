@@ -12,30 +12,27 @@ describe('trajectory chart options', () => {
     const option = buildThreeDimensionalOption({
       points: pcPoints,
       unit: '无量纲',
-      displayMode: 'shape',
     })
 
     expect(option.series).toHaveLength(2)
     expect((option.grid3D as { boxWidth: number }).boxWidth).toBe(100)
   })
 
-  it('uses metric dimensions and metric tooltip suffix', () => {
+  it('uses a fixed relative-shape cube', () => {
     const option = buildThreeDimensionalOption({
       points: pcPoints,
-      unit: 'm',
-      displayMode: 'metric',
+      unit: '无量纲',
     })
     const tooltip = option.tooltip as { formatter: (params: { value: number[] }) => string }
 
-    expect((option.grid3D as { boxHeight: number }).boxHeight).toBeGreaterThan(0)
-    expect(tooltip.formatter({ value: [1, 2, 3] })).toContain('1.0000 m')
+    expect((option.grid3D as { boxHeight: number }).boxHeight).toBe(100)
+    expect(tooltip.formatter({ value: [1, 2, 3] })).toContain('1.0000')
   })
 
   it('builds an aspect-aware XY projection', () => {
     const option = buildProjectionOption({
       points: pcPoints,
-      unit: 'm',
-      displayMode: 'metric',
+      unit: '无量纲',
       view: 'xy',
       chartWidth: 900,
       chartHeight: 500,
@@ -44,16 +41,30 @@ describe('trajectory chart options', () => {
     const yAxis = option.yAxis as { name: string; min: number; max: number }
 
     expect(option.series).toHaveLength(2)
-    expect(xAxis.name).toBe('X（m）')
-    expect(yAxis.name).toBe('Y（m）')
+    expect(xAxis.name).toBe('X（无量纲）')
+    expect(yAxis.name).toBe('Y（无量纲）')
     expect(xAxis.max - xAxis.min).toBeGreaterThan(yAxis.max - yAxis.min)
+  })
+
+  it('adds speed coloring and analysis markers for result trajectories', () => {
+    const option = buildProjectionOption({
+      points: pcPoints,
+      speeds: [0.1, 1.2],
+      markers: [{ point: pcPoints[1], title: '掉落', description: '掉落冲击 3.20 g', color: '#dc2626' }],
+      unit: '无量纲',
+      view: 'xy',
+      chartWidth: 900,
+      chartHeight: 500,
+    })
+
+    expect(option.series).toHaveLength(3)
+    expect(option.visualMap).toBeTruthy()
   })
 
   it('returns an empty series list for missing trajectories', () => {
     const option = buildProjectionOption({
       points: [],
       unit: '无量纲',
-      displayMode: 'shape',
       view: 'yz',
       chartWidth: 600,
       chartHeight: 400,

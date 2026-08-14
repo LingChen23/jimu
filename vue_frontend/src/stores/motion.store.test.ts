@@ -20,6 +20,17 @@ describe('live trajectory accumulation', () => {
     expect(stationary.points).toHaveLength(3)
   })
 
+  it('appends every point returned by a live trajectory batch', () => {
+    const initial = trajectory([[0, 0, 0]])
+    const appended = mergeLiveTrajectory(initial, trajectory([
+      [1, 0, 0],
+      [2, 0.5, 0],
+      [3, 1, 0],
+    ]), false)
+
+    expect(appended.points.map((point) => point.x)).toEqual([0, 1, 2, 3])
+  })
+
   it('starts a new path when the backend trajectory revision changes', () => {
     const reset = mergeLiveTrajectory(trajectory([[0, 0, 0], [1, 0, 0]]), trajectory([[5, 1, 0]]), true)
     expect(reset.points).toHaveLength(1)

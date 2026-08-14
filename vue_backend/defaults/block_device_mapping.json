@@ -1,5 +1,5 @@
 {
-  "mapping_version": "vue-default-a-to-l-v1",
+  "mapping_version": "vue-default-a-to-j-v1",
   "status": "default",
   "description": "Vue 后端默认映射；实际绑定由设备状态页面维护并保存到 runtime。",
   "devices": [
@@ -42,14 +42,6 @@
     {
       "device_id": 10,
       "block_id": "J"
-    },
-    {
-      "device_id": 11,
-      "block_id": "K"
-    },
-    {
-      "device_id": 12,
-      "block_id": "L"
     }
   ]
 }

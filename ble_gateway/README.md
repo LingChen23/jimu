@@ -1,15 +1,14 @@
 # ESP32-S3 SmartBlock BLE Gateway
 
 This is one ESP-IDF source project with three compile-time gateway profiles.
-Every ESP32-S3 remains a four-link BLE Central, while the selected profile
-fixes its gateway ID and the four nRF52832 devices that it is allowed to
-connect:
+Every ESP32-S3 retains capacity for four BLE links, while the selected profile
+fixes its gateway ID and the currently enabled nRF52832 targets:
 
 | Profile | Gateway ID | Device IDs | Current address state |
 | --- | ---: | --- | --- |
-| A | 0 | 1-4 | Configured and enabled |
-| B | 1 | 5-8 | Configured and enabled |
-| C | 2 | 9-12 | Configured and enabled |
+| A | 0 | 1-4 | Four enabled targets |
+| B | 1 | 5-7 | Three enabled targets, one disabled slot |
+| C | 2 | 8-10 | Three enabled targets, one disabled slot |
 
 Gateway A currently uses this fixed device-ID/address map:
 
@@ -26,19 +25,17 @@ Gateway B uses:
 device 5: DE:7A:A0:A1:06:5C
 device 6: FC:D9:6A:DF:B3:E4
 device 7: E1:69:9E:5A:1D:B3
-device 8: C1:2F:3F:19:FB:92
 ```
 
 Gateway C uses:
 
 ```text
+device 8:  C1:2F:3F:19:FB:92
 device 9:  FC:B0:29:81:12:1E
 device 10: C1:58:2F:B8:BB:A5
-device 11: D8:92:8D:B8:89:1C
-device 12: E4:DF:A9:0B:F9:6E
 ```
 
-The gateway repeats the connection flow until all four targets are ready:
+The gateway repeats the connection flow until all enabled targets are ready:
 
 ```text
 scan -> connect -> request DLE 251 -> exchange MTU 185 -> discover Motion Service
@@ -96,8 +93,8 @@ The outputs are:
 
 ```text
 build-gateway-a/esp32s3_multi_receiver.bin  (gateway_id 0, devices 1-4)
-build-gateway-b/esp32s3_multi_receiver.bin  (gateway_id 1, devices 5-8)
-build-gateway-c/esp32s3_multi_receiver.bin  (gateway_id 2, devices 9-12)
+build-gateway-b/esp32s3_multi_receiver.bin  (gateway_id 1, devices 5-7)
+build-gateway-c/esp32s3_multi_receiver.bin  (gateway_id 2, devices 8-10)
 ```
 
 Flash the required image by selecting its existing build directory:
@@ -183,8 +180,8 @@ steady interval for each independent radio:
 
 ```text
 gateway A / devices 1..4: 31.25 ms (25 BLE units)
-gateway B / devices 5..8: 32.5 ms (26 BLE units)
-gateway C / devices 9..12:  35 ms (28 BLE units)
+gateway B / devices 5..7: 32.5 ms (26 BLE units)
+gateway C / devices 8..10:  35 ms (28 BLE units)
 ```
 
 Each gateway requests its group interval from the first connection. Matching
@@ -215,7 +212,7 @@ negotiated links: MTU 185, DLE 189 octets, PHY 1M
 
 ## Colocated-radio isolation and reconnect protection
 
-A 12-node isolation test showed that gateway A delivered all four streams with
+The earlier 12-node isolation test showed that gateway A delivered all four streams with
 zero new gaps when gateways B/C stopped their notifications, while the same
 four links overflowed nRF queues when all three colocated gateways streamed.
 The UART, aggregator and PC counters remained at zero. This identifies
@@ -236,7 +233,7 @@ Production gateway builds therefore use two RF isolation controls:
   channel index. Contiguous narrow-band and guarded-block A/B tests moved loss
   to nodes whose assigned bands had poor RF conditions and were rejected.
 
-The `-6 dBm` setting was verified with all 12 nodes streaming.  At `0 dBm`, a
+The `-6 dBm` setting was originally verified with all 12 nodes streaming. At `0 dBm`, a
 60-second baseline lost 13.14% / 22.50% / 9.72% on devices 3 / 9 / 12, with
 the losses matching nRF queue drops while every UART, aggregator and USB error
 counter remained zero.  After changing all three gateways to `-6 dBm`, two
@@ -247,9 +244,10 @@ zero downstream transport errors on devices 1 through 12.
 The production connection periods are 31.25/32.5/35 ms. Every link uses a
 5 ms connection-event cap so a weak node cannot monopolize radio time. Gateway
 A and devices 1..4 use 31.25 ms to avoid phase-locking with Motion V2's 60 ms
-packet cadence; this requires nRF firmware 0.2.2 on devices 1..4. Devices 5..12
-retain their existing 32.5/35 ms behavior under firmware 0.2.1. Motion V2 also
-requires the V1/V2-aware aggregator build.
+packet cadence; this requires nRF firmware 0.2.2 or later on devices 1..4.
+In the current 4+3+3 deployment, device 8 moved to gateway C and therefore uses
+the 35 ms group interval in nRF firmware 0.2.3. Motion V2 also requires the
+V1/V2-aware aggregator build.
 
 BLE startup is offset by profile so gateways powered from the same module do
 not establish all connection anchors at the same instant:

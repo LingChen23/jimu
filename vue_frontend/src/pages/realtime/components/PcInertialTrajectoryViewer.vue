@@ -1,16 +1,19 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import type { PcInertialTrajectory } from '@/types/motion'
+import type { MotionEvent, PcInertialTrajectory } from '@/types/motion'
 import {
   prepareTrajectory,
-  type TrajectoryDisplayMode,
   type TrajectoryView,
 } from '@/utils/trajectory'
 import { useTrajectoryChart } from '../trajectory/use-trajectory-chart'
+import type { TrajectoryMarker } from '../trajectory/trajectory-chart-options'
 
-const props = defineProps<{ trajectory: PcInertialTrajectory }>()
+const props = withDefaults(defineProps<{
+  trajectory: PcInertialTrajectory
+  events?: MotionEvent[]
+  analysis?: boolean
+}>(), { events: () => [], analysis: false })
 
-const displayMode = ref<TrajectoryDisplayMode>('shape')
 const selectedView = ref<TrajectoryView>('iso')
 const viewOptions: Array<{ value: TrajectoryView; label: string }> = [
   { value: 'iso', label: '三维' },
@@ -19,21 +22,54 @@ const viewOptions: Array<{ value: TrajectoryView; label: string }> = [
   { value: 'yz', label: 'YZ' },
 ]
 
-const prepared = computed(() => prepareTrajectory(props.trajectory.points, displayMode.value))
+const prepared = computed(() => prepareTrajectory(props.trajectory.points))
 const points = computed(() => prepared.value.points)
+const speeds = computed(() => props.analysis
+  ? prepared.value.sourceIndexes.map((index) => props.trajectory.points[index]?.speedMps ?? 0)
+  : [])
+const markerColors: Partial<Record<MotionEvent['type'], string>> = {
+  'strong-shake': '#f59e0b', flip: '#8b5cf6', rotation: '#0891b2', pause: '#64748b', drop: '#dc2626',
+}
+const markers = computed<TrajectoryMarker[]>(() => {
+  if (!props.analysis || !props.trajectory.points.length) return []
+  const source = props.trajectory.points
+  const result = props.events.flatMap((event) => {
+    if (event.type === 'moving' || event.type === 'stationary') return []
+    let sourceIndex = 0
+    let difference = Number.POSITIVE_INFINITY
+    source.forEach((point, index) => {
+      const next = Math.abs(point.timestamp - event.timestamp)
+      if (next < difference) { difference = next; sourceIndex = index }
+    })
+    const displayedIndex = prepared.value.sourceIndexes.reduce((best, index, current) => (
+      Math.abs(index - sourceIndex) < Math.abs(prepared.value.sourceIndexes[best] - sourceIndex) ? current : best
+    ), 0)
+    const point = points.value[displayedIndex]
+    return point ? [{
+      point, title: event.title, description: event.description,
+      color: markerColors[event.type] ?? '#475569', speedMps: source[sourceIndex]?.speedMps,
+    }] : []
+  })
+  const maximum = speeds.value.length ? Math.max(...speeds.value) : Number.NaN
+  if (Number.isFinite(maximum)) {
+    const displayedIndex = speeds.value.indexOf(maximum)
+    const point = points.value[displayedIndex]
+    if (point) result.push({ point, title: '最大速度', description: `${maximum.toFixed(4)} m/s`, color: '#dc2626', speedMps: maximum })
+  }
+  return result
+})
 const hasTrajectory = computed(() => points.value.length > 0)
-const displayUnit = computed(() => '无量纲')
 
-const { chartElement, renderError, webglAvailable } = useTrajectoryChart({
+const chart = useTrajectoryChart({
   points,
-  displayMode,
   selectedView,
-  displayUnit,
   hasTrajectory,
+  speeds,
+  markers,
 })
 
 function selectView(view: TrajectoryView): void {
-  renderError.value = null
+  chart.renderError.value = null
   selectedView.value = view
 }
 </script>
@@ -50,9 +86,9 @@ function selectView(view: TrajectoryView): void {
     </div>
 
     <div v-if="!hasTrajectory" class="trajectory-empty"><strong>暂无轨迹数据</strong></div>
-    <div v-else-if="selectedView === 'iso' && !webglAvailable" class="trajectory-empty"><strong>当前浏览器不支持 WebGL</strong></div>
-    <div v-else-if="renderError" class="trajectory-empty"><strong>轨迹渲染失败</strong></div>
-    <div v-else ref="chartElement" class="trajectory-chart" role="img" :aria-label="`轨迹，${selectedView === 'iso' ? '三维' : selectedView.toUpperCase()}视图`"></div>
+    <div v-else-if="selectedView === 'iso' && !chart.webglAvailable.value" class="trajectory-empty"><strong>当前浏览器不支持 WebGL</strong></div>
+    <div v-else-if="chart.renderError.value" class="trajectory-empty"><strong>轨迹渲染失败</strong></div>
+    <div v-else :ref="chart.setChartElement" class="trajectory-chart" role="img" :aria-label="`轨迹，${selectedView === 'iso' ? '三维' : selectedView.toUpperCase()}视图`"></div>
   </section>
 </template>
 

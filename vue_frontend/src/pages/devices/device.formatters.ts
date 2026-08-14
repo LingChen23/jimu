@@ -53,36 +53,10 @@ export function batteryLevelTone(device: DeviceSnapshot): BadgeTone {
   return level === '低' ? 'red' : 'gray'
 }
 
-export function firmwareVersionText(device: DeviceSnapshot): string {
-  return device.health.firmware ? `v${device.health.firmware.version}` : '—'
-}
-
-export function sensorText(device: DeviceSnapshot): string {
-  if (device.integrationStatus !== 'tested') return '—'
-  if (device.health.sensorStatus === 'ok') return '正常'
-  if (device.health.sensorStatus === 'error') return '故障'
-  return '未知'
-}
-
-export function calibrationText(device: DeviceSnapshot): string {
-  const value = device.health.calibrated
-  if (device.integrationStatus !== 'tested' || value === null) return '—'
-  return value ? '已校准' : '未校准'
-}
-
 export function streamingText(device: DeviceSnapshot): string {
   const value = device.health.streaming
   if (device.integrationStatus !== 'tested' || value === null) return '—'
   return value ? '数据流开启' : '数据流停止'
-}
-
-export function uptimeText(device: DeviceSnapshot): string {
-  const total = device.health.uptimeSeconds
-  if (device.integrationStatus !== 'tested' || total === null) return '—'
-  const hours = Math.floor(total / 3600)
-  const minutes = Math.floor((total % 3600) / 60)
-  const seconds = total % 60
-  return `${hours}小时 ${minutes}分 ${seconds}秒`
 }
 
 export function packetCountText(device: DeviceSnapshot): string {
@@ -93,27 +67,7 @@ export function packetLossText(device: DeviceSnapshot): string {
   return device.integrationStatus === 'tested' ? device.lostPacketCount.toLocaleString() : '—'
 }
 
-export function qualityText(device: DeviceSnapshot): string {
-  if (device.integrationStatus !== 'tested') return '—'
-  return ({ good: '良好', normal: '一般', poor: '较差', unknown: '未知' } as const)[device.dataQuality]
-}
-
-export function qualityTone(device: DeviceSnapshot): BadgeTone {
-  if (device.integrationStatus !== 'tested' || device.dataQuality === 'unknown') return 'gray'
-  if (device.dataQuality === 'good') return 'green'
-  return device.dataQuality === 'normal' ? 'orange' : 'red'
-}
-
 export function motionText(device: DeviceSnapshot): string {
   if (device.integrationStatus !== 'tested') return '—'
   return ({ stationary: '静止', moving: '移动中', calibrating: '校准中', unknown: '未知' } as const)[device.motionState]
-}
-
-export function lastDataText(device: DeviceSnapshot): string {
-  if (device.integrationStatus !== 'tested') return '—'
-  return device.lastDataAgoMs === null ? '无数据' : `${device.lastDataAgoMs} ms 前`
-}
-
-export function nullableCount(value: number | null): string {
-  return value === null ? '—' : value.toLocaleString()
 }

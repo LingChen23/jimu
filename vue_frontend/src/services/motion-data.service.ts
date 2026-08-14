@@ -5,7 +5,6 @@ import type {
   MovementDetail,
   MovementExport,
   MovementExportFormat,
-  MovementRecord,
   RealtimeMotionData,
 } from '@/types/motion'
 import type {
@@ -16,10 +15,16 @@ import type {
   SerialPortInfo,
   SerialStatus,
 } from '@/types/serial'
-import type { TaskResult, TaskSummary } from '@/types/task'
+import type { ParticipantProfile, TaskResult, TaskSummary } from '@/types/task'
 
 export interface DeviceRequest {
   deviceId: number
+}
+
+export interface RealtimeDataRequest extends DeviceRequest {
+  trajectoryRevision?: number
+  deviceTrajectoryCursor?: number
+  pcTrajectoryCursor?: number
 }
 
 export interface OpenSerialRequest {
@@ -27,20 +32,14 @@ export interface OpenSerialRequest {
   baudRate: number
 }
 
-export interface SetAnalysisModeRequest extends DeviceRequest {
-  analysisMode: AnalysisMode
-}
-
 export interface DeviceCommandRequest extends DeviceRequest {
   command: DeviceCommand
 }
 
-export interface MovementListRequest extends DeviceRequest {
-  analysisMode?: AnalysisMode
-}
-
-export interface MovementDetailRequest extends MovementListRequest {
+export interface MovementDetailRequest extends DeviceRequest {
   movementId: number
+  analysisMode?: AnalysisMode
+  taskId?: string
 }
 
 export interface MovementExportRequest extends MovementDetailRequest {
@@ -53,10 +52,15 @@ export interface TaskResultRequest {
 
 export interface StartTaskRequest extends DeviceRequest {
   participantId: string
+  participantProfile: ParticipantProfile
   note: string
 }
 
 export interface FinishTaskRequest {
+  taskId: string
+}
+
+export interface DeleteTaskRequest {
   taskId: string
 }
 
@@ -70,23 +74,22 @@ export interface MotionDataService {
   getBlockMapping(): Promise<BlockMapping>
   updateBlockMapping(mapping: BlockMapping): Promise<BlockMapping>
   getMotionSnapshot(request: DeviceRequest): Promise<MotionSnapshot>
-  getRealtimeData(request: DeviceRequest): Promise<RealtimeMotionData>
+  getRealtimeData(request: RealtimeDataRequest): Promise<RealtimeMotionData>
   getLinkDiagnostics(request: DeviceRequest): Promise<LinkDiagnostics>
 
-  setAnalysisMode(request: SetAnalysisModeRequest): Promise<MotionSnapshot>
-  resetAnalysis(request: DeviceRequest): Promise<MotionSnapshot>
-  resetPacketCounters(request: DeviceRequest): Promise<DeviceSnapshot>
   resetDataAndErrorCounters(request: DeviceRequest): Promise<DeviceSnapshot>
   executeDeviceCommand(request: DeviceCommandRequest): Promise<DeviceCommandResult>
   refreshBatteryVoltages(): Promise<BatteryRefreshResult>
 
-  listMovements(request: MovementListRequest): Promise<MovementRecord[]>
   getMovementDetail(request: MovementDetailRequest): Promise<MovementDetail>
   exportMovement(request: MovementExportRequest): Promise<MovementExport>
 
   getCurrentTask(request: DeviceRequest): Promise<TaskSummary | null>
+  listParticipants(): Promise<ParticipantProfile[]>
   startTask(request: StartTaskRequest): Promise<TaskSummary>
   finishTask(request: FinishTaskRequest): Promise<TaskSummary>
+  deleteTask(request: DeleteTaskRequest): Promise<TaskSummary>
   listTasks(): Promise<TaskSummary[]>
   getTaskResult(request: TaskResultRequest): Promise<TaskResult>
+  getTaskMovementDetail(request: MovementDetailRequest & { taskId: string }): Promise<MovementDetail>
 }

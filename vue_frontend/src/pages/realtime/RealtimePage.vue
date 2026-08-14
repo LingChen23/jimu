@@ -1,6 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useAppStore } from '@/stores/app'
 import { useMotionStore } from '@/stores/motion.store'
 import { useTaskStore } from '@/stores/task.store'
@@ -8,55 +7,93 @@ import RealtimeDevicePanel from './components/RealtimeDevicePanel.vue'
 import RealtimeTelemetryPanel from './components/RealtimeTelemetryPanel.vue'
 import TaskCreateModal from './components/TaskCreateModal.vue'
 import { isTaskBoundToDevice } from './realtime.view-model'
+import type { ParticipantProfile } from '@/types/task'
+import type { MovementDetail } from '@/types/motion'
 
 const appStore = useAppStore()
 const motionStore = useMotionStore()
 const taskStore = useTaskStore()
-const router = useRouter()
 const switching = ref(false)
 const modal = ref(false)
-const participant = ref('')
+const emptyProfile = (): ParticipantProfile => ({
+  participantId: '', name: '', gender: '', age: null, birthDate: '',
+  educationLevel: '', dominantHand: '', phone: '', visionStatus: '',
+  hearingStatus: '', upperLimbStatus: '', cognitiveStatus: '', profileNote: '',
+})
+const participantProfile = ref<ParticipantProfile>(emptyProfile())
 const note = ref('')
 const taskActionLoading = ref(false)
 const taskActionError = ref<string | null>(null)
+const completedMovementDetails = ref<MovementDetail[]>([])
+const resultLoading = ref(false)
 let selectionRequest = 0
-let realtimeTimer: number | null = null
-let realtimeRefreshRunning = false
 let liveTrajectoryTimer: number | null = null
+let taskRefreshTimer: number | null = null
+let deviceStatusTimer: number | null = null
 let liveTrajectoryRefreshRunning = false
+let taskRefreshRunning = false
+let deviceStatusRefreshRunning = false
+let pageActive = false
 
 const device = computed(() => motionStore.deviceById(appStore.selectedDeviceId))
 const snapshot = computed(() => motionStore.snapshots[appStore.selectedDeviceId] ?? null)
 const realtime = computed(() => motionStore.realtimeData[appStore.selectedDeviceId] ?? null)
 const isTested = computed(() => device.value?.integrationStatus === 'tested')
 const selectedTask = computed(() => (
-  taskStore.currentTask?.deviceId === appStore.selectedDeviceId ? taskStore.currentTask : null
+  (taskStore.currentTask?.deviceIds ?? [taskStore.currentTask?.deviceId])
+    .includes(appStore.selectedDeviceId) ? taskStore.currentTask : null
 ))
 const taskBindingMismatch = computed(() => Boolean(selectedTask.value && device.value
   && !isTaskBoundToDevice(selectedTask.value, device.value)))
 const currentTask = computed(() => (
   isTaskBoundToDevice(selectedTask.value, device.value) ? selectedTask.value : null
 ))
+const completedTask = computed(() => taskStore.latestCompletedTask)
 const canStart = computed(() => Boolean(isTested.value && !selectedTask.value && !switching.value && !taskActionLoading.value))
 const canFinish = computed(() => Boolean(
   currentTask.value?.status === 'collecting' && !taskBindingMismatch.value && !switching.value && !taskActionLoading.value,
 ))
-const motionText = computed(() => ({
-  stationary: '静止',
-  moving: '移动中',
-  calibrating: '校准中',
-  unknown: '未知',
-})[snapshot.value?.motionState ?? device.value?.motionState ?? 'unknown'])
-
 function clearRealtimeTimer(): void {
-  if (realtimeTimer !== null) window.clearInterval(realtimeTimer)
-  realtimeTimer = null
   if (liveTrajectoryTimer !== null) window.clearInterval(liveTrajectoryTimer)
   liveTrajectoryTimer = null
 }
 
+function clearTaskRefreshTimer(): void {
+  if (taskRefreshTimer !== null) window.clearInterval(taskRefreshTimer)
+  taskRefreshTimer = null
+}
+
+function clearDeviceStatusTimer(): void {
+  if (deviceStatusTimer !== null) window.clearInterval(deviceStatusTimer)
+  deviceStatusTimer = null
+}
+
+async function refreshAllDeviceStates(): Promise<void> {
+  if (!pageActive || deviceStatusRefreshRunning || switching.value) return
+  deviceStatusRefreshRunning = true
+  try {
+    await motionStore.refreshDeviceStatus()
+  } catch {
+    // Preserve the last valid state; the next poll retries automatically.
+  } finally {
+    deviceStatusRefreshRunning = false
+  }
+}
+
+async function refreshCurrentTask(): Promise<void> {
+  if (!pageActive || taskRefreshRunning || switching.value || taskActionLoading.value || !taskStore.currentTask) return
+  taskRefreshRunning = true
+  try {
+    await taskStore.loadCurrentTask(appStore.selectedDeviceId)
+  } catch {
+    // Keep the last valid task state; the next low-frequency poll retries.
+  } finally {
+    taskRefreshRunning = false
+  }
+}
+
 async function refreshLiveTrajectory(): Promise<void> {
-  if (liveTrajectoryRefreshRunning || switching.value || !isTested.value) return
+  if (!pageActive || liveTrajectoryRefreshRunning || switching.value || !isTested.value) return
   liveTrajectoryRefreshRunning = true
   try {
     await motionStore.refreshRealtimeData(appStore.selectedDeviceId)
@@ -67,28 +104,19 @@ async function refreshLiveTrajectory(): Promise<void> {
   }
 }
 
-async function refreshRealtimeSnapshot(): Promise<void> {
-  if (realtimeRefreshRunning || switching.value || !isTested.value) return
-  realtimeRefreshRunning = true
-  try {
-    await motionStore.refreshMotionSnapshot(appStore.selectedDeviceId)
-  } catch {
-    // The next poll retries automatically; the last valid frame remains visible.
-  } finally {
-    realtimeRefreshRunning = false
-  }
-}
-
 function startRealtimeTimer(): void {
   clearRealtimeTimer()
-  realtimeTimer = window.setInterval(() => void refreshRealtimeSnapshot(), 500)
-  liveTrajectoryTimer = window.setInterval(() => void refreshLiveTrajectory(), 80)
+  clearTaskRefreshTimer()
+  clearDeviceStatusTimer()
+  if (!pageActive) return
+  liveTrajectoryTimer = window.setInterval(() => void refreshLiveTrajectory(), 40)
+  taskRefreshTimer = window.setInterval(() => void refreshCurrentTask(), 500)
+  deviceStatusTimer = window.setInterval(() => void refreshAllDeviceStates(), 200)
 }
 
 async function loadSelectedDevice(deviceId: number): Promise<void> {
   const requestId = ++selectionRequest
   appStore.selectDevice(deviceId)
-  appStore.globalNotice = null
   taskActionError.value = null
   const nextDevice = motionStore.deviceById(deviceId)
   if (nextDevice?.integrationStatus === 'pending-integration') {
@@ -98,40 +126,59 @@ async function loadSelectedDevice(deviceId: number): Promise<void> {
   switching.value = true
   try {
     await Promise.all([
-      motionStore.loadDeviceContext(deviceId),
+      motionStore.loadRealtimeContext(deviceId),
       taskStore.loadCurrentTask(deviceId),
     ])
+  } catch (error) {
+    if (requestId === selectionRequest) {
+      taskActionError.value = error instanceof Error ? error.message : String(error)
+    }
   } finally {
     if (requestId === selectionRequest) switching.value = false
   }
 }
 
 onMounted(async () => {
-  await motionStore.loadDevices()
-  const initialDeviceId = motionStore.deviceById(appStore.selectedDeviceId)?.deviceId
-    ?? motionStore.devices[0]?.deviceId
-  if (initialDeviceId) await loadSelectedDevice(initialDeviceId)
-  startRealtimeTimer()
+  pageActive = true
+  try {
+    await motionStore.loadDevices()
+    const initialDeviceId = motionStore.deviceById(appStore.selectedDeviceId)?.deviceId
+      ?? motionStore.devices[0]?.deviceId
+    if (initialDeviceId) await loadSelectedDevice(initialDeviceId)
+    if (!taskStore.currentTask) {
+      await taskStore.loadTasks()
+      if (completedTask.value) await loadCompletedTaskDetails(completedTask.value)
+    }
+  } catch (error) {
+    if (pageActive) taskActionError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    if (pageActive) startRealtimeTimer()
+  }
 })
 
 onBeforeUnmount(() => {
+  pageActive = false
+  selectionRequest += 1
   clearRealtimeTimer()
+  clearTaskRefreshTimer()
+  clearDeviceStatusTimer()
 })
 
 function openTaskModal(): void {
   if (!canStart.value) return
-  appStore.globalNotice = null
-  participant.value = ''
+  participantProfile.value = emptyProfile()
   note.value = ''
   modal.value = true
+  void taskStore.loadParticipants()
 }
 
 async function startTask(): Promise<void> {
-  if (!device.value || !participant.value.trim()) return
+  if (!device.value || !participantProfile.value.participantId.trim()) return
   taskActionLoading.value = true
   taskActionError.value = null
   try {
-    await taskStore.startTask(device.value.deviceId, participant.value.trim(), note.value.trim())
+    await taskStore.startTask(device.value.deviceId, participantProfile.value, note.value.trim())
+    completedMovementDetails.value = []
     modal.value = false
   } catch (error) {
     taskActionError.value = error instanceof Error ? error.message : String(error)
@@ -144,14 +191,35 @@ async function finishAndViewResult(): Promise<void> {
   const taskId = currentTask.value?.taskId
   if (!taskId) return
   taskActionLoading.value = true
+  resultLoading.value = true
   taskActionError.value = null
   try {
-    await taskStore.finishTask(taskId)
-    await router.push(`/results/${taskId}`)
+    const finished = await taskStore.finishTask(taskId)
+    await nextTick()
+    document.getElementById('realtime-collection-result')
+      ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    await loadCompletedTaskDetails(finished)
   } catch (error) {
     taskActionError.value = error instanceof Error ? error.message : String(error)
   } finally {
+    resultLoading.value = false
     taskActionLoading.value = false
+  }
+}
+
+async function loadCompletedTaskDetails(task: import('@/types/task').TaskSummary): Promise<void> {
+  resultLoading.value = true
+  try {
+    completedMovementDetails.value = (await Promise.allSettled(
+      (task.movementReferences ?? []).map((reference) => motionStore.loadMovementDetail(
+        reference.deviceId,
+        reference.movementId,
+        reference.analysisMode,
+        task.taskId,
+      )),
+    )).flatMap((result) => result.status === 'fulfilled' ? [result.value] : [])
+  } finally {
+    resultLoading.value = false
   }
 }
 </script>
@@ -184,13 +252,16 @@ async function finishAndViewResult(): Promise<void> {
       :snapshot="snapshot"
       :realtime="realtime"
       :current-task="currentTask"
-      :motion-label="motionText"
+      :completed-task="completedTask"
+      :completed-movement-details="completedMovementDetails"
+      :result-loading="resultLoading"
     />
 
     <TaskCreateModal
       v-if="modal"
-      v-model:participant="participant"
+      v-model:profile="participantProfile"
       v-model:note="note"
+      :participants="taskStore.participants"
       @close="modal = false"
       @confirm="startTask"
     />

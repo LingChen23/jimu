@@ -1,15 +1,21 @@
 <script setup lang="ts">
-import * as echarts from 'echarts'
+import { init, use, type ECharts } from 'echarts/core'
+import { LineChart } from 'echarts/charts'
+import { GridComponent, LegendComponent, TooltipComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { AxisPoint } from '@/types/motion'
 
 const props = defineProps<{ title: string; subtitle?: string; unit: string; data: AxisPoint[] }>()
 const el = ref<HTMLDivElement | null>(null)
-let chart: echarts.ECharts | null = null
+
+use([LineChart, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer])
+
+let chart: ECharts | null = null
 function time(ts: number) { return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false }) }
 function render() {
   if (!el.value) return
-  chart ??= echarts.init(el.value)
+  chart ??= init(el.value)
   chart.setOption({
     animation: false,
     tooltip: { trigger: 'axis' },

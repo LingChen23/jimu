@@ -605,6 +605,9 @@ static void link_diagnostic_task(void *param)
 
         for (target_index = 0U; target_index < TARGET_COUNT;
              target_index++) {
+            if (!TARGETS[target_index].enabled) {
+                continue;
+            }
             link_stats_snapshot(target_index, &stats);
             if (stats.connected) {
                 rssi = 0;

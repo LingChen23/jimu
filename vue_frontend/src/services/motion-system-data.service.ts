@@ -21,20 +21,22 @@ import type {
   LinkDiagnostics,
   SerialStatus,
 } from '@/types/serial'
-import type { TaskResult, TaskSummary } from '@/types/task'
+import type { ParticipantProfile, TaskResult, TaskSummary } from '@/types/task'
+import { gatewayNameForDevice } from '@/config/system'
 import type {
   DeviceCommandRequest,
   DeviceRequest,
   FinishTaskRequest,
+  DeleteTaskRequest,
   MotionDataService,
   MovementDetailRequest,
   MovementExportRequest,
-  MovementListRequest,
   OpenSerialRequest,
-  SetAnalysisModeRequest,
+  RealtimeDataRequest,
   StartTaskRequest,
   TaskResultRequest,
 } from './motion-data.service'
+import { fetchWithTimeout } from './http-client'
 
 type JsonObject = Record<string, any>
 
@@ -234,10 +236,18 @@ function taskSummary(raw: JsonObject): TaskSummary {
   return {
     taskId: String(raw.task_id),
     participantId: String(raw.participant_id),
+    participantSnapshot: raw.participant_snapshot ? participantProfile(raw.participant_snapshot) : null,
     blockId: String(raw.block_id ?? ''),
     deviceId: number(raw.device_id),
-    deviceIds: Array.isArray(raw.device_ids) ? raw.device_ids.map((value: unknown) => number(value)) : [number(raw.device_id)],
-    taskType: note,
+    deviceIds: Array.isArray(raw.device_ids)
+      ? raw.device_ids.map((deviceId: unknown) => number(deviceId))
+      : [number(raw.device_id)],
+    blockBindings: Array.isArray(raw.block_bindings)
+      ? raw.block_bindings.map((binding: JsonObject) => ({
+          deviceId: number(binding.device_id),
+          blockId: String(binding.block_id ?? ''),
+        }))
+      : [{ deviceId: number(raw.device_id), blockId: String(raw.block_id ?? '') }],
     note,
     startTime: String(raw.start_time),
     endTime: raw.end_time ? String(raw.end_time) : null,
@@ -247,10 +257,69 @@ function taskSummary(raw: JsonObject): TaskSummary {
     status: raw.status === 'collecting' || raw.status === 'abnormal' || raw.status === 'cancelled' ? raw.status : 'completed',
     movementReferences: Array.isArray(raw.movement_references) ? raw.movement_references.map((reference: JsonObject) => ({
       deviceId: number(reference.device_id),
+      blockId: reference.block_id ? String(reference.block_id) : undefined,
       movementId: number(reference.movement_id),
       analysisMode: analysisMode(reference.analysis_mode),
+      startedAt: reference.started_at ? String(reference.started_at) : null,
+      endedAt: reference.ended_at ? String(reference.ended_at) : null,
+      durationSeconds: nullableNumber(reference.duration_seconds),
+      taskMovementIndex: reference.task_movement_index ? number(reference.task_movement_index) : undefined,
+      deviceMovementIndex: reference.device_movement_index ? number(reference.device_movement_index) : undefined,
+      score: nullableNumber(reference.score),
+      scoreModelVersion: reference.score_model_version ? String(reference.score_model_version) : null,
     })) : [],
   }
+}
+
+function participantProfile(raw: JsonObject): ParticipantProfile {
+  return {
+    participantId: String(raw.participant_id ?? ''),
+    name: String(raw.name ?? ''),
+    gender: String(raw.gender ?? ''),
+    age: nullableNumber(raw.age),
+    birthDate: String(raw.birth_date ?? ''),
+    educationLevel: String(raw.education_level ?? ''),
+    dominantHand: String(raw.dominant_hand ?? ''),
+    phone: String(raw.phone ?? ''),
+    visionStatus: String(raw.vision_status ?? ''),
+    hearingStatus: String(raw.hearing_status ?? ''),
+    upperLimbStatus: String(raw.upper_limb_status ?? ''),
+    cognitiveStatus: String(raw.cognitive_status ?? ''),
+    profileNote: String(raw.profile_note ?? ''),
+  }
+}
+
+function analyzedTrajectory(rows: unknown): PcInertialTrajectory {
+  const points = Array.isArray(rows) ? rows.flatMap((row) => (
+    Array.isArray(row) && row.length >= 5
+      ? [{
+          timestamp: number(row[0]) * 1_000,
+          x: number(row[1]),
+          y: number(row[2]),
+          z: number(row[3]),
+          speedMps: number(row[4]),
+        }]
+      : []
+  )) : []
+  return {
+    source: 'pc-inertial',
+    coordinateSystem: 'world-relative',
+    unit: 'm',
+    metricReliable: false,
+    points,
+  }
+}
+
+function trajectoryWithSpeed(pathRows: unknown, speedRows: unknown): PcInertialTrajectory {
+  if (!Array.isArray(pathRows) || !Array.isArray(speedRows)) return trajectory(pathRows, 'pc-inertial')
+  const points = pathRows.flatMap((row, index) => {
+    if (!Array.isArray(row) || row.length < 3) return []
+    const speedRow = speedRows[Math.max(0, index - 1)]
+    const elapsed = Array.isArray(speedRow) ? number(speedRow[0]) : index
+    const speedMps = Array.isArray(speedRow) ? number(speedRow[1]) : 0
+    return [{ timestamp: elapsed * 1_000, x: number(row[0]), y: number(row[1]), z: number(row[2]), speedMps }]
+  })
+  return { source: 'pc-inertial', coordinateSystem: 'world-relative', unit: 'm', metricReliable: false, points }
 }
 
 function linkDiagnostics(deviceId: number, raw: JsonObject | null | undefined): LinkDiagnostics {
@@ -322,12 +391,12 @@ function health(control: JsonObject | null | undefined): DeviceHealth {
 }
 
 export class MotionSystemDataService implements MotionDataService {
-  private async json(path: string, options?: RequestInit): Promise<JsonObject> {
-    const response = await fetch(path, {
+  private async json(path: string, options?: RequestInit, timeoutMs?: number): Promise<JsonObject> {
+    const response = await fetchWithTimeout(path, {
       ...options,
       cache: 'no-store',
       headers: { 'Content-Type': 'application/json', ...(options?.headers ?? {}) },
-    })
+    }, timeoutMs)
     const payload = await response.json().catch(() => ({}))
     if (!response.ok) throw new Error(String(payload.error ?? `请求失败：${response.status}`))
     return payload
@@ -371,7 +440,7 @@ export class MotionSystemDataService implements MotionDataService {
         motionState: motionState(raw.motion_state),
         currentTaskId: null,
         sessionId: raw.session_id === null ? '—' : String(raw.session_id),
-        gatewayName: `网关${String.fromCharCode(65 + Math.floor((deviceId - 1) / 4))}`,
+        gatewayName: gatewayNameForDevice(deviceId),
         lastDataAgoMs: raw.age_seconds === null ? null : number(raw.age_seconds) * 1_000,
         packetCount: number(raw.packet_count),
         lostPacketCount: number(raw.lost_packets),
@@ -442,13 +511,26 @@ export class MotionSystemDataService implements MotionDataService {
     }
   }
 
-  async getRealtimeData(request: DeviceRequest): Promise<RealtimeMotionData> {
-    const raw = await this.json(`/api/live?device=${request.deviceId}`)
+  async getRealtimeData(request: RealtimeDataRequest): Promise<RealtimeMotionData> {
+    const query = new URLSearchParams({ device: String(request.deviceId) })
+    if (request.trajectoryRevision !== undefined) query.set('trajectory_revision', String(request.trajectoryRevision))
+    if (request.deviceTrajectoryCursor !== undefined) query.set('received_after', String(request.deviceTrajectoryCursor))
+    if (request.pcTrajectoryCursor !== undefined) query.set('calculated_after', String(request.pcTrajectoryCursor))
+    const raw = await this.json(`/api/live?${query}`)
     const capturedAt = Date.now()
     const accel = axisRows(raw.accel_sample ? [raw.accel_sample] : [])
     const gyro = axisRows(raw.gyro_sample ? [raw.gyro_sample] : [])
-    const deviceTrajectory = trajectory(raw.received_position_m ? [raw.received_position_m] : [], 'device')
-    const pcTrajectory = trajectory(raw.calculated_position_m ? [raw.calculated_position_m] : [], 'pc-inertial')
+    const delta = raw.trajectory_delta ?? {}
+    const receivedDelta = delta.received ?? {}
+    const calculatedDelta = delta.calculated ?? {}
+    const deviceRows = Array.isArray(receivedDelta.points)
+      ? receivedDelta.points
+      : raw.received_position_m ? [raw.received_position_m] : []
+    const pcRows = Array.isArray(calculatedDelta.points)
+      ? calculatedDelta.points
+      : raw.calculated_position_m ? [raw.calculated_position_m] : []
+    const deviceTrajectory = trajectory(deviceRows, 'device')
+    const pcTrajectory = trajectory(pcRows, 'pc-inertial')
     deviceTrajectory.points.forEach((point) => { point.timestamp = capturedAt })
     pcTrajectory.points.forEach((point) => { point.timestamp = capturedAt })
     return {
@@ -463,6 +545,11 @@ export class MotionSystemDataService implements MotionDataService {
       latestGyroscope: gyro[0] ?? null,
       orientation: orientation(raw.orientation),
       trajectoryRevision: number(raw.trajectory_revision),
+      trajectoryReset: Boolean(delta.reset),
+      deviceTrajectoryCursor: nullableNumber(receivedDelta.cursor) ?? undefined,
+      pcTrajectoryCursor: nullableNumber(calculatedDelta.cursor) ?? undefined,
+      deviceTrajectoryTruncated: Boolean(receivedDelta.truncated),
+      pcTrajectoryTruncated: Boolean(calculatedDelta.truncated),
       movementId: raw.movement_id === null ? null : number(raw.movement_id),
       trajectories: {
         device: deviceTrajectory,
@@ -478,24 +565,6 @@ export class MotionSystemDataService implements MotionDataService {
     result.deviceQueueDrops = number(raw.control?.status?.queue_drop_count)
     result.bleResourceWaitCount = number(raw.control?.status?.ble_resource_wait_count)
     return result
-  }
-
-  async setAnalysisMode(request: SetAnalysisModeRequest): Promise<MotionSnapshot> {
-    await this.json('/api/device/mode', { method: 'POST', body: JSON.stringify({ device: request.deviceId, mode: request.analysisMode }) })
-    return this.getMotionSnapshot(request)
-  }
-
-  async resetAnalysis(request: DeviceRequest): Promise<MotionSnapshot> {
-    await this.json('/api/device/reset', { method: 'POST', body: JSON.stringify({ device: request.deviceId }) })
-    return this.getMotionSnapshot(request)
-  }
-
-  async resetPacketCounters(request: DeviceRequest): Promise<DeviceSnapshot> {
-    await this.json('/api/device/reset-packet-counters', { method: 'POST', body: JSON.stringify({ device: request.deviceId }) })
-    const devices = await this.listDevices()
-    const device = devices.find((item) => item.deviceId === request.deviceId)
-    if (!device) throw new Error(`未知设备ID: ${request.deviceId}`)
-    return device
   }
 
   async resetDataAndErrorCounters(request: DeviceRequest): Promise<DeviceSnapshot> {
@@ -526,7 +595,7 @@ export class MotionSystemDataService implements MotionDataService {
   async refreshBatteryVoltages(): Promise<BatteryRefreshResult> {
     const raw = await this.json('/api/devices/battery-refresh', {
       method: 'POST', body: '{}',
-    })
+    }, 25_000)
     return {
       requested: number(raw.requested),
       succeeded: number(raw.succeeded),
@@ -541,38 +610,63 @@ export class MotionSystemDataService implements MotionDataService {
     }
   }
 
-  async listMovements(request: MovementListRequest): Promise<MovementRecord[]> {
-    if (request.analysisMode) await this.setAnalysisMode({ deviceId: request.deviceId, analysisMode: request.analysisMode })
-    return (await this.getMotionSnapshot(request)).completedMovements
-  }
-
   async getMovementDetail(request: MovementDetailRequest): Promise<MovementDetail> {
     const mode = request.analysisMode ?? 'pc'
-    const raw = await this.json(`/api/movement/detail?device=${request.deviceId}&movement=${request.movementId}&mode=${mode}`)
+    const endpoint = request.taskId ? '/api/tasks/movement-detail' : '/api/movement/detail'
+    const taskQuery = request.taskId ? `&task=${encodeURIComponent(request.taskId)}` : ''
+    const raw = await this.json(`${endpoint}?device=${request.deviceId}&movement=${request.movementId}&mode=${mode}${taskQuery}`)
     const base = movement(raw, request.deviceId, mode)
+    const movementStartedAt = Date.parse(base.startedAt)
+    const relativeEventTimestamp = (event: JsonObject, elapsedKey = 'elapsed_s', timeKey = 'time'): number => {
+      const elapsed = nullableNumber(event[elapsedKey])
+      if (elapsed !== null) return elapsed * 1_000
+      const absolute = event[timeKey]?.computer ? Date.parse(event[timeKey].computer) : Number.NaN
+      return Number.isFinite(absolute) && Number.isFinite(movementStartedAt)
+        ? Math.max(0, absolute - movementStartedAt)
+        : 0
+    }
     const pauses = (raw.pause_events ?? []).map((event: JsonObject) => ({
-      timestamp: number(event.start?.computer ? Date.parse(event.start.computer) : 0),
+      timestamp: relativeEventTimestamp({ ...event, time: event.start }),
       durationSeconds: number(event.duration_seconds),
       description: `停顿 ${number(event.duration_seconds).toFixed(2)} 秒`,
     }))
     const drops = (raw.drop_events ?? []).map((event: JsonObject) => ({
-      timestamp: number(event.impact_time?.computer ? Date.parse(event.impact_time.computer) : 0),
+      timestamp: relativeEventTimestamp(event, 'impact_s', 'impact_time'),
       durationSeconds: 0,
       description: `掉落冲击 ${number(event.impact_g).toFixed(2)} g`,
     }))
+    const events = [
+      ...pauses.map((event: { timestamp: number; durationSeconds: number; description: string }, index: number) => ({ id: `pause-${index}`, type: 'pause' as const, title: '停顿', level: 'warning' as const, ...event })),
+      ...drops.map((event: { timestamp: number; durationSeconds: number; description: string }, index: number) => ({ id: `drop-${index}`, type: 'drop' as const, title: '掉落', level: 'danger' as const, ...event })),
+      ...(raw.shake_events ?? []).map((event: JsonObject, index: number) => ({
+        id: `shake-${index}`, type: 'strong-shake' as const, title: '剧烈晃动', level: 'warning' as const,
+        timestamp: relativeEventTimestamp(event),
+        description: `剧烈晃动（${number(event.dynamic_acceleration_mps2).toFixed(2)} m/s²）`,
+      })),
+      ...(raw.flip_events ?? []).map((event: JsonObject, index: number) => ({
+        id: `flip-${index}`, type: 'flip' as const, title: '翻转', level: 'info' as const,
+        timestamp: relativeEventTimestamp(event), description: `第 ${index + 1} 次翻转`,
+      })),
+      ...(raw.rotation_events ?? []).map((event: JsonObject, index: number) => ({
+        id: `rotation-${index}`, type: 'rotation' as const, title: '完整旋转', level: 'info' as const,
+        timestamp: relativeEventTimestamp(event), description: `第 ${index + 1} 次完整一轴旋转`,
+      })),
+    ]
     return {
       ...base,
       acceleration: axisRows(raw.acceleration_series),
-      gyroscope: [],
+      gyroscope: axisRows(raw.gyroscope_series),
       dynamicAcceleration: axisRows(raw.dynamic_acceleration_series),
       speedSeries: (raw.speed_series ?? []).map((row: unknown[]) => ({ timestamp: number(row[0]) * 1_000, value: number(row[1]) })),
       orientation: orientation(null),
-      events: [],
+      events,
       pauseEvents: pauses,
       dropEvents: drops,
       trajectories: {
         device: trajectory(raw.received_path, 'device'),
-        pcInertial: trajectory(raw.calculated_path, 'pc-inertial'),
+        pcInertial: Array.isArray(raw.trajectory_series)
+          ? analyzedTrajectory(raw.trajectory_series)
+          : trajectoryWithSpeed(raw.calculated_path, raw.speed_series),
       },
       sessionTremorAverage: sessionTremor(raw.session_tremor_average),
     }
@@ -580,7 +674,15 @@ export class MotionSystemDataService implements MotionDataService {
 
   async exportMovement(request: MovementExportRequest) {
     const mode = request.analysisMode ?? 'pc'
-    const response = await fetch(`/api/movement/export.${request.format}?device=${request.deviceId}&movement=${request.movementId}&mode=${mode}`)
+    const endpoint = request.taskId
+      ? `/api/tasks/movement-export.${request.format}`
+      : `/api/movement/export.${request.format}`
+    const taskQuery = request.taskId ? `&task=${encodeURIComponent(request.taskId)}` : ''
+    const response = await fetchWithTimeout(
+      `${endpoint}?device=${request.deviceId}&movement=${request.movementId}&mode=${mode}${taskQuery}`,
+      {},
+      15_000,
+    )
     if (!response.ok) throw new Error(`导出失败：${response.status}`)
     return {
       fileName: `device_${request.deviceId}_movement_${request.movementId}_${mode}.${request.format}`,
@@ -595,12 +697,32 @@ export class MotionSystemDataService implements MotionDataService {
     return raw.task ? taskSummary(raw.task) : null
   }
 
+  async listParticipants(): Promise<ParticipantProfile[]> {
+    const raw = await this.json('/api/participants')
+    return (raw.participants ?? []).map((item: JsonObject) => participantProfile(item))
+  }
+
   async startTask(request: StartTaskRequest): Promise<TaskSummary> {
     const raw = await this.json('/api/tasks/start', {
       method: 'POST',
       body: JSON.stringify({
         device_id: request.deviceId,
         participant_id: request.participantId,
+        participant_profile: {
+          participant_id: request.participantProfile.participantId,
+          name: request.participantProfile.name,
+          gender: request.participantProfile.gender,
+          age: request.participantProfile.age,
+          birth_date: request.participantProfile.birthDate,
+          education_level: request.participantProfile.educationLevel,
+          dominant_hand: request.participantProfile.dominantHand,
+          phone: request.participantProfile.phone,
+          vision_status: request.participantProfile.visionStatus,
+          hearing_status: request.participantProfile.hearingStatus,
+          upper_limb_status: request.participantProfile.upperLimbStatus,
+          cognitive_status: request.participantProfile.cognitiveStatus,
+          profile_note: request.participantProfile.profileNote,
+        },
         note: request.note,
       }),
     })
@@ -611,7 +733,7 @@ export class MotionSystemDataService implements MotionDataService {
     const raw = await this.json('/api/tasks/finish', {
       method: 'POST',
       body: JSON.stringify({ task_id: request.taskId }),
-    })
+    }, 30_000)
     return taskSummary(raw.task)
   }
 
@@ -625,23 +747,48 @@ export class MotionSystemDataService implements MotionDataService {
     const task = taskSummary(raw.task)
     const reference = raw.movement_reference ? {
       deviceId: number(raw.movement_reference.device_id),
+      blockId: raw.movement_reference.block_id ? String(raw.movement_reference.block_id) : undefined,
       movementId: number(raw.movement_reference.movement_id),
       analysisMode: analysisMode(raw.movement_reference.analysis_mode),
+      startedAt: raw.movement_reference.started_at ? String(raw.movement_reference.started_at) : null,
+      endedAt: raw.movement_reference.ended_at ? String(raw.movement_reference.ended_at) : null,
+      durationSeconds: nullableNumber(raw.movement_reference.duration_seconds),
+      taskMovementIndex: raw.movement_reference.task_movement_index ? number(raw.movement_reference.task_movement_index) : undefined,
+      deviceMovementIndex: raw.movement_reference.device_movement_index ? number(raw.movement_reference.device_movement_index) : undefined,
+      score: nullableNumber(raw.movement_reference.score),
+      scoreModelVersion: raw.movement_reference.score_model_version ? String(raw.movement_reference.score_model_version) : null,
     } : null
+    const rawScore = raw.score ?? {}
     return {
       task,
       movementReference: reference,
       score: {
-        totalScore: null,
-        scoreStatus: 'pending',
-        modelVersion: null,
-        explanation: [],
-        demoOnly: false,
+        totalScore: nullableNumber(rawScore.total_score ?? task.totalScore),
+        scoreStatus: rawScore.score_status === 'completed' || rawScore.score_status === 'processing' || rawScore.score_status === 'failed'
+          ? rawScore.score_status
+          : 'pending',
+        modelVersion: rawScore.model_version ? String(rawScore.model_version) : null,
+        explanation: Array.isArray(rawScore.explanation) ? rawScore.explanation.map(String) : [],
+        demoOnly: Boolean(rawScore.demo_only),
       },
       statistics: emptyStatistics(),
       acceleration: [],
       gyroscope: [],
       events: [],
     }
+  }
+
+  async deleteTask(request: DeleteTaskRequest): Promise<TaskSummary> {
+    const raw = await this.json('/api/tasks/delete', {
+      method: 'POST',
+      body: JSON.stringify({ task_id: request.taskId }),
+    })
+    return taskSummary(raw.task)
+  }
+
+  async getTaskMovementDetail(
+    request: MovementDetailRequest & { taskId: string },
+  ): Promise<MovementDetail> {
+    return this.getMovementDetail(request)
   }
 }

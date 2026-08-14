@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAppStore } from '@/stores/app'
 import { useMotionStore } from '@/stores/motion.store'
 import { useTaskStore } from '@/stores/task.store'
-import type { AnalysisMode, MovementExportFormat, MovementRecord } from '@/types/motion'
+import type { MovementExportFormat } from '@/types/motion'
+import type { TaskMovementReference } from '@/types/task'
 import StatusBadge from '@/shared/components/StatusBadge.vue'
 import ResultDiagnosticsSection from './components/ResultDiagnosticsSection.vue'
 import ResultFeatureSummary from './components/ResultFeatureSummary.vue'
@@ -12,25 +13,20 @@ import ResultMotionSection from './components/ResultMotionSection.vue'
 import ResultOverview from './components/ResultOverview.vue'
 import ResultQualitySection from './components/ResultQualitySection.vue'
 import ResultTrajectorySection from './components/ResultTrajectorySection.vue'
+import TaskMovementNavigator from './components/TaskMovementNavigator.vue'
 import { parseResultRoute } from './result-route'
-
-interface MovementReference {
-  deviceId: number
-  movementId: number
-  analysisMode: AnalysisMode
-}
 
 const route = useRoute()
 const router = useRouter()
 const appStore = useAppStore()
 const motionStore = useMotionStore()
 const taskStore = useTaskStore()
-const movementReference = ref<MovementReference | null>(null)
+const movementReference = ref<TaskMovementReference | null>(null)
 const pageLoading = ref(true)
 const pageError = ref<string | null>(null)
 const enrichmentNotice = ref<string | null>(null)
-const taskUsesMockMovement = ref(false)
 const exporting = ref<MovementExportFormat | null>(null)
+let routeRequest = 0
 
 const isTaskResult = computed(() => route.name === 'task-result')
 const isMovementResult = computed(() => route.name === 'movement-result')
@@ -48,35 +44,32 @@ const task = computed(() => taskResult.value?.task ?? null)
 const movementDetail = computed(() => {
   const reference = movementReference.value
   return reference
-    ? motionStore.movementDetailByKey(reference.deviceId, reference.movementId, reference.analysisMode)
+    ? motionStore.movementDetailByKey(
+        reference.deviceId,
+        reference.movementId,
+        reference.analysisMode,
+        isTaskResult.value ? taskId.value : undefined,
+      )
     : null
 })
 const deviceId = computed(() => task.value?.deviceId ?? movementReference.value?.deviceId ?? null)
-const device = computed(() => deviceId.value === null ? null : motionStore.deviceById(deviceId.value))
+const activeDeviceId = computed(() => movementReference.value?.deviceId ?? deviceId.value)
+const device = computed(() => activeDeviceId.value === null ? null : motionStore.deviceById(activeDeviceId.value))
 const statistics = computed(() => movementDetail.value?.statistics
   ?? (taskResult.value?.score.demoOnly ? taskResult.value.statistics : null))
 const acceleration = computed(() => movementDetail.value?.acceleration ?? taskResult.value?.acceleration ?? [])
 const gyroscope = computed(() => movementDetail.value?.gyroscope ?? taskResult.value?.gyroscope ?? [])
-const events = computed(() => movementDetail.value?.events ?? taskResult.value?.events ?? [])
 const speed = computed(() => movementDetail.value?.speed ?? null)
-const orientation = computed(() => movementDetail.value?.orientation ?? null)
 const trajectories = computed(() => movementDetail.value?.trajectories ?? null)
 const tremor = computed(() => movementDetail.value?.tremor ?? null)
 const sessionTremor = computed(() => movementDetail.value?.sessionTremorAverage ?? null)
 
-function latestCompletedMovement(records: MovementRecord[]): MovementRecord | null {
-  const completed = records
-    .filter((record) => record.state === 'completed')
-    .sort((left, right) => right.startedAt.localeCompare(left.startedAt))
-  return completed.find((record) => record.analysisMode === 'pc') ?? completed[0] ?? null
-}
-
 async function loadRouteResult(): Promise<void> {
+  const requestId = ++routeRequest
   pageLoading.value = true
   pageError.value = null
   enrichmentNotice.value = null
   movementReference.value = null
-  taskUsesMockMovement.value = false
   try {
     const routeReference = parseResultRoute(route.name, route.params)
     if (routeReference.kind === 'task') {
@@ -84,20 +77,20 @@ async function loadRouteResult(): Promise<void> {
         taskStore.loadTaskResult(routeReference.taskId),
         motionStore.devices.length ? Promise.resolve() : motionStore.loadDevices(),
       ])
-      appStore.selectDevice(loadedResult.task.deviceId)
+      if (requestId !== routeRequest) return
+      const preferred = loadedResult.task.movementReferences?.[0] ?? loadedResult.movementReference
+      appStore.selectDevice(preferred?.deviceId ?? loadedResult.task.deviceId)
       try {
-        await motionStore.loadMovementRecords(loadedResult.task.deviceId)
-        const candidate = loadedResult.movementReference
-          ?? (loadedResult.task.movementReferences === undefined
-            ? latestCompletedMovement(motionStore.movementRecords[loadedResult.task.deviceId] ?? [])
-            : null)
+        const candidate = preferred
         if (candidate) {
-          movementReference.value = {
-            deviceId: candidate.deviceId,
-            movementId: candidate.movementId,
-            analysisMode: candidate.analysisMode,
-          }
-          await motionStore.loadMovementDetail(candidate.deviceId, candidate.movementId, candidate.analysisMode)
+          movementReference.value = candidate
+          await motionStore.loadMovementDetail(
+            candidate.deviceId,
+            candidate.movementId,
+            candidate.analysisMode,
+            routeReference.taskId,
+          )
+          if (requestId !== routeRequest) return
         } else {
           enrichmentNotice.value = '当前任务设备没有可用于补充高级字段的完整移动记录。'
         }
@@ -114,14 +107,38 @@ async function loadRouteResult(): Promise<void> {
           routeReference.analysisMode,
         ),
       ])
+      if (requestId !== routeRequest) return
       appStore.selectDevice(routeReference.deviceId)
     }
   } catch (error) {
-    pageError.value = error instanceof Error ? error.message : String(error)
+    if (requestId === routeRequest) pageError.value = error instanceof Error ? error.message : String(error)
   } finally {
-    pageLoading.value = false
+    if (requestId === routeRequest) pageLoading.value = false
   }
 }
+
+async function selectTaskMovement(reference: TaskMovementReference): Promise<void> {
+  if (!taskId.value) return
+  const requestId = ++routeRequest
+  pageError.value = null
+  enrichmentNotice.value = null
+  try {
+    movementReference.value = reference
+    appStore.selectDevice(reference.deviceId)
+    await motionStore.loadMovementDetail(
+      reference.deviceId,
+      reference.movementId,
+      reference.analysisMode,
+      taskId.value,
+    )
+  } catch (error) {
+    if (requestId === routeRequest) pageError.value = error instanceof Error ? error.message : String(error)
+  }
+}
+
+onBeforeUnmount(() => {
+  routeRequest += 1
+})
 
 watch(
   () => [route.name, route.params.taskId, route.params.deviceId, route.params.analysisMode, route.params.movementId],
@@ -140,6 +157,7 @@ async function downloadMovement(format: MovementExportFormat): Promise<void> {
       reference.movementId,
       format,
       reference.analysisMode,
+      isTaskResult.value ? taskId.value : undefined,
     )
     const blob = new Blob([exported.content], { type: exported.mimeType })
     const url = URL.createObjectURL(blob)
@@ -182,19 +200,25 @@ function goRealtime(): void {
     <section v-else-if="pageError" class="card result-state result-state--error"><strong>结果详情不可用</strong><span>{{ pageError }}</span><button class="btn secondary" @click="router.push('/history')">返回历史记录</button></section>
 
     <template v-else-if="taskResult || movementDetail">
+      <TaskMovementNavigator
+        v-if="isTaskResult && task"
+        :task="task"
+        :selected="movementReference"
+        @select="selectTaskMovement"
+      />
       <ResultOverview
         :result-kind="resultKind"
         :task-result="taskResult"
         :task="task"
         :device="device"
         :movement="movementDetail"
-        :uses-mock-movement="taskUsesMockMovement"
+        :movement-reference="movementReference"
         :enrichment-notice="enrichmentNotice"
       />
       <ResultFeatureSummary :statistics="statistics" :speed="speed" :tremor="tremor" />
       <ResultMotionSection :statistics="statistics" :acceleration="acceleration" :gyroscope="gyroscope" />
-      <ResultDiagnosticsSection :speed="speed" :events="events" :orientation="orientation" />
-      <ResultTrajectorySection :trajectories="trajectories" />
+      <ResultDiagnosticsSection :speed="speed" />
+      <ResultTrajectorySection :trajectories="trajectories" :events="movementDetail?.events ?? []" />
       <ResultQualitySection :tremor="tremor" :session-tremor="sessionTremor" />
     </template>
 

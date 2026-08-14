@@ -8,7 +8,6 @@ import type {
   MovementDetail,
   MovementExport,
   MovementExportFormat,
-  MovementRecord,
   MotionTrajectory,
   RealtimeMotionData,
 } from '@/types/motion'
@@ -27,13 +26,15 @@ export function mergeLiveTrajectory<T extends MotionTrajectory>(
   reset: boolean,
 ): T {
   if (reset || !previous) return incoming
-  const latest = incoming.points[incoming.points.length - 1]
-  if (!latest) return { ...incoming, points: previous.points } as T
-  const prior = previous.points[previous.points.length - 1]
-  if (prior && prior.x === latest.x && prior.y === latest.y && prior.z === latest.z) {
-    return { ...incoming, points: previous.points } as T
+  if (!incoming.points.length) return { ...incoming, points: previous.points } as T
+  const merged = [...previous.points]
+  for (const point of incoming.points) {
+    const prior = merged[merged.length - 1]
+    if (!prior || prior.x !== point.x || prior.y !== point.y || prior.z !== point.z) {
+      merged.push(point)
+    }
   }
-  return { ...incoming, points: [...previous.points, latest].slice(-4_000) } as T
+  return { ...incoming, points: merged.slice(-4_000) } as T
 }
 
 export const useMotionStore = defineStore('motion', () => {
@@ -44,56 +45,35 @@ export const useMotionStore = defineStore('motion', () => {
   const snapshots = ref<Record<number, MotionSnapshot>>({})
   const realtimeData = ref<Record<number, RealtimeMotionData>>({})
   const linkDiagnostics = ref<Record<number, LinkDiagnostics>>({})
-  const movementRecords = ref<Record<number, MovementRecord[]>>({})
   const movementDetails = ref<Record<string, MovementDetail>>({})
   const controlResults = ref<Record<number, DeviceCommandResult>>({})
-  const loading = ref(false)
-  const errorMessage = ref<string | null>(null)
 
-  const testedCount = computed(() => devices.value.filter((device) => device.integrationStatus === 'tested').length)
-  const pendingCount = computed(() => devices.value.filter((device) => device.integrationStatus === 'pending-integration').length)
   const onlineCount = computed(() => devices.value.filter((device) => device.integrationStatus === 'tested' && device.connectionStatus === 'online').length)
   const offlineCount = computed(() => devices.value.filter((device) => device.integrationStatus === 'tested' && device.connectionStatus === 'offline').length)
   const warningCount = computed(() => devices.value.filter((device) => device.integrationStatus === 'tested' && device.connectionStatus === 'warning').length)
-  const allMovementRecords = computed(() => Object.values(movementRecords.value)
-    .flat()
-    .sort((left, right) => right.startedAt.localeCompare(left.startedAt)))
 
   function deviceById(deviceId: number): DeviceSnapshot | null {
     return devices.value.find((device) => device.deviceId === deviceId) ?? null
   }
 
-  async function run<T>(action: () => Promise<T>): Promise<T> {
-    loading.value = true
-    errorMessage.value = null
-    try {
-      return await action()
-    } catch (error) {
-      errorMessage.value = error instanceof Error ? error.message : String(error)
-      throw error
-    } finally {
-      loading.value = false
-    }
-  }
-
   async function loadDevices(): Promise<void> {
-    devices.value = await run(() => motionDataService.listDevices())
+    devices.value = await motionDataService.listDevices()
   }
 
   async function loadBlockMapping(): Promise<void> {
-    blockMapping.value = await run(() => motionDataService.getBlockMapping())
+    blockMapping.value = await motionDataService.getBlockMapping()
   }
 
   async function updateBlockMapping(mapping: BlockMapping): Promise<void> {
-    blockMapping.value = await run(() => motionDataService.updateBlockMapping(mapping))
+    blockMapping.value = await motionDataService.updateBlockMapping(mapping)
     devices.value = await motionDataService.listDevices()
   }
 
   async function loadSerial(): Promise<void> {
-    const [ports, status] = await run(() => Promise.all([
+    const [ports, status] = await Promise.all([
       motionDataService.listSerialPorts(),
       motionDataService.getSerialStatus(),
-    ]))
+    ])
     serialPorts.value = ports
     serialStatus.value = status
   }
@@ -110,46 +90,53 @@ export const useMotionStore = defineStore('motion', () => {
   }
 
   async function openSerial(port: string, baudRate: number): Promise<void> {
-    serialStatus.value = await run(() => motionDataService.openSerial({ port, baudRate }))
+    serialStatus.value = await motionDataService.openSerial({ port, baudRate })
   }
 
   async function closeSerial(): Promise<void> {
-    serialStatus.value = await run(() => motionDataService.closeSerial())
+    serialStatus.value = await motionDataService.closeSerial()
   }
 
   async function loadDeviceContext(deviceId: number): Promise<void> {
-    const [snapshot, realtime, diagnostics, records] = await run(() => Promise.all([
+    const [snapshot, realtime, diagnostics] = await Promise.all([
       motionDataService.getMotionSnapshot({ deviceId }),
       motionDataService.getRealtimeData({ deviceId }),
       motionDataService.getLinkDiagnostics({ deviceId }),
-      motionDataService.listMovements({ deviceId }),
-    ]))
+    ])
     snapshots.value[deviceId] = snapshot
     realtimeData.value[deviceId] = {
       ...realtime,
       trajectories: snapshot.trajectories,
     }
     linkDiagnostics.value[deviceId] = diagnostics
-    movementRecords.value[deviceId] = records
   }
 
-  async function refreshMotionSnapshot(deviceId: number): Promise<void> {
-    const snapshot = await motionDataService.getMotionSnapshot({ deviceId })
+  async function loadRealtimeContext(deviceId: number): Promise<void> {
+    const [snapshot, realtime] = await Promise.all([
+      motionDataService.getMotionSnapshot({ deviceId }),
+      motionDataService.getRealtimeData({ deviceId }),
+    ])
     snapshots.value[deviceId] = snapshot
-    const realtime = realtimeData.value[deviceId]
-    if (
-      realtime
-      && realtime.trajectoryRevision === snapshot.trajectoryRevision
-      && snapshot.trajectories.pcInertial.points.length > realtime.trajectories.pcInertial.points.length
-    ) {
-      realtimeData.value[deviceId] = { ...realtime, trajectories: snapshot.trajectories }
+    realtimeData.value[deviceId] = {
+      ...realtime,
+      trajectories: snapshot.trajectories,
     }
   }
 
   async function refreshRealtimeData(deviceId: number): Promise<void> {
-    const incoming = await motionDataService.getRealtimeData({ deviceId })
     const previous = realtimeData.value[deviceId]
-    const reset = previous?.trajectoryRevision !== incoming.trajectoryRevision
+    const incoming = await motionDataService.getRealtimeData({
+      deviceId,
+      trajectoryRevision: previous?.trajectoryRevision,
+      deviceTrajectoryCursor: previous?.deviceTrajectoryCursor,
+      pcTrajectoryCursor: previous?.pcTrajectoryCursor,
+    })
+    const reset = Boolean(
+      incoming.trajectoryReset
+      || incoming.deviceTrajectoryTruncated
+      || incoming.pcTrajectoryTruncated
+      || previous?.trajectoryRevision !== incoming.trajectoryRevision,
+    )
     realtimeData.value[deviceId] = {
       ...incoming,
       trajectories: {
@@ -159,51 +146,21 @@ export const useMotionStore = defineStore('motion', () => {
     }
   }
 
-  async function loadMovementRecords(deviceId: number, analysisMode?: AnalysisMode): Promise<void> {
-    movementRecords.value[deviceId] = await run(() => motionDataService.listMovements({ deviceId, analysisMode }))
-  }
-
-  async function loadMovementRecordsForDevices(deviceIds: number[]): Promise<void> {
-    const uniqueDeviceIds = [...new Set(deviceIds)]
-    const entries = await run(() => Promise.all(uniqueDeviceIds.map(async (deviceId) => (
-      [deviceId, await motionDataService.listMovements({ deviceId })] as const
-    ))))
-    for (const [deviceId, records] of entries) movementRecords.value[deviceId] = records
-  }
-
-  async function setAnalysisMode(deviceId: number, analysisMode: AnalysisMode): Promise<void> {
-    snapshots.value[deviceId] = await run(() => motionDataService.setAnalysisMode({ deviceId, analysisMode }))
-    realtimeData.value[deviceId] = await motionDataService.getRealtimeData({ deviceId })
-    movementRecords.value[deviceId] = await motionDataService.listMovements({ deviceId, analysisMode })
-  }
-
-  async function resetAnalysis(deviceId: number): Promise<void> {
-    snapshots.value[deviceId] = await run(() => motionDataService.resetAnalysis({ deviceId }))
-    movementRecords.value[deviceId] = []
-  }
-
-  async function resetPacketCounters(deviceId: number): Promise<void> {
-    const updated = await run(() => motionDataService.resetPacketCounters({ deviceId }))
-    const index = devices.value.findIndex((device) => device.deviceId === deviceId)
-    if (index >= 0) devices.value[index] = updated
-    linkDiagnostics.value[deviceId] = await motionDataService.getLinkDiagnostics({ deviceId })
-  }
-
   async function resetDataAndErrorCounters(deviceId: number): Promise<void> {
-    const updated = await run(() => motionDataService.resetDataAndErrorCounters({ deviceId }))
+    const updated = await motionDataService.resetDataAndErrorCounters({ deviceId })
     const index = devices.value.findIndex((device) => device.deviceId === deviceId)
     if (index >= 0) devices.value[index] = updated
   }
 
   async function executeCommand(deviceId: number, command: DeviceCommand): Promise<DeviceCommandResult> {
-    const result = await run(() => motionDataService.executeDeviceCommand({ deviceId, command }))
+    const result = await motionDataService.executeDeviceCommand({ deviceId, command })
     controlResults.value[deviceId] = result
     devices.value = await motionDataService.listDevices()
     return result
   }
 
   async function refreshBatteryVoltages(): Promise<BatteryRefreshResult> {
-    const result = await run(() => motionDataService.refreshBatteryVoltages())
+    const result = await motionDataService.refreshBatteryVoltages()
     devices.value = await motionDataService.listDevices()
     return result
   }
@@ -212,9 +169,13 @@ export const useMotionStore = defineStore('motion', () => {
     deviceId: number,
     movementId: number,
     analysisMode?: AnalysisMode,
+    taskId?: string,
   ): Promise<MovementDetail> {
-    const detail = await run(() => motionDataService.getMovementDetail({ deviceId, movementId, analysisMode }))
-    movementDetails.value[`${deviceId}:${analysisMode ?? 'pc'}:${movementId}`] = detail
+    const request = { deviceId, movementId, analysisMode }
+    const detail = await (taskId
+      ? motionDataService.getTaskMovementDetail({ ...request, taskId })
+      : motionDataService.getMovementDetail(request))
+    movementDetails.value[`${taskId ?? 'live'}:${deviceId}:${analysisMode ?? 'pc'}:${movementId}`] = detail
     return detail
   }
 
@@ -222,8 +183,9 @@ export const useMotionStore = defineStore('motion', () => {
     deviceId: number,
     movementId: number,
     analysisMode: AnalysisMode = 'pc',
+    taskId?: string,
   ): MovementDetail | null {
-    return movementDetails.value[`${deviceId}:${analysisMode}:${movementId}`] ?? null
+    return movementDetails.value[`${taskId ?? 'live'}:${deviceId}:${analysisMode}:${movementId}`] ?? null
   }
 
   async function exportMovement(
@@ -231,8 +193,9 @@ export const useMotionStore = defineStore('motion', () => {
     movementId: number,
     format: MovementExportFormat,
     analysisMode?: AnalysisMode,
+    taskId?: string,
   ): Promise<MovementExport> {
-    return run(() => motionDataService.exportMovement({ deviceId, movementId, analysisMode, format }))
+    return motionDataService.exportMovement({ deviceId, movementId, analysisMode, format, taskId })
   }
 
   return {
@@ -243,17 +206,11 @@ export const useMotionStore = defineStore('motion', () => {
     snapshots,
     realtimeData,
     linkDiagnostics,
-    movementRecords,
     movementDetails,
     controlResults,
-    loading,
-    errorMessage,
-    testedCount,
-    pendingCount,
     onlineCount,
     offlineCount,
     warningCount,
-    allMovementRecords,
     deviceById,
     loadDevices,
     loadBlockMapping,
@@ -263,13 +220,8 @@ export const useMotionStore = defineStore('motion', () => {
     openSerial,
     closeSerial,
     loadDeviceContext,
-    refreshMotionSnapshot,
+    loadRealtimeContext,
     refreshRealtimeData,
-    loadMovementRecords,
-    loadMovementRecordsForDevices,
-    setAnalysisMode,
-    resetAnalysis,
-    resetPacketCounters,
     resetDataAndErrorCounters,
     executeCommand,
     refreshBatteryVoltages,

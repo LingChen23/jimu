@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -15,12 +16,13 @@ import webbrowser
 
 from motion_model import ANALYSIS_MODE_PC, MotionStore
 from serial_service import SerialService
+from system_config import DEVICE_COUNT, DEVICE_IDS
 from task_service import TaskService
 
 
 ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = ROOT / "static"
-RUNTIME_ROOT = ROOT / "runtime"
+RUNTIME_ROOT = Path(os.environ.get("MOTION_DATA_DIR", ROOT / "runtime")).resolve()
 DEFAULTS_ROOT = ROOT / "defaults"
 
 
@@ -37,14 +39,28 @@ def _runtime_file(name: str) -> Path:
 SETTINGS_PATH = _runtime_file("motion_settings.json")
 BLOCK_MAPPING_PATH = _runtime_file("block_device_mapping.json")
 TASK_RECORDS_PATH = _runtime_file("task_records.json")
+DATABASE_PATH = Path(
+    os.environ.get("MOTION_DATABASE_PATH", RUNTIME_ROOT / "motion_system.sqlite3")
+).resolve()
+MOVEMENT_ARCHIVE_ROOT = Path(
+    os.environ.get("MOTION_MOVEMENT_ARCHIVE_DIR", RUNTIME_ROOT / "task_movements")
+).resolve()
 STORE = MotionStore(
-    device_count=12,
+    device_count=DEVICE_COUNT,
     default_analysis_mode=ANALYSIS_MODE_PC,
     settings_path=SETTINGS_PATH,
     mapping_path=BLOCK_MAPPING_PATH,
 )
-SERIAL = SerialService(STORE)
-TASKS = TaskService(TASK_RECORDS_PATH, STORE.snapshot)
+SERIAL = SerialService(STORE, device_ids=DEVICE_IDS)
+TASKS = TaskService(
+    TASK_RECORDS_PATH,
+    STORE.snapshot,
+    device_ids=DEVICE_IDS,
+    database_path=DATABASE_PATH,
+    movement_root=MOVEMENT_ARCHIVE_ROOT,
+    require_participant_profile=True,
+    movement_archived_callback=STORE.mark_movement_archived,
+)
 
 
 class ApiHandler(SimpleHTTPRequestHandler):
@@ -84,7 +100,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
 
     def _read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0 or length > 4096:
+        if length <= 0 or length > 65536:
             return {}
         return json.loads(self.rfile.read(length).decode("utf-8"))
 
@@ -120,7 +136,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
                     "serial": SERIAL.status(),
                     "controls": {
                         str(device_id): SERIAL.device_control_snapshot(device_id)
-                        for device_id in range(1, 13)
+                        for device_id in DEVICE_IDS
                     },
                 }
             )
@@ -128,8 +144,22 @@ class ApiHandler(SimpleHTTPRequestHandler):
         if path == "/api/tasks":
             self._json_response({"tasks": TASKS.list()})
             return
+        if path == "/api/participants":
+            search = query.get("search", [""])[0]
+            self._json_response({"participants": TASKS.participants(search)})
+            return
+        if path == "/api/participants/detail":
+            participant_id = query.get("participant_id", [""])[0]
+            profile = TASKS.participant(participant_id)
+            if profile is None:
+                self._json_response(
+                    {"error": "未找到体验者档案"}, HTTPStatus.NOT_FOUND
+                )
+                return
+            self._json_response({"participant": profile})
+            return
         if path == "/api/tasks/current":
-            device_id = max(1, min(12, self._integer(query, "device", 1)))
+            device_id = max(1, min(DEVICE_COUNT, self._integer(query, "device", 1)))
             self._json_response({"task": TASKS.current(device_id)})
             return
         if path == "/api/tasks/result":
@@ -142,23 +172,76 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 return
             self._json_response(result)
             return
+        if path == "/api/tasks/movement-detail":
+            task_id = query.get("task", [""])[0]
+            device_id = max(1, min(DEVICE_COUNT, self._integer(query, "device", 1)))
+            movement_id = self._integer(query, "movement", 0)
+            mode = query.get("mode", ["pc"])[0]
+            detail = TASKS.movement_detail(
+                task_id, device_id, movement_id, mode
+            )
+            if detail is None:
+                self._json_response(
+                    {"error": "未找到任务中保存的移动记录"},
+                    HTTPStatus.NOT_FOUND,
+                )
+                return
+            self._json_response(detail)
+            return
+        if path in {
+            "/api/tasks/movement-export.csv",
+            "/api/tasks/movement-export.json",
+        }:
+            task_id = query.get("task", [""])[0]
+            device_id = max(1, min(DEVICE_COUNT, self._integer(query, "device", 1)))
+            movement_id = self._integer(query, "movement", 0)
+            mode = query.get("mode", ["pc"])[0]
+            export_format = "csv" if path.endswith(".csv") else "json"
+            content = TASKS.movement_export(
+                task_id, device_id, movement_id, mode, export_format
+            )
+            if content is None:
+                self._json_response(
+                    {"error": "未找到任务中保存的导出数据"},
+                    HTTPStatus.NOT_FOUND,
+                )
+                return
+            filename = (
+                f"task_{task_id}_device_{device_id}_movement_{movement_id}."
+                f"{export_format}"
+            )
+            content_type = (
+                "text/csv; charset=utf-8"
+                if export_format == "csv"
+                else "application/json; charset=utf-8"
+            )
+            self._download_response(content, content_type, filename)
+            return
         if path == "/api/snapshot":
-            device_id = max(1, min(12, self._integer(query, "device", 1)))
+            device_id = max(1, min(DEVICE_COUNT, self._integer(query, "device", 1)))
             payload = STORE.snapshot(device_id)
             payload["serial"] = SERIAL.status()
             payload["control"] = SERIAL.device_control_snapshot(device_id)
             self._json_response(payload)
             return
         if path == "/api/live":
-            device_id = max(1, min(12, self._integer(query, "device", 1)))
-            self._json_response(STORE.live_snapshot(device_id))
+            device_id = max(1, min(DEVICE_COUNT, self._integer(query, "device", 1)))
+            revision = self._integer(query, "trajectory_revision", -1)
+            received_after = self._integer(query, "received_after", -1)
+            calculated_after = self._integer(query, "calculated_after", -1)
+            self._json_response(STORE.live_snapshot(
+                device_id,
+                revision if revision >= 0 else None,
+                received_after if received_after >= 0 else None,
+                calculated_after if calculated_after >= 0 else None,
+            ))
             return
         if path in {
             "/api/movement/detail",
             "/api/movement/export.csv",
             "/api/movement/export.json",
         }:
-            device_id = max(1, min(12, self._integer(query, "device", 1)))
+            device_id = max(1, min(DEVICE_COUNT, self._integer(query, "device", 1)))
             movement_id = self._integer(query, "movement", 0)
             mode = query.get("mode", [None])[0]
             if movement_id <= 0:
@@ -215,7 +298,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 self._json_response(SERIAL.close())
                 return
             if self.path == "/api/device/reset":
-                device_id = max(1, min(12, int(body.get("device", 1))))
+                device_id = max(1, min(DEVICE_COUNT, int(body.get("device", 1))))
                 if not STORE.reset_analysis(device_id):
                     raise ValueError("设备不存在")
                 self._json_response(
@@ -227,7 +310,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 )
                 return
             if self.path == "/api/device/reset-packet-counters":
-                device_id = max(1, min(12, int(body.get("device", 1))))
+                device_id = max(1, min(DEVICE_COUNT, int(body.get("device", 1))))
                 if not STORE.reset_packet_counters(device_id):
                     raise ValueError("设备不存在")
                 self._json_response(
@@ -239,16 +322,10 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 )
                 return
             if self.path == "/api/device/reset-data-error-counters":
-                device_id = max(1, min(12, int(body.get("device", 1))))
-                # Clear the four counters owned by the nRF first, verify them
-                # with a fresh status response, then rebase the two counters
-                # maintained by the PC receiver.
-                SERIAL.command(device_id, "RESET_STATS")
-                status_result = SERIAL.command(device_id, "GET_STATUS")
-                if not status_result.get("ok"):
-                    raise ValueError(str(status_result.get("message", "设备状态读取失败")))
-                if not STORE.reset_packet_counters(device_id):
-                    raise ValueError("设备不存在")
+                device_id = max(1, min(DEVICE_COUNT, int(body.get("device", 1))))
+                result = SERIAL.reset_data_and_error_counters(device_id)
+                if not result.get("ok"):
+                    raise ValueError(str(result.get("message", "计数清零失败")))
                 self._json_response(
                     {
                         "ok": True,
@@ -259,7 +336,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 )
                 return
             if self.path == "/api/device/command":
-                device_id = max(1, min(12, int(body.get("device", 1))))
+                device_id = max(1, min(DEVICE_COUNT, int(body.get("device", 1))))
                 command = str(body.get("command", "")).upper()
                 result = SERIAL.command(device_id, command)
                 result["control"] = SERIAL.device_control_snapshot(device_id)
@@ -269,7 +346,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 self._json_response(SERIAL.refresh_batteries())
                 return
             if self.path == "/api/device/mode":
-                device_id = max(1, min(12, int(body.get("device", 1))))
+                device_id = max(1, min(DEVICE_COUNT, int(body.get("device", 1))))
                 mode = str(body.get("mode", ""))
                 if not STORE.set_analysis_mode(device_id, mode):
                     raise ValueError("设备不存在")
@@ -301,14 +378,19 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 return
             if self.path == "/api/tasks/start":
                 device_id = int(body.get("device_id", 0))
+                task = TASKS.start(
+                    device_id,
+                    str(body.get("participant_id", "")),
+                    str(body.get("note", "")),
+                    body.get("participant_profile")
+                    if isinstance(body.get("participant_profile"), dict)
+                    else None,
+                )
+                STORE.set_task_collection_active(True)
                 self._json_response(
                     {
                         "ok": True,
-                        "task": TASKS.start(
-                            device_id,
-                            str(body.get("participant_id", "")),
-                            str(body.get("note", "")),
-                        ),
+                        "task": task,
                     }
                 )
                 return
@@ -321,22 +403,38 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 if current_task is not None:
                     deadline = time.monotonic() + 3.5
                     while time.monotonic() < deadline:
-                        snapshot = STORE.snapshot(int(current_task["device_id"]))
-                        if snapshot.get("current_movement") is None:
+                        active = any(
+                            STORE.snapshot(int(device_id)).get("current_movement")
+                            is not None
+                            for device_id in current_task.get(
+                                "device_ids", [current_task.get("device_id", 1)]
+                            )
+                        )
+                        if not active:
                             break
                         time.sleep(0.1)
-                STORE.wait_for_finalizations(timeout_seconds=1.0)
+                STORE.wait_for_finalizations(timeout_seconds=5.0)
+                task = TASKS.finish(task_id)
+                STORE.set_task_collection_active(False)
                 self._json_response(
                     {
                         "ok": True,
-                        "task": TASKS.finish(task_id),
+                        "task": task,
+                    }
+                )
+                return
+            if self.path == "/api/tasks/delete":
+                self._json_response(
+                    {
+                        "ok": True,
+                        "task": TASKS.delete(str(body.get("task_id", ""))),
                     }
                 )
                 return
             self._json_response(
                 {"error": "unknown endpoint"}, HTTPStatus.NOT_FOUND
             )
-        except (ValueError, OSError) as error:
+        except (ValueError, OSError, TypeError) as error:
             self._json_response(
                 {"error": str(error)}, HTTPStatus.BAD_REQUEST
             )

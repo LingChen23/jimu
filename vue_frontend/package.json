@@ -9,11 +9,10 @@
     "build": "vue-tsc -b && vite build",
     "test": "vitest run",
     "test:watch": "vitest",
-    "smoke:mock": "vite build --config vite.smoke.config.ts && node .smoke-dist/mock-motion-data-service.smoke.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
-    "echarts": "^5.6.0",
+    "echarts": "^6.1.0",
     "echarts-gl": "^2.1.0",
     "pinia": "^3.0.3",
     "vue": "^3.5.17",
@@ -26,5 +25,8 @@
     "vite": "^7.0.4",
     "vitest": "^4.1.10",
     "vue-tsc": "^3.0.1"
+  },
+  "overrides": {
+    "nanoid": "3.3.18"
   }
 }

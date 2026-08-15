@@ -11,6 +11,11 @@ const props = defineProps<{
   completedTask: TaskSummary | null
   movementDetails: MovementDetail[]
   resultLoading: boolean
+  taskExporting: boolean
+}>()
+
+const emit = defineEmits<{
+  exportTask: []
 }>()
 
 const result = computed(() => props.completedTask)
@@ -35,6 +40,12 @@ function formatSeconds(value: number): string {
           <div class="card-title">采集结果</div>
           <div class="card-subtitle">任务结束后生成本次采集的总评分和全部完整移动汇总</div>
         </div>
+        <button
+          v-if="result"
+          class="btn secondary"
+          :disabled="taskExporting"
+          @click="emit('exportTask')"
+        >{{ taskExporting ? '正在打包…' : '导出整次任务' }}</button>
       </div>
 
       <div v-if="currentTask" class="collection-result-pending">

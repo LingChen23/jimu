@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import StatusBadge from '@/shared/components/StatusBadge.vue'
 import type { MotionStatistics, SpeedStatistics, TremorMetrics } from '@/types/motion'
 
 const props = defineProps<{
@@ -56,7 +55,6 @@ const motionFeatures = computed<FeatureItem[]>(() => {
   <section class="card result-feature-summary">
     <div class="result-feature-head">
       <div class="card-title">运动特征</div>
-      <StatusBadge :tone="tremor?.valid ? 'green' : 'gray'" :text="tremor?.valid ? '震颤特征可用' : '暂无震颤特征'" />
     </div>
 
     <div class="result-feature-section">

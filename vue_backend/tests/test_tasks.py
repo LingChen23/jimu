@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import io
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -534,6 +536,33 @@ class TaskServiceTests(unittest.TestCase):
             self.assertEqual(exported_json["samples"][0]["gyro_dps"], [4, 5, 6])
             self.assertIn("participant_snapshot.name,李某", exported_csv)
             self.assertIn("imu_pc,0,1.2,3.4", exported_csv)
+
+            task_archive = service.task_export_archive(started["task_id"])
+            self.assertIsNotNone(task_archive)
+            with zipfile.ZipFile(io.BytesIO(task_archive)) as archive:
+                names = archive.namelist()
+                manifest = json.loads(archive.read("task.json"))
+                sample_json_name = next(
+                    name for name in names if name.endswith("/samples.json")
+                )
+                sample_csv_name = next(
+                    name for name in names if name.endswith("/samples.csv")
+                )
+                detail_name = next(
+                    name for name in names if name.endswith("/detail.json")
+                )
+                sample_json = json.loads(archive.read(sample_json_name))
+
+                self.assertEqual(manifest["movement_count"], 1)
+                self.assertEqual(manifest["task"]["task_id"], started["task_id"])
+                self.assertEqual(
+                    manifest["participant_snapshot"]["name"], "李某"
+                )
+                self.assertEqual(sample_json["samples"][0]["gyro_dps"], [4, 5, 6])
+                self.assertIn(b"imu_pc,0,1.2,3.4", archive.read(sample_csv_name))
+                self.assertEqual(
+                    json.loads(archive.read(detail_name))["movement_id"], 1
+                )
 
     def test_finished_task_persists_movement_detail(self) -> None:
         class SnapshotProvider:

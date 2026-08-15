@@ -5,12 +5,14 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime
 import hashlib
+import io
 import json
 from pathlib import Path
 import secrets
 import shutil
 import threading
 import uuid
+import zipfile
 from typing import Any, Callable
 
 from data_repository import DataRepository, normalize_participant_profile
@@ -664,6 +666,110 @@ class TaskService:
                 task,
                 reference,
             )
+
+    def task_export_archive(self, task_id: str) -> bytes | None:
+        """Build a self-contained ZIP export for every movement in one task.
+
+        The task snapshot is copied while holding the service lock, then the
+        potentially expensive compression work happens without blocking live
+        task updates or serial-data requests.
+        """
+        identifier = str(task_id).strip()
+        if not identifier:
+            raise ValueError("任务编号不能为空")
+        with self._lock:
+            stored_task = next(
+                (item for item in self._tasks if item.get("task_id") == identifier),
+                None,
+            )
+            if stored_task is None:
+                return None
+            task = deepcopy(stored_task)
+
+        references = task.get("movement_references", [])
+        movement_files = task.get("movement_files", {})
+        manifest_movements: list[dict[str, Any]] = []
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(
+            buffer,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=6,
+        ) as archive:
+            for fallback_index, reference in enumerate(references, start=1):
+                if not isinstance(reference, dict):
+                    continue
+                key = self._movement_key(reference)
+                files = movement_files.get(key, {})
+                movement_index = int(
+                    reference.get("task_movement_index", fallback_index)
+                )
+                device_id = int(reference["device_id"])
+                movement_id = int(reference["movement_id"])
+                mode = str(reference["analysis_mode"])
+                directory = (
+                    f"movements/{movement_index:04d}_device_{device_id}_"
+                    f"movement_{movement_id}_{mode}"
+                )
+                included: list[str] = []
+                missing: list[str] = []
+
+                detail = self._read_movement_file(files.get("detail"))
+                if detail is None:
+                    missing.append("detail.json")
+                else:
+                    name = f"{directory}/detail.json"
+                    archive.writestr(name, detail.encode("utf-8"))
+                    included.append(name)
+
+                for export_format in ("json", "csv"):
+                    content = self._read_movement_file(files.get(export_format))
+                    export_name = f"samples.{export_format}"
+                    if content is None:
+                        missing.append(export_name)
+                        continue
+                    enriched = self._enrich_export(
+                        content,
+                        export_format,
+                        task,
+                        reference,
+                    )
+                    name = f"{directory}/{export_name}"
+                    encoding = "utf-8-sig" if export_format == "csv" else "utf-8"
+                    archive.writestr(name, enriched.encode(encoding))
+                    included.append(name)
+
+                manifest_movements.append({
+                    **deepcopy(reference),
+                    "included_files": included,
+                    "missing_files": missing,
+                })
+
+            manifest = {
+                "export_schema_version": 1,
+                "exported_at": datetime.now().astimezone().isoformat(
+                    timespec="seconds"
+                ),
+                "task": self._public(task),
+                "participant_snapshot": deepcopy(
+                    task.get("participant_snapshot")
+                ),
+                "block_bindings": deepcopy(task.get("block_bindings", [])),
+                "movement_count": len(manifest_movements),
+                "movements": manifest_movements,
+                "storage": {
+                    "schema_version": DataRepository.SCHEMA_VERSION,
+                    "task_database": "sqlite",
+                    "sample_archive": "file",
+                },
+            }
+            archive.writestr(
+                "task.json",
+                (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode(
+                    "utf-8"
+                ),
+            )
+        return buffer.getvalue()
 
     def _enrich_export(
         self,

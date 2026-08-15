@@ -50,7 +50,10 @@ describe('trajectory chart options', () => {
     const option = buildProjectionOption({
       points: pcPoints,
       speeds: [0.1, 1.2],
-      markers: [{ point: pcPoints[1], title: '掉落', description: '掉落冲击 3.20 g', color: '#dc2626' }],
+      markers: [{
+        point: pcPoints[1], title: '掉落', description: '掉落冲击 3.20 g', color: '#dc2626',
+        symbolSize: 1, labelOnly: true,
+      }],
       unit: '无量纲',
       view: 'xy',
       chartWidth: 900,
@@ -58,7 +61,36 @@ describe('trajectory chart options', () => {
     })
 
     expect(option.series).toHaveLength(3)
-    expect(option.visualMap).toBeTruthy()
+    expect(option.visualMap).toMatchObject({ show: false })
+    const markerSeries = option.series[2] as { data: Array<{ itemStyle: { color: string } }> }
+    expect(markerSeries.data[0]?.itemStyle.color).toBe('rgba(0,0,0,0)')
+  })
+
+  it('renders a sustained action as a translucent outline below the speed path', () => {
+    const option = buildProjectionOption({
+      points: pcPoints,
+      speeds: [0.1, 1.2],
+      intervals: [{
+        eventId: 'rotation-1',
+        points: pcPoints,
+        title: '完整旋转',
+        description: '持续 1.00 秒',
+        color: '#f59e0b',
+      }],
+      unit: '无量纲',
+      view: 'xy',
+      chartWidth: 900,
+      chartHeight: 500,
+    })
+
+    expect(option.series).toHaveLength(3)
+    const interval = option.series[0] as { name: string; lineStyle: { width: number; opacity: number } }
+    const path = option.series[1] as { name: string }
+    expect(interval.name).toBe('完整旋转')
+    expect(interval.lineStyle.width).toBeGreaterThan(3)
+    expect(interval.lineStyle.opacity).toBeLessThan(0.5)
+    expect(path.name).toBe('PC 惯导轨迹')
+    expect(option.visualMap).toMatchObject({ seriesIndex: [1] })
   })
 
   it('returns an empty series list for missing trajectories', () => {

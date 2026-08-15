@@ -5,7 +5,6 @@ import type { ParticipantProfile, TaskResult, TaskSummary } from '@/types/task'
 
 export const useTaskStore = defineStore('task', () => {
   const currentTask = ref<TaskSummary | null>(null)
-  const latestCompletedTask = ref<TaskSummary | null>(null)
   const tasks = ref<TaskSummary[]>([])
   const taskResults = ref<Record<string, TaskResult>>({})
   const participants = ref<ParticipantProfile[]>([])
@@ -35,7 +34,6 @@ export const useTaskStore = defineStore('task', () => {
       note,
     })
     currentTask.value = task
-    latestCompletedTask.value = null
     tasks.value = [task, ...tasks.value.filter((item) => item.taskId !== task.taskId)]
     return task
   }
@@ -48,7 +46,6 @@ export const useTaskStore = defineStore('task', () => {
     currentTaskRequest += 1
     const task = await motionDataService.finishTask({ taskId })
     currentTask.value = null
-    latestCompletedTask.value = task
     const index = tasks.value.findIndex((item) => item.taskId === taskId)
     if (index >= 0) tasks.value[index] = task
     else tasks.value.unshift(task)
@@ -58,9 +55,6 @@ export const useTaskStore = defineStore('task', () => {
 
   async function loadTasks(): Promise<void> {
     tasks.value = await motionDataService.listTasks()
-    if (!latestCompletedTask.value) {
-      latestCompletedTask.value = tasks.value.find((task) => task.status === 'completed') ?? null
-    }
   }
 
   async function deleteTask(taskId: string): Promise<void> {
@@ -68,7 +62,6 @@ export const useTaskStore = defineStore('task', () => {
     tasks.value = tasks.value.filter((task) => task.taskId !== taskId)
     delete taskResults.value[taskId]
     if (currentTask.value?.taskId === taskId) currentTask.value = null
-    if (latestCompletedTask.value?.taskId === taskId) latestCompletedTask.value = null
   }
 
   async function loadTaskResult(taskId: string): Promise<TaskResult> {
@@ -77,13 +70,16 @@ export const useTaskStore = defineStore('task', () => {
     return result
   }
 
+  async function exportTask(taskId: string) {
+    return motionDataService.exportTask({ taskId })
+  }
+
   function resultById(taskId: string): TaskResult | null {
     return taskResults.value[taskId] ?? null
   }
 
   return {
     currentTask,
-    latestCompletedTask,
     tasks,
     participants,
     completedCount,
@@ -95,6 +91,7 @@ export const useTaskStore = defineStore('task', () => {
     loadTasks,
     deleteTask,
     loadTaskResult,
+    exportTask,
     resultById,
   }
 })

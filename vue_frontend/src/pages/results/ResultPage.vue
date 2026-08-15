@@ -26,6 +26,7 @@ const pageLoading = ref(true)
 const pageError = ref<string | null>(null)
 const enrichmentNotice = ref<string | null>(null)
 const exporting = ref<MovementExportFormat | null>(null)
+const exportingTask = ref(false)
 let routeRequest = 0
 
 const isTaskResult = computed(() => route.name === 'task-result')
@@ -174,6 +175,27 @@ async function downloadMovement(format: MovementExportFormat): Promise<void> {
     exporting.value = null
   }
 }
+
+async function downloadTask(): Promise<void> {
+  if (!taskId.value || exportingTask.value) return
+  exportingTask.value = true
+  pageError.value = null
+  try {
+    const exported = await taskStore.exportTask(taskId.value)
+    const url = URL.createObjectURL(exported.content)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = exported.fileName
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 0)
+  } catch (error) {
+    pageError.value = `导出失败：${error instanceof Error ? error.message : String(error)}`
+  } finally {
+    exportingTask.value = false
+  }
+}
 function goRealtime(): void {
   if (deviceId.value !== null) appStore.selectDevice(deviceId.value)
   void router.push('/realtime')
@@ -189,8 +211,9 @@ function goRealtime(): void {
         <p>详情类型由具名路由确定；通过实时采集结束或历史记录进入。</p>
       </div>
       <div class="heading-actions result-actions">
-        <button class="btn secondary" :disabled="!movementDetail || exporting !== null" @click="downloadMovement('csv')">{{ exporting === 'csv' ? '导出中…' : '导出 CSV' }}</button>
-        <button class="btn secondary" :disabled="!movementDetail || exporting !== null" @click="downloadMovement('json')">{{ exporting === 'json' ? '导出中…' : '导出 JSON' }}</button>
+        <button v-if="isTaskResult" class="btn secondary" :disabled="pageLoading || exportingTask" @click="downloadTask">{{ exportingTask ? '正在打包…' : '导出整次任务' }}</button>
+        <button class="btn secondary" :disabled="!movementDetail || exporting !== null" @click="downloadMovement('csv')">{{ exporting === 'csv' ? '导出中…' : '导出当前移动 CSV' }}</button>
+        <button class="btn secondary" :disabled="!movementDetail || exporting !== null" @click="downloadMovement('json')">{{ exporting === 'json' ? '导出中…' : '导出当前移动 JSON' }}</button>
         <button class="btn secondary" @click="router.push('/history')">返回历史记录</button>
         <button class="btn primary" :disabled="pageLoading || deviceId === null" @click="goRealtime">开始新任务</button>
       </div>

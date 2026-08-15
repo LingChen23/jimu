@@ -15,7 +15,7 @@ import type {
   SerialPortInfo,
   SerialStatus,
 } from '@/types/serial'
-import type { ParticipantProfile, TaskResult, TaskSummary } from '@/types/task'
+import type { ParticipantProfile, TaskArchiveExport, TaskResult, TaskSummary } from '@/types/task'
 
 export interface DeviceRequest {
   deviceId: number
@@ -83,6 +83,7 @@ export interface MotionDataService {
 
   getMovementDetail(request: MovementDetailRequest): Promise<MovementDetail>
   exportMovement(request: MovementExportRequest): Promise<MovementExport>
+  exportTask(request: TaskResultRequest): Promise<TaskArchiveExport>
 
   getCurrentTask(request: DeviceRequest): Promise<TaskSummary | null>
   listParticipants(): Promise<ParticipantProfile[]>

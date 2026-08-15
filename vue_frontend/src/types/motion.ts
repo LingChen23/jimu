@@ -28,6 +28,9 @@ export interface MotionEvent {
   id: string
   deviceId?: number
   timestamp: number
+  startTimestamp?: number
+  endTimestamp?: number
+  durationSeconds?: number
   type: MotionEventType
   title: string
   description: string
@@ -45,7 +48,6 @@ export interface MotionStatistics {
   spatialRotationDegrees: number
   spatialRotationTurns: number
   dropCount: number
-  suspectedDropCount: number
   abnormalCount: number
 }
 

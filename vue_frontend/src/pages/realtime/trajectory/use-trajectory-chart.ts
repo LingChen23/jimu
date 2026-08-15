@@ -18,6 +18,7 @@ import type {
 import {
   buildProjectionOption,
   buildThreeDimensionalOption,
+  type TrajectoryInterval,
   type TrajectoryMarker,
 } from './trajectory-chart-options'
 
@@ -27,6 +28,7 @@ interface UseTrajectoryChartInput {
   hasTrajectory: ComputedRef<boolean>
   speeds?: ComputedRef<number[]>
   markers?: ComputedRef<TrajectoryMarker[]>
+  intervals?: ComputedRef<TrajectoryInterval[]>
 }
 
 function trajectorySignature(points: TrajectoryVector[]): string {
@@ -40,10 +42,26 @@ function trajectorySignature(points: TrajectoryVector[]): string {
   return `${points.length}:${hash >>> 0}`
 }
 
-function analysisSignature(speeds: number[], markers: TrajectoryMarker[]): string {
+function analysisSignature(
+  speeds: number[],
+  markers: TrajectoryMarker[],
+  intervals: TrajectoryInterval[],
+): string {
   const speedKey = speeds.map((value) => Math.round(value * 10_000)).join(',')
   const markerKey = markers.map((marker) => `${marker.title}:${marker.point.map((value) => Math.round(value * 100_000)).join(',')}`).join('|')
-  return `${speedKey};${markerKey}`
+  const intervalKey = intervals.map((interval) => (
+    `${interval.eventId}:${interval.points.length}:${interval.points[0]?.join(',')}:${interval.points.at(-1)?.join(',')}`
+  )).join('|')
+  return `${speedKey};${markerKey};${intervalKey}`
+}
+
+function analysisStructureKey(
+  markers: TrajectoryMarker[],
+  intervals: TrajectoryInterval[],
+): string {
+  const markerSeries = markers.length ? 'markers' : 'no-markers'
+  const intervalSeries = intervals.map((interval) => interval.eventId).join(',')
+  return `${markerSeries}:${intervalSeries}`
 }
 
 function detectWebGL(): boolean {
@@ -92,18 +110,22 @@ export function useTrajectoryChart(input: UseTrajectoryChartInput) {
       renderError.value = null
       const isNewChart = chart === null
       chart ??= echarts.init(element)
-      const configurationKey = input.selectedView.value
+      const configurationKey = `${input.selectedView.value}:${analysisStructureKey(
+        input.markers?.value ?? [],
+        input.intervals?.value ?? [],
+      )}`
       const configurationChanged = lastConfigurationKey !== configurationKey
       const sizeKey = input.selectedView.value === 'iso'
         ? ''
         : `:${element.clientWidth}x${element.clientHeight}`
-      const renderSignature = `${configurationKey}:${trajectorySignature(input.points.value)}:${analysisSignature(input.speeds?.value ?? [], input.markers?.value ?? [])}${sizeKey}`
+      const renderSignature = `${configurationKey}:${trajectorySignature(input.points.value)}:${analysisSignature(input.speeds?.value ?? [], input.markers?.value ?? [], input.intervals?.value ?? [])}${sizeKey}`
       if (!isNewChart && !configurationChanged && lastRenderSignature === renderSignature) return
       const common = {
         points: input.points.value,
         unit: '无量纲',
         speeds: input.speeds?.value ?? [],
         markers: input.markers?.value ?? [],
+        intervals: input.intervals?.value ?? [],
       }
       const option = input.selectedView.value === 'iso'
         ? buildThreeDimensionalOption(common)
@@ -143,6 +165,7 @@ export function useTrajectoryChart(input: UseTrajectoryChartInput) {
       input.points.value,
       input.speeds?.value,
       input.markers?.value,
+      input.intervals?.value,
       input.selectedView.value,
     ],
     scheduleRender,

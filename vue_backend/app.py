@@ -85,11 +85,17 @@ class ApiHandler(SimpleHTTPRequestHandler):
 
     def _download_response(
         self,
-        content: str,
+        content: str | bytes,
         content_type: str,
         filename: str,
     ) -> None:
-        encoded = content.encode("utf-8-sig" if content_type.startswith("text/csv") else "utf-8")
+        encoded = (
+            content
+            if isinstance(content, bytes)
+            else content.encode(
+                "utf-8-sig" if content_type.startswith("text/csv") else "utf-8"
+            )
+        )
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(encoded)))
@@ -216,6 +222,20 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 else "application/json; charset=utf-8"
             )
             self._download_response(content, content_type, filename)
+            return
+        if path == "/api/tasks/export.zip":
+            task_id = query.get("task", [""])[0]
+            content = TASKS.task_export_archive(task_id)
+            if content is None:
+                self._json_response(
+                    {"error": "未找到采集任务"}, HTTPStatus.NOT_FOUND
+                )
+                return
+            self._download_response(
+                content,
+                "application/zip",
+                f"task_{task_id}.zip",
+            )
             return
         if path == "/api/snapshot":
             device_id = max(1, min(DEVICE_COUNT, self._integer(query, "device", 1)))

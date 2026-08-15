@@ -13,6 +13,17 @@ export interface TrajectoryMarker {
   description: string
   color: string
   speedMps?: number
+  symbolSize?: number
+  labelOnly?: boolean
+  labelPosition?: 'top' | 'right' | 'bottom' | 'left'
+}
+
+export interface TrajectoryInterval {
+  eventId: string
+  points: TrajectoryVector[]
+  title: string
+  description: string
+  color: string
 }
 
 export interface TrajectoryChartOption {
@@ -27,6 +38,7 @@ interface ThreeDimensionalOptionInput {
   unit: string
   speeds?: number[]
   markers?: TrajectoryMarker[]
+  intervals?: TrajectoryInterval[]
 }
 
 interface ProjectionOptionInput extends ThreeDimensionalOptionInput {
@@ -75,13 +87,40 @@ function lineSeries3D(points: TrajectoryVector[], name: string, color: string, s
 
 function markerSeries3D(markers: TrajectoryMarker[]) {
   if (!markers.length) return null
+  const positions = ['top', 'right', 'bottom', 'left'] as const
   return {
     id: 'pc-trajectory-analysis-markers', name: '轨迹事件', type: 'scatter3D', coordinateSystem: 'cartesian3D',
-    data: markers.map((marker) => ({ name: marker.title, value: [...marker.point, marker.speedMps ?? 0], description: marker.description, itemStyle: { color: marker.color } })),
-    symbolSize: 11,
-    label: { show: true, formatter: '{b}', color: '#24324a', fontSize: 10, distance: 5 },
+    data: markers.map((marker, index) => ({
+      name: marker.title,
+      value: [...marker.point, marker.speedMps ?? 0],
+      description: marker.description,
+      itemStyle: { color: marker.labelOnly ? 'rgba(0,0,0,0)' : marker.color },
+      label: { position: marker.labelPosition ?? positions[index % positions.length] },
+    })),
+    symbolSize: (_value: unknown, params: { dataIndex: number }) => markers[params.dataIndex]?.symbolSize ?? 11,
+    label: {
+      show: true, formatter: '{b}', color: '#24324a', fontSize: 10, distance: 16,
+      backgroundColor: 'rgba(255,255,255,.9)', borderColor: '#dce4ee', borderWidth: 1,
+      borderRadius: 4, padding: [3, 5],
+    },
+    labelLayout: { hideOverlap: true, moveOverlap: 'shiftY' },
     emphasis: { disabled: true },
   }
+}
+
+function intervalSeries3D(intervals: TrajectoryInterval[]) {
+  return intervals.map((interval, index) => ({
+    id: `pc-trajectory-interval-${index}`,
+    name: interval.title,
+    type: 'line3D',
+    coordinateSystem: 'cartesian3D',
+    data: interval.points,
+    // Render event ranges as a translucent underlay. The speed-coloured path
+    // is drawn afterwards, leaving the event colour visible only as an outline.
+    lineStyle: { color: interval.color, width: 11, opacity: 0.32 },
+    emphasis: { disabled: true },
+    tooltip: { show: false },
+  }))
 }
 
 function endpointSeries2D(
@@ -137,29 +176,50 @@ function lineSeries2D(points: TrajectoryPoint2D[], name: string, color: string, 
 function markerSeries2D(markers: TrajectoryMarker[], view: TrajectoryProjectionView) {
   if (!markers.length) return null
   const projection = trajectoryProjection(view)
+  const positions = ['top', 'right', 'bottom', 'left'] as const
   return {
     id: 'pc-trajectory-analysis-markers', name: '轨迹事件', type: 'scatter', coordinateSystem: 'cartesian2d',
-    data: markers.map((marker) => ({
+    data: markers.map((marker, index) => ({
       name: marker.title,
       value: [marker.point[projection.horizontalIndex], marker.point[projection.verticalIndex], marker.speedMps ?? 0],
       description: marker.description,
-      itemStyle: { color: marker.color },
+      itemStyle: { color: marker.labelOnly ? 'rgba(0,0,0,0)' : marker.color },
+      label: { position: marker.labelPosition ?? positions[index % positions.length] },
     })),
-    symbolSize: 11,
-    label: { show: true, formatter: '{b}', position: 'top', color: '#24324a', fontSize: 10 },
-    labelLayout: { hideOverlap: true }, emphasis: { disabled: true }, z: 6,
+    symbolSize: (_value: unknown, params: { dataIndex: number }) => markers[params.dataIndex]?.symbolSize ?? 11,
+    label: {
+      show: true, formatter: '{b}', color: '#24324a', fontSize: 10, distance: 14,
+      backgroundColor: 'rgba(255,255,255,.9)', borderColor: '#dce4ee', borderWidth: 1,
+      borderRadius: 4, padding: [3, 5],
+    },
+    labelLayout: { hideOverlap: true, moveOverlap: 'shiftY' }, emphasis: { disabled: true }, z: 6,
   }
 }
 
-function speedVisualMap(speeds: number[], dimension: number) {
+
+function intervalSeries2D(intervals: TrajectoryInterval[], view: TrajectoryProjectionView) {
+  return intervals.map((interval, index) => ({
+    id: `pc-trajectory-interval-${index}`,
+    name: interval.title,
+    type: 'line',
+    coordinateSystem: 'cartesian2d',
+    data: projectTrajectory(interval.points, view),
+    showSymbol: false,
+    lineStyle: { color: interval.color, width: 9, opacity: 0.32 },
+    emphasis: { disabled: true },
+    tooltip: { show: false },
+    z: 1,
+  }))
+}
+
+function speedVisualMap(speeds: number[], dimension: number, seriesIndex: number) {
   const finite = speeds.filter(Number.isFinite)
   if (!finite.length) return undefined
   const minimum = Math.min(...finite)
   const maximum = Math.max(...finite)
   return {
-    show: true, type: 'continuous', min: minimum, max: maximum > minimum ? maximum : minimum + 1e-6,
-    dimension, seriesIndex: [0], orient: 'horizontal', right: 18, bottom: 8,
-    itemWidth: 110, itemHeight: 8, text: ['快', '慢'], textGap: 4, calculable: false,
+    show: false, type: 'continuous', min: minimum, max: maximum > minimum ? maximum : minimum + 1e-6,
+    dimension, seriesIndex: [seriesIndex], calculable: false,
     inRange: { color: ['#2563eb', '#14b8a6', '#f59e0b', '#dc2626'] },
   }
 }
@@ -212,8 +272,9 @@ function axis2D(name: string, unit: string, minimum: number, maximum: number, ve
 }
 
 export function buildThreeDimensionalOption(input: ThreeDimensionalOptionInput): TrajectoryChartOption {
-  const { points, unit, speeds = [], markers = [] } = input
+  const { points, unit, speeds = [], markers = [], intervals = [] } = input
   const series = [
+    ...intervalSeries3D(intervals),
     lineSeries3D(points, 'PC 惯导轨迹', '#1769e8', speeds),
     endpointSeries3D(points, 'PC 惯导轨迹', '#1769e8'),
     markerSeries3D(markers),
@@ -222,7 +283,7 @@ export function buildThreeDimensionalOption(input: ThreeDimensionalOptionInput):
   return {
     animation: false,
     backgroundColor: '#ffffff',
-    visualMap: speedVisualMap(speeds, 3),
+    visualMap: speedVisualMap(speeds, 3, intervals.length),
     tooltip: {
       show: true,
       confine: true,
@@ -273,7 +334,7 @@ export function buildThreeDimensionalOption(input: ThreeDimensionalOptionInput):
 }
 
 export function buildProjectionOption(input: ProjectionOptionInput): TrajectoryChartOption {
-  const { points, view, unit, chartWidth, chartHeight, speeds = [], markers = [] } = input
+  const { points, view, unit, chartWidth, chartHeight, speeds = [], markers = [], intervals = [] } = input
   const projection = trajectoryProjection(view)
   const projectedPoints = projectTrajectory(points, view)
   const plotWidth = Math.max(chartWidth - projectionGrid.left - projectionGrid.right, 1)
@@ -285,6 +346,7 @@ export function buildProjectionOption(input: ProjectionOptionInput): TrajectoryC
     1,
   )
   const series = [
+    ...intervalSeries2D(intervals, view),
     lineSeries2D(projectedPoints, 'PC 惯导轨迹', '#1769e8', speeds),
     endpointSeries2D(projectedPoints, 'PC 惯导轨迹', '#1769e8', { start: 'top', current: 'right' }),
     markerSeries2D(markers, view),
@@ -293,7 +355,7 @@ export function buildProjectionOption(input: ProjectionOptionInput): TrajectoryC
   return {
     animation: false,
     backgroundColor: '#ffffff',
-    visualMap: speedVisualMap(speeds, 2),
+    visualMap: speedVisualMap(speeds, 2, intervals.length),
     tooltip: {
       show: true,
       trigger: 'item',

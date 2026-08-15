@@ -17,7 +17,7 @@ defineProps<{ statistics: MotionStatistics }>()
       <MetricCard icon="⚡" label="剧烈晃动" :value="`${statistics.strongShakeCount}次`" tone="orange" />
       <MetricCard icon="↕" label="翻转" :value="`${statistics.flipCount}次`" tone="purple" />
       <MetricCard icon="⟳" label="旋转" :value="`${statistics.rotationCount}次`" tone="purple" />
-      <MetricCard icon="↘" label="掉落 / 疑似" :value="`${statistics.dropCount} / ${statistics.suspectedDropCount}次`" tone="red" />
+      <MetricCard icon="↘" label="掉落" :value="`${statistics.dropCount}次`" tone="red" />
     </div>
   </section>
 </template>

@@ -37,6 +37,7 @@ import type {
   TaskResultRequest,
 } from './motion-data.service'
 import { fetchWithTimeout } from './http-client'
+import { estimateAngularEventStart } from '@/utils/motion-event-interval'
 
 type JsonObject = Record<string, any>
 
@@ -51,7 +52,6 @@ const emptyStatistics = () => ({
   spatialRotationDegrees: 0,
   spatialRotationTurns: 0,
   dropCount: 0,
-  suspectedDropCount: 0,
   abnormalCount: 0,
 })
 
@@ -617,6 +617,7 @@ export class MotionSystemDataService implements MotionDataService {
     const raw = await this.json(`${endpoint}?device=${request.deviceId}&movement=${request.movementId}&mode=${mode}${taskQuery}`)
     const base = movement(raw, request.deviceId, mode)
     const movementStartedAt = Date.parse(base.startedAt)
+    const gyroscopeSeries = axisRows(raw.gyroscope_series)
     const relativeEventTimestamp = (event: JsonObject, elapsedKey = 'elapsed_s', timeKey = 'time'): number => {
       const elapsed = nullableNumber(event[elapsedKey])
       if (elapsed !== null) return elapsed * 1_000
@@ -625,16 +626,30 @@ export class MotionSystemDataService implements MotionDataService {
         ? Math.max(0, absolute - movementStartedAt)
         : 0
     }
-    const pauses = (raw.pause_events ?? []).map((event: JsonObject) => ({
-      timestamp: relativeEventTimestamp({ ...event, time: event.start }),
-      durationSeconds: number(event.duration_seconds),
-      description: `停顿 ${number(event.duration_seconds).toFixed(2)} 秒`,
-    }))
-    const drops = (raw.drop_events ?? []).map((event: JsonObject) => ({
-      timestamp: relativeEventTimestamp(event, 'impact_s', 'impact_time'),
-      durationSeconds: 0,
-      description: `掉落冲击 ${number(event.impact_g).toFixed(2)} g`,
-    }))
+    const pauses = (raw.pause_events ?? []).map((event: JsonObject) => {
+      const startTimestamp = relativeEventTimestamp({ ...event, time: event.start })
+      const durationSeconds = number(event.duration_seconds)
+      return {
+        timestamp: startTimestamp,
+        startTimestamp,
+        endTimestamp: startTimestamp + durationSeconds * 1_000,
+        durationSeconds,
+        description: `停顿 ${durationSeconds.toFixed(2)} 秒`,
+      }
+    })
+    const drops = (raw.drop_events ?? []).map((event: JsonObject) => {
+      const endTimestamp = relativeEventTimestamp(event, 'impact_s', 'impact_time')
+      const freefallStart = nullableNumber(event.freefall_start_s)
+      const startTimestamp = freefallStart === null ? endTimestamp : freefallStart * 1_000
+      const durationSeconds = Math.max(0, endTimestamp - startTimestamp) / 1_000
+      return {
+        timestamp: endTimestamp,
+        startTimestamp,
+        endTimestamp,
+        durationSeconds,
+        description: `掉落 ${durationSeconds.toFixed(2)} 秒，冲击 ${number(event.impact_g).toFixed(2)} g`,
+      }
+    })
     const events = [
       ...pauses.map((event: { timestamp: number; durationSeconds: number; description: string }, index: number) => ({ id: `pause-${index}`, type: 'pause' as const, title: '停顿', level: 'warning' as const, ...event })),
       ...drops.map((event: { timestamp: number; durationSeconds: number; description: string }, index: number) => ({ id: `drop-${index}`, type: 'drop' as const, title: '掉落', level: 'danger' as const, ...event })),
@@ -643,19 +658,38 @@ export class MotionSystemDataService implements MotionDataService {
         timestamp: relativeEventTimestamp(event),
         description: `剧烈晃动（${number(event.dynamic_acceleration_mps2).toFixed(2)} m/s²）`,
       })),
-      ...(raw.flip_events ?? []).map((event: JsonObject, index: number) => ({
-        id: `flip-${index}`, type: 'flip' as const, title: '翻转', level: 'info' as const,
-        timestamp: relativeEventTimestamp(event), description: `第 ${index + 1} 次翻转`,
-      })),
-      ...(raw.rotation_events ?? []).map((event: JsonObject, index: number) => ({
-        id: `rotation-${index}`, type: 'rotation' as const, title: '完整旋转', level: 'info' as const,
-        timestamp: relativeEventTimestamp(event), description: `第 ${index + 1} 次完整一轴旋转`,
-      })),
+      ...(raw.flip_events ?? []).map((event: JsonObject, index: number) => {
+        const endTimestamp = relativeEventTimestamp(event)
+        const explicitStart = nullableNumber(event.start_elapsed_s)
+        const startTimestamp = explicitStart === null
+          ? estimateAngularEventStart(gyroscopeSeries, endTimestamp, 150, 600)
+          : explicitStart * 1_000
+        const durationSeconds = Math.max(0, endTimestamp - startTimestamp) / 1_000
+        return {
+          id: `flip-${index}`, type: 'flip' as const, title: '翻转', level: 'info' as const,
+          timestamp: endTimestamp, startTimestamp, endTimestamp, durationSeconds,
+          description: `第 ${index + 1} 次翻转，持续 ${durationSeconds.toFixed(2)} 秒`,
+        }
+      }),
+      ...(raw.rotation_events ?? []).map((event: JsonObject, index: number) => {
+        const endTimestamp = relativeEventTimestamp(event)
+        const explicitStart = nullableNumber(event.start_elapsed_s)
+        const degrees = nullableNumber(event.degrees) ?? 330
+        const startTimestamp = explicitStart === null
+          ? estimateAngularEventStart(gyroscopeSeries, endTimestamp, degrees, 1_000)
+          : explicitStart * 1_000
+        const durationSeconds = Math.max(0, endTimestamp - startTimestamp) / 1_000
+        return {
+          id: `rotation-${index}`, type: 'rotation' as const, title: '完整旋转', level: 'info' as const,
+          timestamp: endTimestamp, startTimestamp, endTimestamp, durationSeconds,
+          description: `第 ${index + 1} 次完整一轴旋转，持续 ${durationSeconds.toFixed(2)} 秒`,
+        }
+      }),
     ]
     return {
       ...base,
       acceleration: axisRows(raw.acceleration_series),
-      gyroscope: axisRows(raw.gyroscope_series),
+      gyroscope: gyroscopeSeries,
       dynamicAcceleration: axisRows(raw.dynamic_acceleration_series),
       speedSeries: (raw.speed_series ?? []).map((row: unknown[]) => ({ timestamp: number(row[0]) * 1_000, value: number(row[1]) })),
       orientation: orientation(null),
@@ -700,6 +734,20 @@ export class MotionSystemDataService implements MotionDataService {
   async listParticipants(): Promise<ParticipantProfile[]> {
     const raw = await this.json('/api/participants')
     return (raw.participants ?? []).map((item: JsonObject) => participantProfile(item))
+  }
+
+  async exportTask(request: TaskResultRequest) {
+    const response = await fetchWithTimeout(
+      `/api/tasks/export.zip?task=${encodeURIComponent(request.taskId)}`,
+      {},
+      120_000,
+    )
+    if (!response.ok) throw new Error(`整次任务导出失败：${response.status}`)
+    return {
+      fileName: `task_${request.taskId}.zip`,
+      mimeType: 'application/zip' as const,
+      content: await response.blob(),
+    }
   }
 
   async startTask(request: StartTaskRequest): Promise<TaskSummary> {

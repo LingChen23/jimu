@@ -72,3 +72,9 @@ export interface TaskResult {
   gyroscope: AxisPoint[]
   events: MotionEvent[]
 }
+
+export interface TaskArchiveExport {
+  fileName: string
+  mimeType: 'application/zip'
+  content: Blob
+}

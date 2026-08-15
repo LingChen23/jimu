@@ -66,10 +66,18 @@ COORD_CALIBRATING = 0x0040
 
 PAUSE_MIN_SECONDS = 0.8
 MOVEMENT_END_HOLD_SECONDS = 3.0
-SHAKE_START_MPS2 = 1.5 * GRAVITY
-SHAKE_END_MPS2 = 0.7 * GRAVITY
-SHAKE_GYRO_DPS = 300.0
-SHAKE_COOLDOWN_SECONDS = 0.45
+# Severe shake is counted as a continuous back-and-forth episode, not as each
+# threshold-crossing peak.  Acceleration energy is evaluated over a rolling
+# window while direction reversals reject isolated impacts and pure rotations.
+SHAKE_WINDOW_SECONDS = 0.50
+SHAKE_SMOOTHING_SECONDS = 0.08
+SHAKE_START_RMS_MPS2 = 0.8 * GRAVITY
+SHAKE_START_PEAK_MPS2 = 1.5 * GRAVITY
+SHAKE_END_MPS2 = 0.45 * GRAVITY
+SHAKE_DIRECTION_DEADBAND_MPS2 = 0.25 * GRAVITY
+SHAKE_MIN_DIRECTION_REVERSALS = 2
+SHAKE_CONFIRM_SECONDS = 0.25
+SHAKE_MERGE_GAP_SECONDS = 1.20
 # A physical full turn often integrates below 360 degrees because the first and
 # last slow samples fall under the rate gate. 330 degrees keeps a modest sensor
 # tolerance without allowing ordinary movement to become a completed rotation.
@@ -870,7 +878,16 @@ class MovementStats:
     pending_stop_sequence: int | None = None
     pending_stop_epoch: float | None = None
     shake_active: bool = False
-    last_shake_tick: int | None = None
+    shake_candidate_seconds: float = 0.0
+    shake_candidate_start_s: float | None = None
+    shake_quiet_seconds: float = 0.0
+    shake_last_energy_elapsed_s: float | None = None
+    shake_last_energy_epoch: float | None = None
+    shake_smoothed_linear: list[float] = field(default_factory=list, repr=False)
+    shake_window: deque[tuple[float, float, list[float], float, float]] = field(
+        default_factory=deque,
+        repr=False,
+    )
     rotation_degrees_total: float = 0.0
     rotation_progress_degrees: float = 0.0
     rotation_axis: list[float] | None = None
@@ -920,6 +937,208 @@ class MovementStats:
 
     def __post_init__(self) -> None:
         self.flip_reference_up = list(self.start_up)
+
+    def _shake_window_metrics(self) -> dict[str, float | int]:
+        if not self.shake_window:
+            return {
+                "accel_rms": 0.0,
+                "accel_peak": 0.0,
+                "gyro_rms": 0.0,
+                "gyro_peak": 0.0,
+                "direction_reversals": 0,
+            }
+        total_dt = sum(max(sample[1], 0.0) for sample in self.shake_window)
+        if total_dt <= 1e-9:
+            total_dt = float(len(self.shake_window))
+            weights = [1.0] * len(self.shake_window)
+        else:
+            weights = [max(sample[1], 0.0) for sample in self.shake_window]
+        accel_rms = math.sqrt(sum(
+            sample[3] * sample[3] * weight
+            for sample, weight in zip(self.shake_window, weights)
+        ) / total_dt)
+        gyro_rms = math.sqrt(sum(
+            sample[4] * sample[4] * weight
+            for sample, weight in zip(self.shake_window, weights)
+        ) / total_dt)
+        axis_energy = [
+            sum(sample[2][axis] * sample[2][axis] for sample in self.shake_window)
+            for axis in range(3)
+        ]
+        dominant_axis = max(range(3), key=axis_energy.__getitem__)
+        previous_sign = 0
+        reversals = 0
+        for sample in self.shake_window:
+            component = sample[2][dominant_axis]
+            sign = (
+                1 if component >= SHAKE_DIRECTION_DEADBAND_MPS2
+                else -1 if component <= -SHAKE_DIRECTION_DEADBAND_MPS2
+                else 0
+            )
+            if sign and previous_sign and sign != previous_sign:
+                reversals += 1
+            if sign:
+                previous_sign = sign
+        return {
+            "accel_rms": accel_rms,
+            "accel_peak": max(sample[3] for sample in self.shake_window),
+            "gyro_rms": gyro_rms,
+            "gyro_peak": max(sample[4] for sample in self.shake_window),
+            "direction_reversals": reversals,
+        }
+
+    def _start_shake_episode(
+        self,
+        elapsed_s: float,
+        sequence: int,
+        wall_epoch: float | None,
+        metrics: dict[str, float | int],
+    ) -> None:
+        start_elapsed_s = (
+            self.shake_candidate_start_s
+            if self.shake_candidate_start_s is not None
+            else elapsed_s
+        )
+        start_epoch = (
+            wall_epoch - max(0.0, elapsed_s - start_elapsed_s)
+            if wall_epoch is not None
+            else None
+        )
+        self.shake_count += 1
+        self.shake_active = True
+        self.shake_quiet_seconds = 0.0
+        self.shake_last_energy_elapsed_s = elapsed_s
+        self.shake_last_energy_epoch = wall_epoch
+        self.shake_events.append({
+            "shake_index": self.shake_count,
+            "elapsed_s": float(start_elapsed_s),
+            "end_elapsed_s": None,
+            "duration_seconds": 0.0,
+            "sequence": int(sequence),
+            "dynamic_acceleration_mps2": float(metrics["accel_peak"]),
+            "dynamic_acceleration_rms_mps2": float(metrics["accel_rms"]),
+            "angular_speed_dps": float(metrics["gyro_peak"]),
+            "angular_speed_rms_dps": float(metrics["gyro_rms"]),
+            "direction_reversals": int(metrics["direction_reversals"]),
+            "time": _iso_times(start_epoch),
+            "end_time": _iso_times(None),
+        })
+
+    def _finish_shake_episode(self) -> None:
+        if not self.shake_active or not self.shake_events:
+            return
+        event = self.shake_events[-1]
+        end_elapsed_s = (
+            self.shake_last_energy_elapsed_s
+            if self.shake_last_energy_elapsed_s is not None
+            else self.moving_seconds
+        )
+        event["end_elapsed_s"] = float(end_elapsed_s)
+        event["duration_seconds"] = max(
+            0.0,
+            float(end_elapsed_s) - float(event["elapsed_s"]),
+        )
+        event["end_time"] = _iso_times(self.shake_last_energy_epoch)
+        self.shake_active = False
+        self.shake_candidate_seconds = 0.0
+        self.shake_candidate_start_s = None
+        self.shake_quiet_seconds = 0.0
+        self.shake_last_energy_elapsed_s = None
+        self.shake_last_energy_epoch = None
+
+    def _update_shake(
+        self,
+        linear_world: list[float],
+        linear_magnitude: float,
+        gyro_magnitude: float,
+        dt: float,
+        elapsed_s: float,
+        sequence: int,
+        wall_epoch: float | None,
+    ) -> None:
+        dt = max(0.0, float(dt))
+        if not self.shake_smoothed_linear:
+            self.shake_smoothed_linear = list(linear_world)
+        else:
+            alpha = min(1.0, dt / (SHAKE_SMOOTHING_SECONDS + dt)) if dt else 0.0
+            self.shake_smoothed_linear = [
+                previous + alpha * (current - previous)
+                for previous, current in zip(
+                    self.shake_smoothed_linear,
+                    linear_world,
+                )
+            ]
+        self.shake_window.append((
+            float(elapsed_s),
+            dt,
+            list(self.shake_smoothed_linear),
+            float(linear_magnitude),
+            float(gyro_magnitude),
+        ))
+        while (
+            self.shake_window
+            and elapsed_s - self.shake_window[0][0] > SHAKE_WINDOW_SECONDS
+        ):
+            self.shake_window.popleft()
+
+        metrics = self._shake_window_metrics()
+        qualifies = (
+            float(metrics["accel_rms"]) >= SHAKE_START_RMS_MPS2
+            and float(metrics["accel_peak"]) >= SHAKE_START_PEAK_MPS2
+            and int(metrics["direction_reversals"])
+            >= SHAKE_MIN_DIRECTION_REVERSALS
+        )
+        # Ending/merging is measured from the most recent energetic sample,
+        # rather than after the rolling RMS window has drained. This makes the
+        # configured gap correspond to the physical pause between two bouts.
+        energetic = linear_magnitude >= SHAKE_END_MPS2
+
+        if self.shake_active:
+            event = self.shake_events[-1]
+            event["dynamic_acceleration_mps2"] = max(
+                float(event["dynamic_acceleration_mps2"]),
+                float(metrics["accel_peak"]),
+            )
+            event["dynamic_acceleration_rms_mps2"] = max(
+                float(event["dynamic_acceleration_rms_mps2"]),
+                float(metrics["accel_rms"]),
+            )
+            event["angular_speed_dps"] = max(
+                float(event["angular_speed_dps"]),
+                float(metrics["gyro_peak"]),
+            )
+            event["angular_speed_rms_dps"] = max(
+                float(event["angular_speed_rms_dps"]),
+                float(metrics["gyro_rms"]),
+            )
+            event["direction_reversals"] = max(
+                int(event["direction_reversals"]),
+                int(metrics["direction_reversals"]),
+            )
+            if energetic:
+                self.shake_quiet_seconds = 0.0
+                self.shake_last_energy_elapsed_s = elapsed_s + dt
+                self.shake_last_energy_epoch = wall_epoch
+            else:
+                self.shake_quiet_seconds += dt
+                if self.shake_quiet_seconds >= SHAKE_MERGE_GAP_SECONDS:
+                    self._finish_shake_episode()
+            return
+
+        if qualifies:
+            if self.shake_candidate_seconds <= 0.0:
+                self.shake_candidate_start_s = float(self.shake_window[0][0])
+            self.shake_candidate_seconds += dt
+            if self.shake_candidate_seconds >= SHAKE_CONFIRM_SECONDS:
+                self._start_shake_episode(
+                    elapsed_s,
+                    sequence,
+                    wall_epoch,
+                    metrics,
+                )
+        else:
+            self.shake_candidate_seconds = 0.0
+            self.shake_candidate_start_s = None
 
     def _add_live_speed(self, speed: float) -> None:
         """Maintain O(1) live moments and a bounded quantile sample.
@@ -1241,31 +1460,15 @@ class MovementStats:
         self.accel_max = max(self.accel_max, linear_magnitude)
         self._add_live_speed(speed)
 
-        cooldown_ready = (
-            self.last_shake_tick is None
-            or _tick_seconds(tick, self.last_shake_tick) >= SHAKE_COOLDOWN_SECONDS
+        self._update_shake(
+            estimate.linear_world,
+            linear_magnitude,
+            gyro_magnitude,
+            estimate.dt,
+            elapsed_s,
+            sequence,
+            wall_epoch,
         )
-        severe = (
-            linear_magnitude >= SHAKE_START_MPS2
-            or gyro_magnitude >= SHAKE_GYRO_DPS
-        )
-        if severe and not self.shake_active and cooldown_ready:
-            self.shake_count += 1
-            self.shake_active = True
-            self.last_shake_tick = tick
-            self.shake_events.append({
-                "shake_index": self.shake_count,
-                "elapsed_s": float(elapsed_s),
-                "sequence": int(sequence),
-                "dynamic_acceleration_mps2": float(linear_magnitude),
-                "angular_speed_dps": float(gyro_magnitude),
-                "time": _iso_times(wall_epoch),
-            })
-        elif (
-            linear_magnitude < SHAKE_END_MPS2
-            and gyro_magnitude < SHAKE_GYRO_DPS * 0.5
-        ):
-            self.shake_active = False
 
         # Complete one-axis rotations are tracked in world coordinates so an
         # arbitrary physical axis remains comparable while the body turns.
@@ -1423,6 +1626,7 @@ class MovementStats:
         """Seal the segment using only bounded, non-FFT work."""
         if self.prepared_for_finalize:
             return
+        self._finish_shake_episode()
         self._finish_spatial_rotation_segment()
         # PC stop confirmation is backdated to the first quiet sample. Remove any
         # already-buffered samples at/after that transition so duration, FFT and
@@ -1614,6 +1818,18 @@ class MovementStats:
             "analysis_parameters": {
                 "pause_min_seconds": PAUSE_MIN_SECONDS,
                 "movement_end_hold_seconds": MOVEMENT_END_HOLD_SECONDS,
+                "shake_window_seconds": SHAKE_WINDOW_SECONDS,
+                "shake_start_rms_mps2": SHAKE_START_RMS_MPS2,
+                "shake_start_peak_mps2": SHAKE_START_PEAK_MPS2,
+                "shake_end_mps2": SHAKE_END_MPS2,
+                "shake_direction_deadband_mps2": (
+                    SHAKE_DIRECTION_DEADBAND_MPS2
+                ),
+                "shake_min_direction_reversals": (
+                    SHAKE_MIN_DIRECTION_REVERSALS
+                ),
+                "shake_confirm_seconds": SHAKE_CONFIRM_SECONDS,
+                "shake_merge_gap_seconds": SHAKE_MERGE_GAP_SECONDS,
                 "rotation_start_rate_dps": ROTATION_START_RATE_DPS,
                 "rotation_continue_rate_dps": ROTATION_CONTINUE_RATE_DPS,
                 "rotation_threshold_degrees": ROTATION_THRESHOLD_DEGREES,

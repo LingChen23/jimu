@@ -14,7 +14,7 @@ function device(deviceId: number, batteryVoltageMv: number | null, streaming: bo
     integrationStatus: 'tested', connectionStatus: 'online', usageStatus: 'idle', motionState: 'stationary',
     currentTaskId: null, sessionId: '1', gatewayName: '网关A', lastDataAgoMs: 0, packetCount: 0,
     lostPacketCount: 0, dataQuality: 'good', batteryPercent: null, acceleration: [], gyroscope: [], events: [],
-    statistics: { movingSeconds: 0, stationarySeconds: 0, pauseCount: 0, pauseTotalSeconds: 0, strongShakeCount: 0, flipCount: 0, rotationCount: 0, spatialRotationDegrees: 0, spatialRotationTurns: 0, dropCount: 0, suspectedDropCount: 0, abnormalCount: 0 },
+    statistics: { movingSeconds: 0, stationarySeconds: 0, pauseCount: 0, pauseTotalSeconds: 0, strongShakeCount: 0, flipCount: 0, rotationCount: 0, spatialRotationDegrees: 0, spatialRotationTurns: 0, dropCount: 0, abnormalCount: 0 },
     health: { batteryVoltageMv, batteryLow: null, firmware: null, sensorStatus: 'ok', calibrated: true, streaming, uptimeSeconds: null, resetReason: null, latestSampleSequence: null, queueDepth: null, errors: { sampleGapCount: 0, sensorErrorCount: 0, queueDropCount: 0, bleResourceWaitCount: 0, abnormalCount: 0 } },
   }
 }

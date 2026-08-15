@@ -33,8 +33,8 @@ function durationText(): string {
   return seconds === null || seconds === undefined ? '—' : `${seconds}秒`
 }
 const displayedScore = computed(() => props.resultKind === 'task'
-  ? props.movementReference?.score ?? null
-  : props.taskResult?.score.totalScore ?? null)
+  ? props.task?.totalScore ?? props.taskResult?.score.totalScore ?? null
+  : props.movementReference?.score ?? null)
 </script>
 
 <template>
@@ -64,7 +64,7 @@ const displayedScore = computed(() => props.resultKind === 'task'
   </section>
 
   <section class="card score result-score-card">
-      <span>{{ resultKind === 'task' ? '本次移动评分' : '评分' }}</span>
+      <span>{{ resultKind === 'task' ? '本次任务评分' : '本次移动评分' }}</span>
       <strong>{{ displayedScore ?? '—' }}<small v-if="displayedScore !== null">分</small></strong>
       <StatusBadge :tone="displayedScore !== null ? 'green' : 'gray'" :text="displayedScore !== null ? '已评分' : '未评分'" />
   </section>

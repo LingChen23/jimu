@@ -14,6 +14,11 @@ const props = defineProps<{
   completedTask: TaskSummary | null
   completedMovementDetails: MovementDetail[]
   resultLoading: boolean
+  taskExporting: boolean
+}>()
+
+const emit = defineEmits<{
+  exportTask: []
 }>()
 
 const ready = computed(() => Boolean(props.realtime?.available ?? props.snapshot?.available))
@@ -38,6 +43,8 @@ const ready = computed(() => Boolean(props.realtime?.available ?? props.snapshot
         :completed-task="completedTask"
         :movement-details="completedMovementDetails"
         :result-loading="resultLoading"
+        :task-exporting="taskExporting"
+        @export-task="emit('exportTask')"
       />
     </div>
   </div>

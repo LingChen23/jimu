@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import StatusBadge from '@/shared/components/StatusBadge.vue'
 import type { SessionTremorAverage, TremorMetrics } from '@/types/motion'
 
 defineProps<{
@@ -16,7 +15,6 @@ function nullable(value: number | null | undefined, suffix = '', digits = 2): st
   <section v-if="tremor" class="card tremor-review-card">
       <div class="section-head">
         <div><div class="card-title">震颤审核</div><div class="card-subtitle">频域结果及会话平均</div></div>
-        <StatusBadge :tone="tremor.valid ? 'green' : 'gray'" :text="tremor.valid ? '结果有效' : '结果无效'" />
       </div>
       <div class="tremor-primary"><strong>{{ nullable(tremor.dominantFrequencyHz, ' Hz') }}</strong></div>
       <div class="tremor-review-grid">

@@ -700,23 +700,104 @@ class MotionProtocolTests(unittest.TestCase):
 
     def test_shake_and_flip_are_counted_independently(self) -> None:
         movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
-        estimate = InertialEstimate(
-            accel=[0.0, 0.0, 9.80665],
-            gyro_dps=[0.0, 0.0, 0.0],
-            corrected_gyro_dps=[0.0, 0.0, 0.0],
-            linear_world=[16.0, 0.0, 0.0],
-            velocity=[0.0, 0.0, 0.0],
-            position=[0.0, 0.0, 0.0],
-            up_world=[0.0, 0.0, -1.0],
-            dt=0.01,
-            stationary=False,
-        )
-
-        for index in range(30):
-            movement.add_sample(estimate, index * 328)
+        for index in range(200):
+            direction = 16.0 if (index // 5) % 2 == 0 else -16.0
+            movement.add_sample(InertialEstimate(
+                accel=[0.0, 0.0, 9.80665],
+                gyro_dps=[0.0, 0.0, 0.0],
+                corrected_gyro_dps=[0.0, 0.0, 0.0],
+                linear_world=[direction, 0.0, 0.0],
+                velocity=[0.0, 0.0, 0.0],
+                position=[0.0, 0.0, 0.0],
+                up_world=[0.0, 0.0, -1.0],
+                dt=0.01,
+                stationary=False,
+            ), index * 328)
 
         self.assertEqual(movement.shake_count, 1)
         self.assertEqual(movement.flip_count, 1)
+
+    def test_continuous_shake_peaks_are_one_episode(self) -> None:
+        movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
+
+        def estimate(linear_x: float, gyro_z: float = 0.0) -> InertialEstimate:
+            return InertialEstimate(
+                accel=[0.0, 0.0, 9.80665],
+                gyro_dps=[0.0, 0.0, gyro_z],
+                corrected_gyro_dps=[0.0, 0.0, gyro_z],
+                linear_world=[linear_x, 0.0, 0.0],
+                velocity=[0.0, 0.0, 0.0],
+                position=[0.0, 0.0, 0.0],
+                up_world=[0.0, 0.0, 1.0],
+                dt=0.01,
+                stationary=False,
+            )
+
+        tick = 0
+        for index in range(300):
+            direction = 16.0 if (index // 5) % 2 == 0 else -16.0
+            movement.add_sample(estimate(direction), tick, index, 1000.0 + index * 0.01)
+            tick += 328
+        for index in range(130):
+            movement.add_sample(estimate(0.0), tick, 300 + index, 1003.0 + index * 0.01)
+            tick += 328
+
+        self.assertEqual(movement.shake_count, 1)
+        self.assertFalse(movement.shake_active)
+        event = movement.shake_events[0]
+        self.assertGreater(event["duration_seconds"], 2.5)
+        self.assertGreaterEqual(event["direction_reversals"], 2)
+
+    def test_shakes_separated_by_merge_gap_are_two_episodes(self) -> None:
+        movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
+
+        def estimate(linear_x: float) -> InertialEstimate:
+            return InertialEstimate(
+                accel=[0.0, 0.0, 9.80665],
+                gyro_dps=[0.0, 0.0, 0.0],
+                corrected_gyro_dps=[0.0, 0.0, 0.0],
+                linear_world=[linear_x, 0.0, 0.0],
+                velocity=[0.0, 0.0, 0.0],
+                position=[0.0, 0.0, 0.0],
+                up_world=[0.0, 0.0, 1.0],
+                dt=0.01,
+                stationary=False,
+            )
+
+        tick = 0
+        sequence = 0
+        for sample_count, shaking in ((150, True), (150, False), (150, True)):
+            for local_index in range(sample_count):
+                direction = (
+                    16.0 if (local_index // 5) % 2 == 0 else -16.0
+                ) if shaking else 0.0
+                movement.add_sample(estimate(direction), tick, sequence)
+                tick += 328
+                sequence += 1
+
+        self.assertEqual(movement.shake_count, 2)
+
+    def test_isolated_impact_and_pure_rotation_are_not_shakes(self) -> None:
+        movement = MovementStats(1, 0, [0.0, 0.0, 1.0])
+
+        def estimate(linear_x: float, gyro_z: float = 0.0) -> InertialEstimate:
+            return InertialEstimate(
+                accel=[0.0, 0.0, 9.80665],
+                gyro_dps=[0.0, 0.0, gyro_z],
+                corrected_gyro_dps=[0.0, 0.0, gyro_z],
+                linear_world=[linear_x, 0.0, 0.0],
+                velocity=[0.0, 0.0, 0.0],
+                position=[0.0, 0.0, 0.0],
+                up_world=[0.0, 0.0, 1.0],
+                dt=0.01,
+                stationary=False,
+            )
+
+        movement.add_sample(estimate(30.0), 0)
+        for index in range(1, 100):
+            movement.add_sample(estimate(0.0, 500.0), index * 328)
+
+        self.assertEqual(movement.shake_count, 0)
 
     def test_full_gyro_rotation_counts_once(self) -> None:
         movement = MovementStats(1, 0, [0.0, 0.0, 1.0])

@@ -11,7 +11,7 @@ function detail(speedValues: number[], movingSeconds: number, shakeCount: number
       movingSeconds, stationarySeconds: 0, pauseCount: 1, pauseTotalSeconds: .8,
       strongShakeCount: shakeCount, flipCount: 1, rotationCount: 2,
       spatialRotationDegrees: 360, spatialRotationTurns: 1, dropCount: 0,
-      suspectedDropCount: 0, abnormalCount: 0,
+      abnormalCount: 0,
     },
     speed: {
       maximumMps: 0, p05Mps: 0, averageMps: 0, medianMps: 0,

@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import StatusBadge from '@/shared/components/StatusBadge.vue'
 import type { SpeedStatistics } from '@/types/motion'
 
 defineProps<{
@@ -14,7 +13,6 @@ function speedText(value: number | null | undefined): string {
   <section v-if="speed" class="card speed-review-card">
     <div class="section-head">
       <div><div class="card-title">速度统计</div><div class="card-subtitle">来自完整移动详情</div></div>
-      <StatusBadge tone="orange" text="惯导估算" />
     </div>
     <div class="speed-review-grid">
       <div><span>最小速度</span><b>{{ speedText(speed.p05Mps) }}</b></div>

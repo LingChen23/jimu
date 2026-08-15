@@ -7,7 +7,7 @@ import RealtimeDevicePanel from './components/RealtimeDevicePanel.vue'
 import RealtimeTelemetryPanel from './components/RealtimeTelemetryPanel.vue'
 import TaskCreateModal from './components/TaskCreateModal.vue'
 import { isTaskBoundToDevice } from './realtime.view-model'
-import type { ParticipantProfile } from '@/types/task'
+import type { ParticipantProfile, TaskSummary } from '@/types/task'
 import type { MovementDetail } from '@/types/motion'
 
 const appStore = useAppStore()
@@ -25,6 +25,8 @@ const note = ref('')
 const taskActionLoading = ref(false)
 const taskActionError = ref<string | null>(null)
 const completedMovementDetails = ref<MovementDetail[]>([])
+const completedTask = ref<TaskSummary | null>(null)
+const taskExporting = ref(false)
 const resultLoading = ref(false)
 let selectionRequest = 0
 let liveTrajectoryTimer: number | null = null
@@ -48,7 +50,6 @@ const taskBindingMismatch = computed(() => Boolean(selectedTask.value && device.
 const currentTask = computed(() => (
   isTaskBoundToDevice(selectedTask.value, device.value) ? selectedTask.value : null
 ))
-const completedTask = computed(() => taskStore.latestCompletedTask)
 const canStart = computed(() => Boolean(isTested.value && !selectedTask.value && !switching.value && !taskActionLoading.value))
 const canFinish = computed(() => Boolean(
   currentTask.value?.status === 'collecting' && !taskBindingMismatch.value && !switching.value && !taskActionLoading.value,
@@ -145,10 +146,6 @@ onMounted(async () => {
     const initialDeviceId = motionStore.deviceById(appStore.selectedDeviceId)?.deviceId
       ?? motionStore.devices[0]?.deviceId
     if (initialDeviceId) await loadSelectedDevice(initialDeviceId)
-    if (!taskStore.currentTask) {
-      await taskStore.loadTasks()
-      if (completedTask.value) await loadCompletedTaskDetails(completedTask.value)
-    }
   } catch (error) {
     if (pageActive) taskActionError.value = error instanceof Error ? error.message : String(error)
   } finally {
@@ -178,6 +175,7 @@ async function startTask(): Promise<void> {
   taskActionError.value = null
   try {
     await taskStore.startTask(device.value.deviceId, participantProfile.value, note.value.trim())
+    completedTask.value = null
     completedMovementDetails.value = []
     modal.value = false
   } catch (error) {
@@ -195,6 +193,7 @@ async function finishAndViewResult(): Promise<void> {
   taskActionError.value = null
   try {
     const finished = await taskStore.finishTask(taskId)
+    completedTask.value = finished
     await nextTick()
     document.getElementById('realtime-collection-result')
       ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
@@ -220,6 +219,28 @@ async function loadCompletedTaskDetails(task: import('@/types/task').TaskSummary
     )).flatMap((result) => result.status === 'fulfilled' ? [result.value] : [])
   } finally {
     resultLoading.value = false
+  }
+}
+
+async function exportCompletedTask(): Promise<void> {
+  const task = completedTask.value
+  if (!task || taskExporting.value) return
+  taskExporting.value = true
+  taskActionError.value = null
+  try {
+    const exported = await taskStore.exportTask(task.taskId)
+    const url = URL.createObjectURL(exported.content)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = exported.fileName
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 0)
+  } catch (error) {
+    taskActionError.value = `导出失败：${error instanceof Error ? error.message : String(error)}`
+  } finally {
+    taskExporting.value = false
   }
 }
 </script>
@@ -255,6 +276,8 @@ async function loadCompletedTaskDetails(task: import('@/types/task').TaskSummary
       :completed-task="completedTask"
       :completed-movement-details="completedMovementDetails"
       :result-loading="resultLoading"
+      :task-exporting="taskExporting"
+      @export-task="exportCompletedTask"
     />
 
     <TaskCreateModal

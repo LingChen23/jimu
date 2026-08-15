@@ -31,13 +31,12 @@ export function aggregateTaskMovements(details: MovementDetail[]): TaskMotionAgg
       spatialRotationDegrees: total.spatialRotationDegrees + value.spatialRotationDegrees,
       spatialRotationTurns: total.spatialRotationTurns + value.spatialRotationTurns,
       dropCount: total.dropCount + value.dropCount,
-      suspectedDropCount: total.suspectedDropCount + value.suspectedDropCount,
       abnormalCount: total.abnormalCount + value.abnormalCount,
     }
   }, {
     movingSeconds: 0, stationarySeconds: 0, pauseCount: 0, pauseTotalSeconds: 0,
     strongShakeCount: 0, flipCount: 0, rotationCount: 0, spatialRotationDegrees: 0,
-    spatialRotationTurns: 0, dropCount: 0, suspectedDropCount: 0, abnormalCount: 0,
+    spatialRotationTurns: 0, dropCount: 0, abnormalCount: 0,
   })
 
   const speeds = details.flatMap((detail) => detail.speedSeries.map((point) => point.value))

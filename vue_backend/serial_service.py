@@ -96,11 +96,13 @@ class SerialService:
         self._gateway_lost_frames = 0
         self._last_gateway_sequence: dict[int, int] = {}
         self._decoder = GatewayStreamDecoder()
+        self._decoder_counter_baseline = self._decoder_counters(self._decoder)
         self._request_id = 0
         self._responses: dict[tuple[int, int], ControlResponse] = {}
         self._pending_response_keys: set[tuple[int, int]] = set()
         self._device_control: dict[int, dict[str, Any]] = {}
         self._aggregator_diagnostic: dict[str, Any] | None = None
+        self._aggregator_counter_baseline: dict[str, Any] | None = None
         self._host_session_id = 0
         self._host_session_ready = False
 
@@ -148,10 +150,12 @@ class SerialService:
                 self._last_gateway_sequence = {}
                 decoder = GatewayStreamDecoder()
                 self._decoder = decoder
+                self._decoder_counter_baseline = self._decoder_counters(decoder)
                 self._responses = {}
                 self._pending_response_keys = set()
                 self._device_control = {}
                 self._aggregator_diagnostic = None
+                self._aggregator_counter_baseline = None
                 self._host_session_id = host_session_id
                 self._host_session_ready = False
                 self._stop = stop_event
@@ -225,6 +229,7 @@ class SerialService:
     def status(self) -> dict[str, Any]:
         with self._lock:
             connection = self._serial
+            decoder_counters = self._decoder_counters(self._decoder)
             return {
                 "open": bool(connection is not None and connection.is_open),
                 "port": self._port,
@@ -232,12 +237,32 @@ class SerialService:
                 "error": self._error,
                 "byte_count": self._byte_count,
                 "frame_count": self._frame_count,
-                "encoded_frame_count": self._decoder.encoded_frame_count,
+                "encoded_frame_count": max(
+                    0,
+                    decoder_counters["encoded_frame_count"]
+                    - self._decoder_counter_baseline["encoded_frame_count"],
+                ),
                 "gateway_lost_frames": self._gateway_lost_frames,
-                "cobs_error_count": self._decoder.cobs_error_count,
-                "crc_error_count": self._decoder.crc_error_count,
-                "frame_error_count": self._decoder.frame_error_count,
-                "overflow_count": self._decoder.overflow_count,
+                "cobs_error_count": max(
+                    0,
+                    decoder_counters["cobs_error_count"]
+                    - self._decoder_counter_baseline["cobs_error_count"],
+                ),
+                "crc_error_count": max(
+                    0,
+                    decoder_counters["crc_error_count"]
+                    - self._decoder_counter_baseline["crc_error_count"],
+                ),
+                "frame_error_count": max(
+                    0,
+                    decoder_counters["frame_error_count"]
+                    - self._decoder_counter_baseline["frame_error_count"],
+                ),
+                "overflow_count": max(
+                    0,
+                    decoder_counters["overflow_count"]
+                    - self._decoder_counter_baseline["overflow_count"],
+                ),
                 "host_session_ready": self._host_session_ready,
                 "host_session_id": self._host_session_id,
                 "aggregator": self._aggregator_snapshot_locked(),
@@ -250,6 +275,7 @@ class SerialService:
         snapshot["links"] = [
             dict(link) for link in snapshot.get("links", [])
         ]
+        self._apply_aggregator_counter_baseline_locked(snapshot)
         updated = snapshot.pop("_updated_monotonic", None)
         snapshot["age_seconds"] = (
             max(0.0, time.monotonic() - updated)
@@ -257,6 +283,89 @@ class SerialService:
             else None
         )
         return snapshot
+
+    @staticmethod
+    def _decoder_counters(decoder: GatewayStreamDecoder) -> dict[str, int]:
+        return {
+            "encoded_frame_count": decoder.encoded_frame_count,
+            "cobs_error_count": decoder.cobs_error_count,
+            "crc_error_count": decoder.crc_error_count,
+            "frame_error_count": decoder.frame_error_count,
+            "overflow_count": decoder.overflow_count,
+        }
+
+    @staticmethod
+    def _uint32_delta(current: Any, baseline: Any) -> int:
+        return (int(current or 0) - int(baseline or 0)) & 0xFFFFFFFF
+
+    @staticmethod
+    def _saturating_delta(current: Any, baseline: Any) -> int:
+        return max(0, int(current or 0) - int(baseline or 0))
+
+    def _apply_aggregator_counter_baseline_locked(
+        self,
+        snapshot: dict[str, Any],
+    ) -> None:
+        baseline = self._aggregator_counter_baseline
+        if baseline is None:
+            return
+        if int(snapshot.get("uptime_ms", 0)) < int(baseline.get("uptime_ms", 0)):
+            # The aggregator restarted after the logical reset.  Its hardware
+            # counters already have a fresh origin, so discard the old base.
+            self._aggregator_counter_baseline = None
+            return
+
+        for key in (
+            "usb_rx_bytes",
+            "usb_tx_bytes",
+            "usb_valid_commands",
+            "usb_input_errors",
+            "usb_output_drops",
+        ):
+            snapshot[key] = self._uint32_delta(
+                snapshot.get(key), baseline.get(key)
+            )
+        snapshot["output_drop_seen"] = snapshot["usb_output_drops"] != 0
+
+        baseline_links = {
+            int(link.get("gateway_id", -1)): link
+            for link in baseline.get("links", [])
+        }
+        for link in snapshot.get("links", []):
+            base = baseline_links.get(int(link.get("gateway_id", -1)))
+            if base is None:
+                continue
+            for key in ("uart_rx_bytes", "valid_frames"):
+                link[key] = self._uint32_delta(link.get(key), base.get(key))
+            for key in (
+                "cobs_errors",
+                "crc_errors",
+                "frame_errors",
+                "frame_drops",
+                "uart_output_drops",
+            ):
+                link[key] = self._saturating_delta(
+                    link.get(key), base.get(key)
+                )
+
+    def reset_transport_counters(self) -> dict[str, Any]:
+        """Reset PC/aggregator display counters without touching the stream."""
+        with self._lock:
+            self._byte_count = 0
+            self._frame_count = 0
+            self._gateway_lost_frames = 0
+            self._decoder_counter_baseline = self._decoder_counters(self._decoder)
+            if self._aggregator_diagnostic is None:
+                self._aggregator_counter_baseline = None
+            else:
+                self._aggregator_counter_baseline = dict(
+                    self._aggregator_diagnostic
+                )
+                self._aggregator_counter_baseline["links"] = [
+                    dict(link)
+                    for link in self._aggregator_diagnostic.get("links", [])
+                ]
+        return self.status()
 
     def device_control_snapshot(self, device_id: int) -> dict[str, Any]:
         with self._lock:

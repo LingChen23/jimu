@@ -26,6 +26,7 @@ const mappingSaving = ref(false)
 const commandBusy = ref(false)
 const batteryRefreshing = ref(false)
 const counterResetBusy = ref(false)
+const transportCounterResetBusy = ref(false)
 let selectionRequest = 0
 let statusPollTimer: number | null = null
 let statusPollRunning = false
@@ -71,6 +72,7 @@ async function pollDeviceStatus(): Promise<void> {
     || commandBusy.value
     || batteryRefreshing.value
     || counterResetBusy.value
+    || transportCounterResetBusy.value
   ) {
     scheduleStatusPoll(250)
     return
@@ -172,6 +174,20 @@ async function executeCommand(command: DeviceCommand): Promise<void> {
   }
 }
 
+async function resetTransportCounters(): Promise<void> {
+  if (transportCounterResetBusy.value || serialLoading.value) return
+  transportCounterResetBusy.value = true
+  try {
+    await runOperation(
+      () => motionStore.resetTransportCounters(),
+      'PC 与聚合器传输计数已重新从 0 累计。',
+    )
+  } finally {
+    transportCounterResetBusy.value = false
+    scheduleStatusPoll(250)
+  }
+}
+
 async function resetDataAndErrorCounters(): Promise<void> {
   if (!selected.value || counterResetBusy.value || commandBusy.value || batteryRefreshing.value) return
   const deviceId = selected.value.deviceId
@@ -235,7 +251,7 @@ function openRealtime(device: DeviceSnapshot): void {
     <section v-if="operationMessage || operationError" class="operation-notice" :class="{ error: operationError }">{{ operationError ?? operationMessage }}</section>
 
     <section class="operations-grid">
-      <SerialControlPanel :ports="motionStore.serialPorts" :status="motionStore.serialStatus" :loading="serialLoading" @refresh="refreshSerial" @open="openSerial" @close="closeSerial" />
+      <SerialControlPanel :ports="motionStore.serialPorts" :status="motionStore.serialStatus" :loading="serialLoading" :counter-reset-busy="transportCounterResetBusy" @refresh="refreshSerial" @open="openSerial" @close="closeSerial" @reset-counters="resetTransportCounters" />
       <AggregatorStatusPanel :status="motionStore.serialStatus?.aggregator ?? null" :serial-open="motionStore.serialStatus?.isOpen ?? false" />
     </section>
 

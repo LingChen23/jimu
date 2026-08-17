@@ -97,6 +97,10 @@ export const useMotionStore = defineStore('motion', () => {
     serialStatus.value = await motionDataService.closeSerial()
   }
 
+  async function resetTransportCounters(): Promise<void> {
+    serialStatus.value = await motionDataService.resetTransportCounters()
+  }
+
   async function loadDeviceContext(deviceId: number): Promise<void> {
     const [snapshot, realtime, diagnostics] = await Promise.all([
       motionDataService.getMotionSnapshot({ deviceId }),
@@ -219,6 +223,7 @@ export const useMotionStore = defineStore('motion', () => {
     refreshDeviceStatus,
     openSerial,
     closeSerial,
+    resetTransportCounters,
     loadDeviceContext,
     loadRealtimeContext,
     refreshRealtimeData,

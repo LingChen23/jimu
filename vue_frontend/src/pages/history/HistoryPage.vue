@@ -60,7 +60,6 @@ async function deleteTask(task: import('@/types/task').TaskSummary): Promise<voi
         <h1>历史记录</h1>
         <p>查看采集任务记录。</p>
       </div>
-      <button class="btn secondary" disabled>导出记录（待接入）</button>
     </section>
 
     <section v-if="errorMessage" class="card history-notice history-notice--error">

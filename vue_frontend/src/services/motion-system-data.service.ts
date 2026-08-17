@@ -423,6 +423,12 @@ export class MotionSystemDataService implements MotionDataService {
     return serialStatus(await this.json('/api/serial/close', { method: 'POST', body: '{}' }))
   }
 
+  async resetTransportCounters() {
+    return serialStatus(await this.json('/api/serial/reset-counters', {
+      method: 'POST', body: '{}',
+    }))
+  }
+
   async listDevices(): Promise<DeviceSnapshot[]> {
     const payload = await this.json('/api/devices')
     const controls = payload.controls ?? {}

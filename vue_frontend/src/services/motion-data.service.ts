@@ -69,6 +69,7 @@ export interface MotionDataService {
   getSerialStatus(): Promise<SerialStatus>
   openSerial(request: OpenSerialRequest): Promise<SerialStatus>
   closeSerial(): Promise<SerialStatus>
+  resetTransportCounters(): Promise<SerialStatus>
 
   listDevices(): Promise<DeviceSnapshot[]>
   getBlockMapping(): Promise<BlockMapping>

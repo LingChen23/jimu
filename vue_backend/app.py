@@ -317,6 +317,9 @@ class ApiHandler(SimpleHTTPRequestHandler):
             if self.path == "/api/serial/close":
                 self._json_response(SERIAL.close())
                 return
+            if self.path == "/api/serial/reset-counters":
+                self._json_response(SERIAL.reset_transport_counters())
+                return
             if self.path == "/api/device/reset":
                 device_id = max(1, min(DEVICE_COUNT, int(body.get("device", 1))))
                 if not STORE.reset_analysis(device_id):

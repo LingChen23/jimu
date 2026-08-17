@@ -2416,7 +2416,7 @@ class AnalysisPipeline:
             )
 
             if (
-                decision.motion_candidate
+                decision.started
                 and self.current_movement is not None
                 and self.current_movement.pending_stop_tick is not None
             ):
@@ -2459,6 +2459,22 @@ class AnalysisPipeline:
                     if decision.transition_sequence is not None
                     else sample.sequence,
                     _sample_epoch(frame_epoch, transition_tick, last_tick),
+                )
+            elif (
+                decision.state == "stationary"
+                and not decision.motion_candidate
+                and self.current_movement is not None
+                and self.current_movement.pending_stop_tick is None
+            ):
+                # Keep the detector and movement lifecycle consistent.  A
+                # movement may only resume after the detector has confirmed a
+                # new start.  If an older/inconsistent live object reaches a
+                # stationary sample without a pending stop, start the normal
+                # end hold instead of leaving it permanently "moving".
+                self._mark_stop(
+                    sample.tick_32k,
+                    sample.sequence,
+                    sample_epoch,
                 )
 
             estimate = self.estimator.update(

@@ -882,6 +882,71 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(movement["pause_count"], 1)
         self.assertGreaterEqual(movement["pause_total_seconds"], 0.8)
 
+    def test_pc_isolated_motion_candidate_does_not_strand_stopped_movement(self) -> None:
+        store = MotionStore(minimum_movement_seconds=0.0)
+        store.set_analysis_mode(1, "pc")
+        packet = 0
+        tick = 0
+
+        for accel, gyro, count in (
+            ((0, 0, 4096), (0, 0, 0), 25),
+            ((0, 0, 4096), (0, 0, 1200), 5),
+            ((0, 0, 4096), (0, 0, 0), PAUSE_STATIONARY_FRAMES),
+        ):
+            for _ in range(count):
+                store.process(
+                    make_frame(
+                        packet,
+                        0x0001,
+                        tick,
+                        accel_raw=accel,
+                        gyro_raw=gyro,
+                    )
+                )
+                packet += 1
+                tick += 4 * 328
+
+        # One noisy sample crosses the start threshold, but the following
+        # samples are quiet.  It is only a candidate, not a confirmed restart.
+        candidate_frame = make_frame(packet, 0x0001, tick)
+        candidate_samples = list(candidate_frame.samples)
+        first = candidate_samples[0]
+        candidate_samples[0] = ImuSample(
+            sequence=first.sequence,
+            tick_32k=first.tick_32k,
+            accel_raw=first.accel_raw,
+            gyro_raw=(0, 0, 1200),
+        )
+        store.process(
+            MotionFrame(
+                device_id=candidate_frame.device_id,
+                packet_sequence=candidate_frame.packet_sequence,
+                session_id=candidate_frame.session_id,
+                flags=candidate_frame.flags,
+                samples=tuple(candidate_samples),
+                coordinate_source_sequence=candidate_frame.coordinate_source_sequence,
+                position_mm=candidate_frame.position_mm,
+                coordinate_flags=candidate_frame.coordinate_flags,
+                source=candidate_frame.source,
+            )
+        )
+        packet += 1
+        tick += 4 * 328
+
+        during_hold = store.snapshot(1)
+        self.assertIsNotNone(during_hold["current_movement"])
+        self.assertEqual(during_hold["current_movement"]["pause_count"], 0)
+        self.assertIn(during_hold["motion_state"], {"停止确认", "停顿中"})
+
+        for _ in range(TERMINAL_STATIONARY_FRAMES):
+            store.process(make_frame(packet, 0x0001, tick))
+            packet += 1
+            tick += 4 * 328
+
+        movement = completed_snapshot(store)["completed_movements"][0]
+        self.assertEqual(movement["pause_count"], 0)
+        self.assertIsNone(store.snapshot(1)["current_movement"])
+
     def test_pc_live_path_excludes_stop_confirmation_window(self) -> None:
         store = MotionStore(minimum_movement_seconds=0.0)
         store.set_analysis_mode(1, "pc")

@@ -53,6 +53,29 @@ export const useTaskStore = defineStore('task', () => {
     return task
   }
 
+  async function updateTaskParticipant(
+    taskId: string,
+    profile: ParticipantProfile,
+  ): Promise<TaskSummary> {
+    const task = await motionDataService.updateTaskParticipant({
+      taskId,
+      participantProfile: profile,
+    })
+    const taskIndex = tasks.value.findIndex((item) => item.taskId === taskId)
+    if (taskIndex >= 0) tasks.value[taskIndex] = task
+    if (currentTask.value?.taskId === taskId) currentTask.value = task
+    const cachedResult = taskResults.value[taskId]
+    if (cachedResult) taskResults.value[taskId] = { ...cachedResult, task }
+    const savedProfile = task.participantSnapshot
+    if (savedProfile) {
+      participants.value = [
+        savedProfile,
+        ...participants.value.filter((item) => item.participantId !== savedProfile.participantId),
+      ]
+    }
+    return task
+  }
+
   async function loadTasks(): Promise<void> {
     tasks.value = await motionDataService.listTasks()
   }
@@ -74,6 +97,10 @@ export const useTaskStore = defineStore('task', () => {
     return motionDataService.exportTask({ taskId })
   }
 
+  async function exportTasks(taskIds: string[]) {
+    return motionDataService.exportTasks({ taskIds })
+  }
+
   function resultById(taskId: string): TaskResult | null {
     return taskResults.value[taskId] ?? null
   }
@@ -88,10 +115,12 @@ export const useTaskStore = defineStore('task', () => {
     startTask,
     loadParticipants,
     finishTask,
+    updateTaskParticipant,
     loadTasks,
     deleteTask,
     loadTaskResult,
     exportTask,
+    exportTasks,
     resultById,
   }
 })

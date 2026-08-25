@@ -11,6 +11,7 @@ const taskStore = useTaskStore()
 const loading = ref(true)
 const errorMessage = ref<string | null>(null)
 const deletingTaskId = ref<string | null>(null)
+const exportingTasks = ref(false)
 
 onMounted(async () => {
   loading.value = true
@@ -50,6 +51,27 @@ async function deleteTask(task: import('@/types/task').TaskSummary): Promise<voi
   }
 }
 
+async function exportTasks(taskIds: string[]): Promise<void> {
+  if (!taskIds.length || exportingTasks.value) return
+  exportingTasks.value = true
+  errorMessage.value = null
+  try {
+    const exported = await taskStore.exportTasks(taskIds)
+    const url = URL.createObjectURL(exported.content)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = exported.fileName
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 0)
+  } catch (error) {
+    errorMessage.value = `批量导出失败：${error instanceof Error ? error.message : String(error)}`
+  } finally {
+    exportingTasks.value = false
+  }
+}
+
 </script>
 
 <template>
@@ -63,7 +85,7 @@ async function deleteTask(task: import('@/types/task').TaskSummary): Promise<voi
     </section>
 
     <section v-if="errorMessage" class="card history-notice history-notice--error">
-      <strong>历史数据加载失败</strong><span>{{ errorMessage }}</span>
+      <strong>操作失败</strong><span>{{ errorMessage }}</span>
     </section>
     <section v-else-if="loading" class="card history-notice">
       <strong>正在加载历史数据</strong><span>正在获取采集任务记录。</span>
@@ -76,7 +98,14 @@ async function deleteTask(task: import('@/types/task').TaskSummary): Promise<voi
       :average-score="taskStore.averageScore"
       :completed-count="taskStore.completedCount"
     />
-    <TaskHistorySection :tasks="taskStore.tasks" :deleting-task-id="deletingTaskId" @open="openTaskResult" @delete="deleteTask" />
+    <TaskHistorySection
+      :tasks="taskStore.tasks"
+      :deleting-task-id="deletingTaskId"
+      :exporting="exportingTasks"
+      @open="openTaskResult"
+      @delete="deleteTask"
+      @export="exportTasks"
+    />
   </div>
 </template>
 

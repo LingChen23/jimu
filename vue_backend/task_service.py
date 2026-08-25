@@ -20,6 +20,7 @@ from data_repository import DataRepository, normalize_participant_profile
 
 class TaskService:
     TEMPORARY_SCORE_MODEL_VERSION = "temporary-random-task-v2"
+    MAX_BATCH_EXPORT_TASKS = 50
 
     def __init__(
         self,
@@ -256,6 +257,45 @@ class TaskService:
     def participant(self, participant_id: str) -> dict[str, Any] | None:
         with self._lock:
             return self._repository.participant(participant_id)
+
+    def update_task_participant(
+        self,
+        task_id: str,
+        participant_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Update a task snapshot and the participant's current master profile.
+
+        The participant identifier remains immutable so task ownership and
+        movement archives cannot be accidentally reassigned while correcting
+        profile details from the result page.
+        """
+        identifier = str(task_id).strip()
+        with self._lock:
+            task = next(
+                (item for item in self._tasks if item.get("task_id") == identifier),
+                None,
+            )
+            if task is None:
+                raise ValueError("未找到采集任务")
+            participant_id = str(task.get("participant_id", "")).strip()
+            profile = normalize_participant_profile(
+                participant_profile,
+                participant_id,
+                require_identity=True,
+            )
+            original_snapshot = deepcopy(task.get("participant_snapshot"))
+            original_profile = self._repository.participant(participant_id)
+            task["participant_snapshot"] = deepcopy(profile)
+            try:
+                saved_profile = self._repository.upsert_participant(profile)
+                task["participant_snapshot"] = deepcopy(saved_profile)
+                self._save_locked()
+            except Exception:
+                task["participant_snapshot"] = original_snapshot
+                if original_profile is not None:
+                    self._repository.upsert_participant(original_profile)
+                raise
+            return self._public(task)
 
     def finish(self, task_id: str) -> dict[str, Any]:
         with self._lock:
@@ -768,6 +808,97 @@ class TaskService:
                 (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode(
                     "utf-8"
                 ),
+            )
+        return buffer.getvalue()
+
+    def tasks_export_archive(self, task_ids: list[str]) -> bytes:
+        """Build one ZIP containing the full export of multiple tasks.
+
+        Every task directory contains exactly the files produced by
+        ``task_export_archive``.  Keeping the single-task exporter as the only
+        source of task contents prevents the history-page bulk action from
+        silently omitting fields added to the result-page export later.
+        """
+        if not isinstance(task_ids, list):
+            raise ValueError("task_ids 必须是数组")
+        identifiers: list[str] = []
+        seen: set[str] = set()
+        for task_id in task_ids:
+            identifier = str(task_id).strip()
+            if not identifier or identifier in seen:
+                continue
+            seen.add(identifier)
+            identifiers.append(identifier)
+        if not identifiers:
+            raise ValueError("请至少选择一个历史任务")
+        if len(identifiers) > self.MAX_BATCH_EXPORT_TASKS:
+            raise ValueError(
+                f"一次最多导出 {self.MAX_BATCH_EXPORT_TASKS} 个任务"
+            )
+
+        with self._lock:
+            existing = {
+                str(task.get("task_id")): str(task.get("status", ""))
+                for task in self._tasks
+                if str(task.get("task_id")) in seen
+            }
+        missing = [identifier for identifier in identifiers if identifier not in existing]
+        if missing:
+            raise ValueError(f"未找到任务：{'、'.join(missing)}")
+        collecting = [
+            identifier
+            for identifier in identifiers
+            if existing.get(identifier) == "collecting"
+        ]
+        if collecting:
+            raise ValueError(
+                f"采集中的任务不能导出：{'、'.join(collecting)}"
+            )
+
+        batch_manifest: list[dict[str, Any]] = []
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(
+            buffer,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=6,
+        ) as archive:
+            for index, identifier in enumerate(identifiers, start=1):
+                task_archive = self.task_export_archive(identifier)
+                if task_archive is None:
+                    raise ValueError(f"导出任务失败：{identifier}")
+                directory = f"tasks/{index:03d}_{identifier}"
+                included_files: list[str] = []
+                with zipfile.ZipFile(io.BytesIO(task_archive), mode="r") as source:
+                    for member in source.infolist():
+                        if member.is_dir():
+                            continue
+                        name = f"{directory}/{member.filename}"
+                        archive.writestr(name, source.read(member))
+                        included_files.append(name)
+                batch_manifest.append({
+                    "task_id": identifier,
+                    "directory": directory,
+                    "included_files": included_files,
+                })
+
+            archive.writestr(
+                "batch.json",
+                (
+                    json.dumps(
+                        {
+                            "export_schema_version": 1,
+                            "exported_at": datetime.now().astimezone().isoformat(
+                                timespec="seconds"
+                            ),
+                            "task_count": len(batch_manifest),
+                            "tasks": batch_manifest,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
             )
         return buffer.getvalue()
 

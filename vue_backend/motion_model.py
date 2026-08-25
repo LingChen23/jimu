@@ -49,6 +49,10 @@ UINT32_MASK = 0xFFFFFFFF
 UINT16_MASK = 0xFFFF
 MAX_CONTINUOUS_SAMPLE_GAP_SECONDS = 0.25
 MAX_HOST_ARRIVAL_GAP_SECONDS = 1.0
+MAX_INTERPOLATION_GAP_SECONDS = 1.0
+NOMINAL_SAMPLE_PERIOD_SECONDS = 0.01
+MAX_INTERPOLATED_SAMPLES_PER_GAP = 100
+RECENT_GAP_EVENT_LIMIT = 256
 
 ANALYSIS_MODE_DEVICE = "device"
 ANALYSIS_MODE_PC = "pc"
@@ -265,9 +269,13 @@ def _movement_core_speeds(records: list[dict[str, Any]]) -> list[float]:
 
 
 def _speed_statistics(records: list[dict[str, Any]]) -> dict[str, Any]:
-    all_speeds = [float(row.get("speed_mps", 0.0)) for row in records]
+    observed = [row for row in records if not bool(row.get("interpolated", False))]
+    statistic_records = observed or records
+    all_speeds = [
+        float(row.get("speed_mps", 0.0)) for row in statistic_records
+    ]
     result: dict[str, Any] = _safe_stats(all_speeds)
-    core_speeds = _movement_core_speeds(records)
+    core_speeds = _movement_core_speeds(statistic_records)
     result.update({
         "p05": _percentile(core_speeds, SPEED_PERCENTILE),
         "p05_percentile": SPEED_PERCENTILE,
@@ -307,6 +315,24 @@ def _tremor_fft(records: list[dict[str, Any]]) -> dict[str, Any]:
         "frequency_resolution_hz": None,
         "reason": "有效移动数据不足",
     }
+    # Interpolated samples keep the inertial path causal but are not real
+    # high-frequency measurements.  Analyze only the longest uninterrupted
+    # observed subsegment so a long gap cannot create artificial FFT energy.
+    observed_segments: dict[int, list[dict[str, Any]]] = {}
+    for row in records:
+        if bool(row.get("interpolated", False)):
+            continue
+        observed_segments.setdefault(
+            int(row.get("segment_index", 0)), []
+        ).append(row)
+    if observed_segments:
+        records = max(
+            observed_segments.values(),
+            key=lambda rows: (
+                sum(float(row.get("dt_s", 0.0)) for row in rows),
+                len(rows),
+            ),
+        )
     if len(records) < TREMOR_MIN_SAMPLES:
         return unavailable
     times = np.asarray([float(row["elapsed_s"]) for row in records], dtype=float)
@@ -911,7 +937,7 @@ class MovementStats:
     drop_armed: bool = False
     drop_post_freefall_seconds: float = 0.0
     drop_events: list[dict[str, Any]] = field(default_factory=list)
-    integration_samples: list[tuple[float, list[float]]] = field(
+    integration_samples: list[tuple[int, float, list[float]]] = field(
         default_factory=list,
         repr=False,
     )
@@ -934,9 +960,35 @@ class MovementStats:
     live_speed_sample_stride: int = 1
     live_speed_samples: list[float] = field(default_factory=list, repr=False)
     high_frequency_released: bool = False
+    segment_index: int = 0
+    observed_sample_count: int = 0
+    interpolated_sample_count: int = 0
+    gap_events: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.flip_reference_up = list(self.start_up)
+
+    def record_gap(
+        self,
+        *,
+        reason: str,
+        duration_seconds: float | None,
+        missing_samples: int,
+        interpolated: bool,
+        event_epoch: float | None,
+        start_new_segment: bool,
+    ) -> None:
+        if start_new_segment:
+            self.segment_index += 1
+        self.gap_events.append({
+            "gap_index": len(self.gap_events) + 1,
+            "reason": reason,
+            "duration_seconds": duration_seconds,
+            "missing_samples": max(0, int(missing_samples)),
+            "interpolated": bool(interpolated),
+            "segment_after": self.segment_index,
+            "time": _iso_times(event_epoch),
+        })
 
     def _shake_window_metrics(self) -> dict[str, float | int]:
         if not self.shake_window:
@@ -1443,6 +1495,9 @@ class MovementStats:
         tick: int,
         sequence: int = 0,
         wall_epoch: float | None = None,
+        *,
+        interpolated: bool = False,
+        position_offset: list[float] | None = None,
     ) -> None:
         self.latest_tick = tick
         self.latest_epoch = wall_epoch
@@ -1454,106 +1509,126 @@ class MovementStats:
         speed = _norm(estimate.velocity)
 
         self.moving_seconds += estimate.dt
-        self.accel_sum += linear_magnitude
-        self.accel_count += 1
-        self.accel_min = min(self.accel_min, linear_magnitude)
-        self.accel_max = max(self.accel_max, linear_magnitude)
-        self._add_live_speed(speed)
 
-        self._update_shake(
-            estimate.linear_world,
-            linear_magnitude,
-            gyro_magnitude,
-            estimate.dt,
-            elapsed_s,
-            sequence,
-            wall_epoch,
-        )
-
-        # Complete one-axis rotations are tracked in world coordinates so an
-        # arbitrary physical axis remains comparable while the body turns.
-        # Older/synthetic estimates without this field retain body-frame
-        # behaviour for backward compatibility.
-        rotation_gyro = (
-            estimate.gyro_world_dps
-            if estimate.gyro_world_dps is not None
-            else estimate.corrected_gyro_dps
-        )
-        self._update_rotation(
-            rotation_gyro,
-            estimate.dt,
-            elapsed_s,
-            sequence,
-            wall_epoch,
-        )
-
-        # Spatial rotation is deliberately independent from the one-axis state
-        # machine: changing axis or direction never subtracts angular travel.
-        self._update_spatial_rotation(
-            estimate.corrected_gyro_dps, estimate.dt
-        )
-
-        # Flip counting is independent from complete 360-degree rotations.
-        self._update_flip(
-            estimate.up_world,
-            estimate.dt,
-            elapsed_s,
-            sequence,
-            wall_epoch,
-        )
-
-        # Drop: confirmed near-free-fall followed by a high-g impact within the
-        # configured time window. Low-g alone is neither a pause nor a drop.
-        if not self.drop_armed:
-            if specific_force_g <= DROP_FREEFALL_G:
-                if self.drop_freefall_candidate_seconds <= 0.0:
-                    self.drop_freefall_start_s = elapsed_s
-                self.drop_freefall_candidate_seconds += estimate.dt
-                if (
-                    self.drop_freefall_candidate_seconds
-                    >= DROP_FREEFALL_CONFIRM_SECONDS
-                ):
-                    self.drop_armed = True
-                    self.drop_post_freefall_seconds = 0.0
-            else:
-                self.drop_freefall_candidate_seconds = 0.0
-                self.drop_freefall_start_s = None
+        if interpolated:
+            self.interpolated_sample_count += 1
+            # Missing measurements may keep integration continuous, but they
+            # must never invent impact, shake, flip or rotation events.
+            self.shake_candidate_seconds = 0.0
+            self.shake_candidate_start_s = None
+            self.flip_candidate_seconds = 0.0
+            self.drop_freefall_candidate_seconds = 0.0
+            self.drop_freefall_start_s = None
+            self.drop_armed = False
+            self.drop_post_freefall_seconds = 0.0
         else:
-            if specific_force_g <= DROP_FREEFALL_G:
-                self.drop_post_freefall_seconds = 0.0
+            self.observed_sample_count += 1
+            # Summary features describe measured sensor values only.  The
+            # synthetic rows remain available to integration and plotting.
+            self.accel_sum += linear_magnitude
+            self.accel_count += 1
+            self.accel_min = min(self.accel_min, linear_magnitude)
+            self.accel_max = max(self.accel_max, linear_magnitude)
+            self._add_live_speed(speed)
+            self._update_shake(
+                estimate.linear_world,
+                linear_magnitude,
+                gyro_magnitude,
+                estimate.dt,
+                elapsed_s,
+                sequence,
+                wall_epoch,
+            )
+
+            # Complete one-axis rotations are tracked in world coordinates so
+            # an arbitrary physical axis remains comparable while the body turns.
+            rotation_gyro = (
+                estimate.gyro_world_dps
+                if estimate.gyro_world_dps is not None
+                else estimate.corrected_gyro_dps
+            )
+            self._update_rotation(
+                rotation_gyro,
+                estimate.dt,
+                elapsed_s,
+                sequence,
+                wall_epoch,
+            )
+            self._update_spatial_rotation(
+                estimate.corrected_gyro_dps, estimate.dt
+            )
+            self._update_flip(
+                estimate.up_world,
+                estimate.dt,
+                elapsed_s,
+                sequence,
+                wall_epoch,
+            )
+
+            # Drop: confirmed near-free-fall followed by a high-g impact.
+            if not self.drop_armed:
+                if specific_force_g <= DROP_FREEFALL_G:
+                    if self.drop_freefall_candidate_seconds <= 0.0:
+                        self.drop_freefall_start_s = elapsed_s
+                    self.drop_freefall_candidate_seconds += estimate.dt
+                    if (
+                        self.drop_freefall_candidate_seconds
+                        >= DROP_FREEFALL_CONFIRM_SECONDS
+                    ):
+                        self.drop_armed = True
+                        self.drop_post_freefall_seconds = 0.0
+                else:
+                    self.drop_freefall_candidate_seconds = 0.0
+                    self.drop_freefall_start_s = None
             else:
-                self.drop_post_freefall_seconds += estimate.dt
-                if specific_force_g >= DROP_IMPACT_G:
-                    self.drop_count += 1
-                    event_epoch = wall_epoch
-                    self.drop_events.append({
-                        "drop_index": self.drop_count,
-                        "freefall_start_s": self.drop_freefall_start_s,
-                        "impact_s": elapsed_s,
-                        "sequence": int(sequence),
-                        "impact_g": specific_force_g,
-                        "impact_time": _iso_times(event_epoch),
-                    })
-                    self.drop_armed = False
-                    self.drop_freefall_candidate_seconds = 0.0
-                    self.drop_freefall_start_s = None
+                if specific_force_g <= DROP_FREEFALL_G:
                     self.drop_post_freefall_seconds = 0.0
-                elif self.drop_post_freefall_seconds > DROP_IMPACT_WINDOW_SECONDS:
-                    self.drop_armed = False
-                    self.drop_freefall_candidate_seconds = 0.0
-                    self.drop_freefall_start_s = None
-                    self.drop_post_freefall_seconds = 0.0
+                else:
+                    self.drop_post_freefall_seconds += estimate.dt
+                    if specific_force_g >= DROP_IMPACT_G:
+                        self.drop_count += 1
+                        self.drop_events.append({
+                            "drop_index": self.drop_count,
+                            "freefall_start_s": self.drop_freefall_start_s,
+                            "impact_s": elapsed_s,
+                            "sequence": int(sequence),
+                            "impact_g": specific_force_g,
+                            "impact_time": _iso_times(wall_epoch),
+                        })
+                        self.drop_armed = False
+                        self.drop_freefall_candidate_seconds = 0.0
+                        self.drop_freefall_start_s = None
+                        self.drop_post_freefall_seconds = 0.0
+                    elif (
+                        self.drop_post_freefall_seconds
+                        > DROP_IMPACT_WINDOW_SECONDS
+                    ):
+                        self.drop_armed = False
+                        self.drop_freefall_candidate_seconds = 0.0
+                        self.drop_freefall_start_s = None
+                        self.drop_post_freefall_seconds = 0.0
 
         if len(self.integration_samples) < MAX_MOVEMENT_SAMPLES:
             self.integration_samples.append(
-                (estimate.dt, list(estimate.linear_world))
+                (
+                    self.segment_index,
+                    estimate.dt,
+                    list(estimate.linear_world),
+                )
             )
+            display_position = [
+                estimate.position[axis]
+                + (position_offset[axis] if position_offset is not None else 0.0)
+                for axis in range(3)
+            ]
             self.sample_records.append({
                 "sample_index": len(self.sample_records),
                 "sequence": int(sequence),
                 "tick_32k": int(tick),
                 "elapsed_s": float(elapsed_s),
                 "dt_s": float(estimate.dt),
+                "segment_index": self.segment_index,
+                "interpolated": bool(interpolated),
                 "computer_epoch": wall_epoch,
                 "accel_mps2": list(estimate.accel),
                 "accel_norm_mps2": specific_force,
@@ -1564,7 +1639,7 @@ class MovementStats:
                 "gyro_norm_dps": gyro_magnitude,
                 "velocity_mps": list(estimate.velocity),
                 "speed_mps": speed,
-                "position_m": list(estimate.position),
+                "position_m": display_position,
                 "stationary": bool(estimate.stationary),
                 "specific_force_g": specific_force_g,
             })
@@ -1589,28 +1664,47 @@ class MovementStats:
     ) -> tuple[list[list[float]], list[list[float]]]:
         if not self.integration_samples:
             return [[0.0, 0.0, 0.0]], []
-        sample_array = np.asarray(
-            [[dt, *acceleration] for dt, acceleration in self.integration_samples],
-            dtype=float,
-        )
-        dt = sample_array[:, 0]
-        acceleration = sample_array[:, 1:4]
-        total_seconds = float(np.sum(dt))
-        if total_seconds <= 1e-6:
-            return [[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]] * len(self.integration_samples)
+        grouped: list[list[tuple[float, list[float]]]] = []
+        previous_segment: int | None = None
+        for segment, dt, acceleration in self.integration_samples:
+            if segment != previous_segment:
+                grouped.append([])
+                previous_segment = segment
+            grouped[-1].append((dt, acceleration))
 
-        residual_velocity = np.sum(acceleration * dt[:, None], axis=0)
-        corrected = acceleration - residual_velocity / total_seconds
-        velocity_delta = corrected * dt[:, None]
-        velocities = np.cumsum(velocity_delta, axis=0)
-        previous_velocities = velocities - velocity_delta
-        position_delta = (
-            previous_velocities * dt[:, None]
-            + 0.5 * corrected * np.square(dt)[:, None]
-        )
-        positions = np.cumsum(position_delta, axis=0)
-        path = np.vstack((np.zeros((1, 3), dtype=float), positions))
-        return path.tolist(), velocities.tolist()
+        path: list[list[float]] = [[0.0, 0.0, 0.0]]
+        velocities_result: list[list[float]] = []
+        offset = np.zeros(3, dtype=float)
+        for group in grouped:
+            sample_array = np.asarray(
+                [[dt, *acceleration] for dt, acceleration in group],
+                dtype=float,
+            )
+            dt = sample_array[:, 0]
+            acceleration = sample_array[:, 1:4]
+            total_seconds = float(np.sum(dt))
+            if total_seconds <= 1e-6:
+                velocities = np.zeros((len(group), 3), dtype=float)
+                positions = np.zeros((len(group), 3), dtype=float)
+            else:
+                residual_velocity = np.sum(
+                    acceleration * dt[:, None], axis=0
+                )
+                corrected = acceleration - residual_velocity / total_seconds
+                velocity_delta = corrected * dt[:, None]
+                velocities = np.cumsum(velocity_delta, axis=0)
+                previous_velocities = velocities - velocity_delta
+                position_delta = (
+                    previous_velocities * dt[:, None]
+                    + 0.5 * corrected * np.square(dt)[:, None]
+                )
+                positions = np.cumsum(position_delta, axis=0)
+            translated = positions + offset
+            path.extend(translated.tolist())
+            velocities_result.extend(velocities.tolist())
+            if len(translated):
+                offset = translated[-1]
+        return path, velocities_result
 
     def rest_to_rest_corrected_path(self) -> list[list[float]]:
         path, _ = self.corrected_kinematics()
@@ -1641,8 +1735,17 @@ class MovementStats:
         self.moving_seconds = sum(
             float(row.get("dt_s", 0.0)) for row in self.sample_records
         )
+        self.observed_sample_count = sum(
+            not bool(row.get("interpolated", False))
+            for row in self.sample_records
+        )
+        self.interpolated_sample_count = (
+            len(self.sample_records) - self.observed_sample_count
+        )
         linear_magnitudes = [
-            float(row["dynamic_accel_norm_mps2"]) for row in self.sample_records
+            float(row["dynamic_accel_norm_mps2"])
+            for row in self.sample_records
+            if not bool(row.get("interpolated", False))
         ]
         self.accel_count = len(linear_magnitudes)
         self.accel_sum = sum(linear_magnitudes)
@@ -1675,8 +1778,15 @@ class MovementStats:
             self.calculated_path_final = [list(point) for point in calculated_path]
 
         self.speed_statistics = _speed_statistics(self.sample_records)
-        accel_rows = [list(row["accel_mps2"]) for row in self.sample_records]
-        dynamic_rows = [list(row["linear_world_mps2"]) for row in self.sample_records]
+        observed_rows = [
+            row for row in self.sample_records
+            if not bool(row.get("interpolated", False))
+        ]
+        statistic_rows = observed_rows or self.sample_records
+        accel_rows = [list(row["accel_mps2"]) for row in statistic_rows]
+        dynamic_rows = [
+            list(row["linear_world_mps2"]) for row in statistic_rows
+        ]
         self.accel_statistics = {
             "specific_force_mps2": _axis_statistics(accel_rows, ("x", "y", "z")),
             "dynamic_world_mps2": _axis_statistics(dynamic_rows, ("x", "y", "z")),
@@ -1723,7 +1833,22 @@ class MovementStats:
             if self.latest_tick is not None
             else self.start_tick
         )
-        segment_seconds = _tick_seconds(end_tick, self.start_tick)
+        duration_epoch = (
+            self.end_epoch
+            if self.end_epoch is not None
+            else self.latest_epoch
+        )
+        if (
+            self.start_epoch is not None
+            and duration_epoch is not None
+            and duration_epoch >= self.start_epoch
+        ):
+            # Device ticks may restart after a reconnect.  Wall-clock epochs
+            # remain monotonic and keep a long, gap-tolerant movement from
+            # producing a wrapped multi-day duration.
+            segment_seconds = duration_epoch - self.start_epoch
+        else:
+            segment_seconds = _tick_seconds(end_tick, self.start_tick)
         live_speed_stats = (
             self.speed_statistics
             if self.speed_statistics
@@ -1737,6 +1862,7 @@ class MovementStats:
             "reason": "移动尚未结束",
         }
         spatial_rotation_degrees = self._spatial_rotation_degrees()
+        total_samples = self.observed_sample_count + self.interpolated_sample_count
         return {
             "movement_id": self.movement_id,
             "block_id": self.block_id,
@@ -1769,7 +1895,24 @@ class MovementStats:
             "speed": live_speed_stats,
             "tremor": tremor,
             "position_corrected": self.position_corrected,
-            "sample_count": self.accel_count,
+            "sample_count": total_samples,
+            "observed_sample_count": self.observed_sample_count,
+            "interpolated_sample_count": self.interpolated_sample_count,
+            "interpolated_sample_ratio": (
+                self.interpolated_sample_count / total_samples
+                if total_samples
+                else 0.0
+            ),
+            "gap_count": len(self.gap_events),
+            "segment_count": self.segment_index + 1,
+            "max_gap_seconds": max(
+                (
+                    float(event["duration_seconds"])
+                    for event in self.gap_events
+                    if event.get("duration_seconds") is not None
+                ),
+                default=0.0,
+            ),
             "samples_truncated": self.samples_truncated,
             "time": self._time_snapshot(),
         }
@@ -1812,6 +1955,7 @@ class MovementStats:
             "shake_events": self.shake_events,
             "rotation_events": self.rotation_events,
             "flip_events": self.flip_events,
+            "gap_events": self.gap_events,
             "calculated_path": self.calculated_path_final,
             "received_path": self.received_path_final,
             "device_coordinates": self.device_coordinate_records,
@@ -1858,6 +2002,16 @@ class MovementStats:
                 "drop_freefall_g": DROP_FREEFALL_G,
                 "drop_impact_g": DROP_IMPACT_G,
                 "drop_impact_window_seconds": DROP_IMPACT_WINDOW_SECONDS,
+                "gap_recovery": {
+                    "interpolation_max_seconds": (
+                        MAX_INTERPOLATION_GAP_SECONDS
+                    ),
+                    "interpolation_max_samples": (
+                        MAX_INTERPOLATED_SAMPLES_PER_GAP
+                    ),
+                    "long_gap_strategy": "new_inertial_subsegment_keep_movement",
+                    "event_features_use_observed_samples_only": True,
+                },
                 "tremor_highpass_hz": TREMOR_HIGHPASS_HZ,
                 "tremor_band_hz": [TREMOR_BAND_LOW_HZ, TREMOR_BAND_HIGH_HZ],
                 "speed_semantics": "PC惯导估算；仅用于同一设备同一流程内比较，不是标定速度计",
@@ -1899,6 +2053,19 @@ class MovementStats:
         )])
         writer.writerow(["metadata", "speed_p05_mps", self.speed_statistics.get("p05")])
         writer.writerow(["metadata", "drop_count", self.drop_count])
+        writer.writerow(["metadata", "gap_count", len(self.gap_events)])
+        writer.writerow(["metadata", "segment_count", self.segment_index + 1])
+        writer.writerow([
+            "metadata", "observed_sample_count", self.observed_sample_count
+        ])
+        writer.writerow([
+            "metadata", "interpolated_sample_count",
+            self.interpolated_sample_count,
+        ])
+        writer.writerow([
+            "metadata", "gap_events",
+            json.dumps(self.gap_events, ensure_ascii=False),
+        ])
         writer.writerow(["metadata", "rotation_count", self.rotation_count])
         writer.writerow([
             "metadata",
@@ -1923,6 +2090,7 @@ class MovementStats:
         writer.writerow([])
         writer.writerow([
             "record_type", "sample_index", "sequence", "tick_32k", "elapsed_s",
+            "segment_index", "interpolated",
             "computer_time", "beijing_time",
             "accel_x_mps2", "accel_y_mps2", "accel_z_mps2", "accel_norm_mps2",
             "linear_x_mps2", "linear_y_mps2", "linear_z_mps2", "dynamic_accel_norm_mps2",
@@ -1936,6 +2104,7 @@ class MovementStats:
             times = _iso_times(row.get("computer_epoch"))
             writer.writerow([
                 "imu_pc", row["sample_index"], row["sequence"], row["tick_32k"], row["elapsed_s"],
+                row.get("segment_index", 0), row.get("interpolated", False),
                 times["computer"], times["beijing"],
                 *row["accel_mps2"], row["accel_norm_mps2"],
                 *row["linear_world_mps2"], row["dynamic_accel_norm_mps2"],
@@ -1948,6 +2117,7 @@ class MovementStats:
             times = _iso_times(row.get("computer_epoch"))
             writer.writerow([
                 "device_coordinate", row["coordinate_index"], "", "", "",
+                "", "",
                 times["computer"], times["beijing"],
                 "", "", "", "", "", "", "", "", "", "", "", "",
                 "", "", "", "", "", "", "", "", "",
@@ -2025,6 +2195,12 @@ class AnalysisPipeline:
     finalization_error_count: int = 0
     last_finalization_error: str | None = None
     last_finalization_seconds: float | None = None
+    calculated_segment_offset: list[float] = field(
+        default_factory=lambda: [0.0, 0.0, 0.0]
+    )
+    received_segment_offset: list[float] = field(
+        default_factory=lambda: [0.0, 0.0, 0.0]
+    )
 
     def __post_init__(self) -> None:
         if self.mode == ANALYSIS_MODE_PC and self.detector is None:
@@ -2043,6 +2219,8 @@ class AnalysisPipeline:
         self.calculated_path.clear()
         self.received_path.append([0.0, 0.0, 0.0])
         self.calculated_path.append([0.0, 0.0, 0.0])
+        self.calculated_segment_offset = [0.0, 0.0, 0.0]
+        self.received_segment_offset = [0.0, 0.0, 0.0]
         self.received_path_cursor = 1
         self.calculated_path_cursor = 1
         self.last_coordinate_source_sequence = None
@@ -2069,32 +2247,104 @@ class AnalysisPipeline:
         )
         self.motion_state = "移动中"
 
+    def _translated_calculated_position(
+        self, position: list[float]
+    ) -> list[float]:
+        return [
+            position[axis] + self.calculated_segment_offset[axis]
+            for axis in range(3)
+        ]
+
+    def note_interpolated_gap(
+        self,
+        reason: str,
+        duration_seconds: float,
+        missing_samples: int,
+        event_epoch: float,
+    ) -> None:
+        if self.current_movement is None:
+            return
+        self.current_movement.record_gap(
+            reason=reason,
+            duration_seconds=duration_seconds,
+            missing_samples=missing_samples,
+            interpolated=True,
+            event_epoch=event_epoch,
+            start_new_segment=False,
+        )
+
+    def resume_after_gap(
+        self,
+        reason: str,
+        duration_seconds: float | None,
+        missing_samples: int,
+        event_epoch: float,
+    ) -> None:
+        """Preserve visible/task state while starting a fresh inertial subsegment."""
+        movement = self.current_movement
+        if movement is not None:
+            self.calculated_segment_offset = (
+                list(self.calculated_path[-1])
+                if self.calculated_path
+                else list(self.calculated_segment_offset)
+            )
+            self.received_segment_offset = (
+                list(self.received_path[-1])
+                if self.received_path
+                else list(self.received_segment_offset)
+            )
+            movement.record_gap(
+                reason=reason,
+                duration_seconds=duration_seconds,
+                missing_samples=missing_samples,
+                interpolated=False,
+                event_epoch=event_epoch,
+                start_new_segment=True,
+            )
+            # A gap may hide the end of a candidate event. Keep confirmed
+            # totals, but discard all unconfirmed cross-gap state.
+            movement._finish_shake_episode()
+            movement.shake_window.clear()
+            movement.shake_candidate_seconds = 0.0
+            movement.shake_candidate_start_s = None
+            movement.rotation_axis = None
+            movement.rotation_progress_degrees = 0.0
+            movement.rotation_gap_seconds = 0.0
+            movement._clear_rotation_candidate()
+            movement._finish_spatial_rotation_segment()
+            movement.flip_candidate_seconds = 0.0
+            movement.drop_freefall_candidate_seconds = 0.0
+            movement.drop_freefall_start_s = None
+            movement.drop_armed = False
+            movement.drop_post_freefall_seconds = 0.0
+            movement.pending_stop_tick = None
+            movement.pending_stop_sequence = None
+            movement.pending_stop_epoch = None
+
+        self.estimator = InertialEstimator()
+        if self.mode == ANALYSIS_MODE_PC and self.detector is not None:
+            # Packet loss is not evidence that the sensor bias or stationary
+            # baseline became invalid.  Preserve calibration across gaps so a
+            # lossy device cannot be trapped forever in "PC校准中".  Candidate
+            # start/stop runs are cleared because they must be contiguous.
+            self.detector.reset_analysis()
+            if movement is not None:
+                self.detector.state = "moving"
+        self.received_origin = [0.0, 0.0, 0.0]
+        self.received_origin_set = False
+        self.last_coordinate_source_sequence = None
+        if movement is not None:
+            self.motion_state = "移动中"
+        elif self.mode == ANALYSIS_MODE_PC:
+            self.motion_state = "PC校准中"
+        else:
+            self.motion_state = "等待设备状态"
+
     def set_block_mapping(self, block_id: str, mapping_version: str) -> None:
         # An active movement keeps the mapping captured at its start.  The new
         # mapping applies to the next complete movement only.
         self.block_id = block_id
         self.mapping_version = mapping_version
-
-    def break_segment(self, reason: str) -> None:
-        """Discard an incomplete segment and rebuild all causal tracking state."""
-        if self.current_movement is not None:
-            self.interrupted_movement_count += 1
-        self.current_movement = None
-        self.estimator = InertialEstimator()
-        if self.mode == ANALYSIS_MODE_PC:
-            self.detector = PcMotionDetector()
-            self.motion_state = "数据中断，等待静止校准"
-        else:
-            self.detector = None
-            self.motion_state = "数据中断，等待设备状态"
-        self.received_path.clear()
-        self.calculated_path.clear()
-        self.received_path_cursor = 0
-        self.calculated_path_cursor = 0
-        self.received_origin = [0.0, 0.0, 0.0]
-        self.received_origin_set = False
-        self.last_coordinate_source_sequence = None
-        self.trajectory_revision += 1
 
     def _resume_movement(
         self,
@@ -2321,10 +2571,15 @@ class AnalysisPipeline:
             self.received_origin = position
             self.received_origin_set = True
             movement.add_device_coordinate(
-                source_sequence, [0.0, 0.0, 0.0], frame_epoch
+                source_sequence, list(self.received_segment_offset), frame_epoch
             )
             return
-        relative = [position[axis] - self.received_origin[axis] for axis in range(3)]
+        relative = [
+            position[axis]
+            - self.received_origin[axis]
+            + self.received_segment_offset[axis]
+            for axis in range(3)
+        ]
         self.received_path.append(relative)
         self.received_path_cursor += 1
         movement.add_device_coordinate(source_sequence, relative, frame_epoch)
@@ -2335,6 +2590,9 @@ class AnalysisPipeline:
         sparse: bool,
         frame_epoch: float,
     ) -> None:
+        interpolated_only = bool(frame.samples) and all(
+            sample.interpolated for sample in frame.samples
+        )
         moving_now = bool(frame.coordinate_flags & COORD_MOVING)
         stationary_now = bool(frame.coordinate_flags & COORD_STATIONARY)
         calibrating_now = bool(frame.coordinate_flags & COORD_CALIBRATING)
@@ -2343,7 +2601,7 @@ class AnalysisPipeline:
         first_epoch = _sample_epoch(frame_epoch, first_sample.tick_32k, last_tick)
 
         if moving_now:
-            if self.current_movement is None:
+            if self.current_movement is None and not interpolated_only:
                 self._begin_movement(
                     first_sample.tick_32k,
                     first_sample.sequence,
@@ -2355,7 +2613,7 @@ class AnalysisPipeline:
                     first_sample.tick_32k,
                     first_epoch,
                 )
-        elif stationary_now:
+        elif stationary_now and not interpolated_only:
             if self.current_movement is not None:
                 self._mark_stop(
                     first_sample.tick_32k,
@@ -2364,7 +2622,7 @@ class AnalysisPipeline:
                 )
             else:
                 self.motion_state = "静止"
-        elif calibrating_now:
+        elif calibrating_now and not interpolated_only:
             self.motion_state = "校准中"
         elif self.current_movement is None:
             self.motion_state = "等待移动"
@@ -2384,13 +2642,18 @@ class AnalysisPipeline:
                 stationary_hint=stationary_hint,
             )
             if self.current_movement is not None and moving_now:
+                translated = self._translated_calculated_position(
+                    estimate.position
+                )
                 self.current_movement.add_sample(
                     estimate,
                     sample.tick_32k,
                     sample.sequence,
                     sample_epoch,
+                    interpolated=sample.interpolated,
+                    position_offset=self.calculated_segment_offset,
                 )
-                self.calculated_path.append(estimate.position)
+                self.calculated_path.append(translated)
                 self.calculated_path_cursor += 1
             if self.current_movement is not None:
                 self.current_movement.latest_tick = sample.tick_32k
@@ -2411,9 +2674,19 @@ class AnalysisPipeline:
         for sample in frame.samples:
             sample_epoch = _sample_epoch(frame_epoch, sample.tick_32k, last_tick)
             measurements = InertialEstimator.measurements(sample)
-            decision = self.detector.update(
-                measurements[0], measurements[1], sample.tick_32k, sample.sequence
-            )
+            if sample.interpolated:
+                detector_state = self.detector.state
+                decision = MotionDecision(
+                    detector_state,
+                    stationary_hint=detector_state == "stationary",
+                )
+            else:
+                decision = self.detector.update(
+                    measurements[0],
+                    measurements[1],
+                    sample.tick_32k,
+                    sample.sequence,
+                )
 
             if (
                 decision.started
@@ -2494,7 +2767,11 @@ class AnalysisPipeline:
                     movement.pending_stop_tick is None
                     and not decision.quiet_candidate
                 ):
-                    self.calculated_path.append(estimate.position)
+                    self.calculated_path.append(
+                        self._translated_calculated_position(
+                            estimate.position
+                        )
+                    )
                     self.calculated_path_cursor += 1
                 if not estimate.stationary:
                     movement.add_sample(
@@ -2502,6 +2779,8 @@ class AnalysisPipeline:
                         sample.tick_32k,
                         sample.sequence,
                         sample_epoch,
+                        interpolated=sample.interpolated,
+                        position_offset=self.calculated_segment_offset,
                     )
                 movement.latest_tick = sample.tick_32k
                 movement.latest_epoch = sample_epoch
@@ -2582,6 +2861,8 @@ class AnalysisPipeline:
         self.last_finalization_seconds = None
         self.received_origin = [0.0, 0.0, 0.0]
         self.received_origin_set = False
+        self.calculated_segment_offset = [0.0, 0.0, 0.0]
+        self.received_segment_offset = [0.0, 0.0, 0.0]
         self.last_coordinate_source_sequence = None
         self.trajectory_revision += 1
         if self.detector is not None:
@@ -2814,13 +3095,15 @@ class DeviceState:
     )
     last_seen: float = 0.0
     last_arrival_monotonic: float = 0.0
-    first_tick: int | None = None
+    signal_elapsed_seconds: float = 0.0
+    last_history_tick: int | None = None
     clock_anchor_tick: int | None = None
     clock_anchor_epoch: float | None = None
     last_packet_sequence: int | None = None
     last_sample_sequence: int | None = None
     last_continuity_sample_sequence: int | None = None
     last_sample_tick: int | None = None
+    last_real_sample: ImuSample | None = None
     current_session_id: int | None = None
     packet_count: int = 0
     sample_count: int = 0
@@ -2834,6 +3117,10 @@ class DeviceState:
     source: str = "waiting"
     last_flags: int = 0
     coordinate_flags: int = 0
+    interpolated_sample_count: int = 0
+    recent_gap_events: deque = field(
+        default_factory=lambda: deque(maxlen=RECENT_GAP_EVENT_LIMIT)
+    )
     analysis_mode: str = ANALYSIS_MODE_DEVICE
     analyses: dict[str, AnalysisPipeline] = field(init=False)
 
@@ -2892,30 +3179,95 @@ class DeviceState:
         self.gyro_history.clear()
         for analysis in self.analyses.values():
             analysis.clear_analysis()
-        self.first_tick = None
+        self.signal_elapsed_seconds = 0.0
+        self.last_history_tick = None
         self.clock_anchor_tick = None
         self.clock_anchor_epoch = None
 
-    def _break_analysis_segment(
+    def _record_gap(
         self,
+        *,
         reason: str,
         event_epoch: float,
-        mark_offline: bool = False,
+        duration_seconds: float | None,
+        missing_samples: int,
+        interpolated: bool,
     ) -> None:
-        for analysis in self.analyses.values():
-            analysis.break_segment(reason)
-        self.accel_history.clear()
-        self.gyro_history.clear()
-        self.first_tick = None
-        self.clock_anchor_tick = None
-        self.clock_anchor_epoch = None
         self.discontinuity_count += 1
         self.last_discontinuity_reason = reason
         self.last_discontinuity_epoch = event_epoch
-        if mark_offline:
-            self.last_seen = 0.0
-            self.last_arrival_monotonic = 0.0
-            self.source = "waiting"
+        self.recent_gap_events.append({
+            "gap_index": self.discontinuity_count,
+            "reason": reason,
+            "duration_seconds": duration_seconds,
+            "missing_samples": max(0, int(missing_samples)),
+            "interpolated": bool(interpolated),
+            "time": _iso_times(event_epoch),
+        })
+        for analysis in self.analyses.values():
+            if interpolated:
+                analysis.note_interpolated_gap(
+                    reason,
+                    float(duration_seconds or 0.0),
+                    missing_samples,
+                    event_epoch,
+                )
+            else:
+                analysis.resume_after_gap(
+                    reason,
+                    duration_seconds,
+                    missing_samples,
+                    event_epoch,
+                )
+
+    @staticmethod
+    def _interpolate_samples(
+        previous: ImuSample,
+        current: ImuSample,
+        missing_samples: int,
+    ) -> tuple[ImuSample, ...]:
+        if (
+            missing_samples <= 0
+            or missing_samples > MAX_INTERPOLATED_SAMPLES_PER_GAP
+        ):
+            return ()
+        total_tick_delta = _tick_delta(current.tick_32k, previous.tick_32k)
+        total_seconds = total_tick_delta / TICK_HZ
+        missing_seconds = max(
+            0.0, total_seconds - NOMINAL_SAMPLE_PERIOD_SECONDS
+        )
+        if missing_seconds > MAX_INTERPOLATION_GAP_SECONDS + 1e-6:
+            return ()
+
+        result: list[ImuSample] = []
+        divisor = missing_samples + 1
+        for index in range(1, divisor):
+            alpha = index / divisor
+            result.append(ImuSample(
+                sequence=(previous.sequence + index) & UINT32_MASK,
+                tick_32k=(
+                    previous.tick_32k
+                    + round(total_tick_delta * alpha)
+                ) & UINT32_MASK,
+                accel_raw=tuple(
+                    round(
+                        previous.accel_raw[axis]
+                        + alpha
+                        * (current.accel_raw[axis] - previous.accel_raw[axis])
+                    )
+                    for axis in range(3)
+                ),
+                gyro_raw=tuple(
+                    round(
+                        previous.gyro_raw[axis]
+                        + alpha
+                        * (current.gyro_raw[axis] - previous.gyro_raw[axis])
+                    )
+                    for axis in range(3)
+                ),
+                interpolated=True,
+            ))
+        return tuple(result)
 
     def transport_discontinuity(self, reason: str) -> None:
         has_stream_state = (
@@ -2930,11 +3282,28 @@ class DeviceState:
         )
         if not has_stream_state:
             return
-        self._break_analysis_segment(reason, time.time(), mark_offline=True)
+        event_epoch = time.time()
+        self._record_gap(
+            reason=reason,
+            event_epoch=event_epoch,
+            duration_seconds=None,
+            missing_samples=0,
+            interpolated=False,
+        )
+        self.accel_history.clear()
+        self.gyro_history.clear()
+        self.signal_elapsed_seconds = 0.0
+        self.last_history_tick = None
+        self.clock_anchor_tick = None
+        self.clock_anchor_epoch = None
+        self.last_seen = 0.0
+        self.last_arrival_monotonic = 0.0
+        self.source = "waiting"
         self.last_packet_sequence = None
         self.last_sample_sequence = None
         self.last_continuity_sample_sequence = None
         self.last_sample_tick = None
+        self.last_real_sample = None
         self.current_session_id = None
 
     def reset_packet_counters(self) -> None:
@@ -2943,9 +3312,13 @@ class DeviceState:
         self.duplicate_packet_count = 0
         self.out_of_order_packet_count = 0
         self.continuity_gap_count = 0
+        self.interpolated_sample_count = 0
+        self.recent_gap_events.clear()
         self.last_packet_sequence = None
         self.last_continuity_sample_sequence = None
         self.last_sample_tick = None
+        self.last_real_sample = None
+        self.last_history_tick = None
 
     def _reset_stream_continuity(self) -> None:
         """Forget sequence anchors before accepting a new stream segment."""
@@ -2953,6 +3326,8 @@ class DeviceState:
         self.last_sample_sequence = None
         self.last_continuity_sample_sequence = None
         self.last_sample_tick = None
+        self.last_real_sample = None
+        self.last_history_tick = None
 
     def process(self, frame: MotionFrame) -> bool:
         frame_epoch = time.time()
@@ -2963,7 +3338,10 @@ class DeviceState:
             "motion-v1-100b",
             "motion-v2-100b",
         }
-        discontinuity_reason: str | None = None
+        gap_reason: str | None = None
+        gap_duration_seconds: float | None = None
+        missing_samples = 0
+        interpolated_samples: tuple[ImuSample, ...] = ()
 
         if full_motion_frame:
             reset_stream_continuity = False
@@ -2972,14 +3350,17 @@ class DeviceState:
                 and frame_arrival_monotonic - self.last_arrival_monotonic
                 > MAX_HOST_ARRIVAL_GAP_SECONDS
             ):
-                discontinuity_reason = "host_arrival_gap"
+                gap_reason = "host_arrival_gap"
+                gap_duration_seconds = (
+                    frame_arrival_monotonic - self.last_arrival_monotonic
+                )
                 reset_stream_continuity = True
 
             if (
                 self.source in {"motion-v1-100b", "motion-v2-100b"}
                 and frame.source != self.source
             ):
-                discontinuity_reason = "stream_format_changed"
+                gap_reason = "stream_format_changed"
                 reset_stream_continuity = True
 
             # A reboot can reuse a session ID on older firmware.  Once the
@@ -2993,10 +3374,9 @@ class DeviceState:
                 self.current_session_id = frame.session_id
             elif frame.session_id != self.current_session_id:
                 self.current_session_id = frame.session_id
-                self.last_packet_sequence = None
-                self.last_continuity_sample_sequence = None
-                self.last_sample_tick = None
-                discontinuity_reason = "session_changed"
+                gap_reason = "session_changed"
+                reset_stream_continuity = True
+                self._reset_stream_continuity()
 
             if self.last_packet_sequence is not None:
                 if frame.packet_sequence == self.last_packet_sequence:
@@ -3010,9 +3390,6 @@ class DeviceState:
                 ) & UINT16_MASK
                 if 0 < packet_gap < 0x8000:
                     self.lost_packets += packet_gap
-                    discontinuity_reason = (
-                        discontinuity_reason or "packet_gap"
-                    )
                 elif packet_gap >= 0x8000:
                     self.out_of_order_packet_count += 1
                     return False
@@ -3026,9 +3403,23 @@ class DeviceState:
                     first_sample.sequence - expected_sample
                 ) & UINT32_MASK
                 if 0 < sample_gap < 0x80000000:
-                    discontinuity_reason = (
-                        discontinuity_reason or "sample_gap"
-                    )
+                    missing_samples = sample_gap
+                    if self.last_real_sample is not None:
+                        tick_delta_seconds = _tick_seconds(
+                            first_sample.tick_32k,
+                            self.last_real_sample.tick_32k,
+                        )
+                        gap_duration_seconds = max(
+                            0.0,
+                            tick_delta_seconds
+                            - NOMINAL_SAMPLE_PERIOD_SECONDS,
+                        )
+                        interpolated_samples = self._interpolate_samples(
+                            self.last_real_sample,
+                            first_sample,
+                            missing_samples,
+                        )
+                    gap_reason = "sample_gap"
                 elif sample_gap >= 0x80000000:
                     self.out_of_order_packet_count += 1
                     return False
@@ -3043,17 +3434,37 @@ class DeviceState:
                     or sample_gap_seconds
                     > MAX_CONTINUOUS_SAMPLE_GAP_SECONDS
                 ):
-                    discontinuity_reason = (
-                        discontinuity_reason or "sample_time_gap"
-                    )
+                    # A sequence gap already describes this discontinuity more
+                    # precisely.  A time-only jump cannot be reconstructed
+                    # safely, so it starts a new inertial subsegment.
+                    if gap_reason is None:
+                        gap_reason = "sample_time_gap"
+                        gap_duration_seconds = max(
+                            0.0,
+                            sample_gap_seconds
+                            - NOMINAL_SAMPLE_PERIOD_SECONDS,
+                        )
 
-        if discontinuity_reason is not None:
-            if discontinuity_reason != "session_changed":
-                self.continuity_gap_count += 1
-            self._break_analysis_segment(
-                discontinuity_reason,
-                frame_epoch,
+        if gap_reason is not None:
+            self.continuity_gap_count += 1
+            gap_was_interpolated = (
+                missing_samples > 0
+                and len(interpolated_samples) == missing_samples
             )
+            self._record_gap(
+                reason=gap_reason,
+                event_epoch=frame_epoch,
+                duration_seconds=gap_duration_seconds,
+                missing_samples=missing_samples,
+                interpolated=gap_was_interpolated,
+            )
+            if gap_was_interpolated:
+                self.interpolated_sample_count += len(interpolated_samples)
+            else:
+                interpolated_samples = ()
+                # Keep the graph's relative time monotonic even if a device
+                # reboot resets its 32 kHz clock or a long gap wraps the tick.
+                self.last_history_tick = None
 
         last_sample_tick = frame.samples[-1].tick_32k
         if self.clock_anchor_tick is None or self.clock_anchor_epoch is None:
@@ -3079,19 +3490,44 @@ class DeviceState:
         self.coordinate_flags = frame.coordinate_flags
         sparse = frame.source == "esp32-diagnostic-s0"
 
+        analysis_frame = frame
+        if interpolated_samples:
+            analysis_frame = MotionFrame(
+                device_id=frame.device_id,
+                packet_sequence=frame.packet_sequence,
+                session_id=frame.session_id,
+                flags=frame.flags,
+                samples=interpolated_samples + frame.samples,
+                coordinate_source_sequence=frame.coordinate_source_sequence,
+                position_mm=frame.position_mm,
+                coordinate_flags=frame.coordinate_flags,
+                source=frame.source,
+            )
+
         # Both pipelines receive every sample, so switching modes never loses
         # history and does not require replaying serial data.
         self.analyses[ANALYSIS_MODE_DEVICE].process_device(
-            frame, sparse, timeline_epoch
+            analysis_frame, sparse, timeline_epoch
         )
         self.analyses[ANALYSIS_MODE_PC].process_pc(
-            frame, sparse, timeline_epoch
+            analysis_frame, sparse, timeline_epoch
         )
 
-        for sample in frame.samples:
-            if self.first_tick is None:
-                self.first_tick = sample.tick_32k
-            relative_time = _tick_seconds(sample.tick_32k, self.first_tick)
+        for sample in analysis_frame.samples:
+            if self.last_history_tick is None:
+                if self.accel_history:
+                    self.signal_elapsed_seconds += NOMINAL_SAMPLE_PERIOD_SECONDS
+            else:
+                history_dt = _tick_seconds(
+                    sample.tick_32k,
+                    self.last_history_tick,
+                )
+                self.signal_elapsed_seconds += (
+                    history_dt
+                    if 0.0 < history_dt <= MAX_INTERPOLATION_GAP_SECONDS
+                    else NOMINAL_SAMPLE_PERIOD_SECONDS
+                )
+            relative_time = self.signal_elapsed_seconds
             accel, gyro_dps = InertialEstimator.measurements(sample)
             self.accel_history.append(
                 [relative_time, accel[0], accel[1], accel[2]]
@@ -3099,11 +3535,14 @@ class DeviceState:
             self.gyro_history.append(
                 [relative_time, gyro_dps[0], gyro_dps[1], gyro_dps[2]]
             )
-            self.last_sample_sequence = sample.sequence
-            self.sample_count += 1
+            if not sample.interpolated:
+                self.last_sample_sequence = sample.sequence
+                self.sample_count += 1
+            self.last_history_tick = sample.tick_32k
         if full_motion_frame:
             self.last_continuity_sample_sequence = frame.samples[-1].sequence
             self.last_sample_tick = frame.samples[-1].tick_32k
+            self.last_real_sample = frame.samples[-1]
         return True
 
     def snapshot(self) -> dict[str, Any]:
@@ -3124,6 +3563,8 @@ class DeviceState:
             "duplicate_packet_count": self.duplicate_packet_count,
             "out_of_order_packet_count": self.out_of_order_packet_count,
             "continuity_gap_count": self.continuity_gap_count,
+            "interpolated_sample_count": self.interpolated_sample_count,
+            "recent_gap_events": list(self.recent_gap_events),
             "discontinuity_count": self.discontinuity_count,
             "last_discontinuity_reason": self.last_discontinuity_reason,
             "last_discontinuity_epoch": self.last_discontinuity_epoch,
@@ -3165,6 +3606,7 @@ class DeviceState:
             "duplicate_packet_count": self.duplicate_packet_count,
             "out_of_order_packet_count": self.out_of_order_packet_count,
             "continuity_gap_count": self.continuity_gap_count,
+            "interpolated_sample_count": self.interpolated_sample_count,
             "discontinuity_count": self.discontinuity_count,
             "last_discontinuity_reason": self.last_discontinuity_reason,
             "session_id": self.current_session_id,
@@ -3201,6 +3643,7 @@ class DeviceState:
             "last_sample_sequence": self.last_sample_sequence,
             "session_id": self.current_session_id,
             "discontinuity_count": self.discontinuity_count,
+            "interpolated_sample_count": self.interpolated_sample_count,
             "last_discontinuity_reason": self.last_discontinuity_reason,
             "analysis_mode": self.analysis_mode,
             "analysis_mode_label": ANALYSIS_MODE_LABELS[self.analysis_mode],

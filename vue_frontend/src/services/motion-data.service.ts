@@ -50,6 +50,10 @@ export interface TaskResultRequest {
   taskId: string
 }
 
+export interface TaskBatchExportRequest {
+  taskIds: string[]
+}
+
 export interface StartTaskRequest extends DeviceRequest {
   participantId: string
   participantProfile: ParticipantProfile
@@ -62,6 +66,10 @@ export interface FinishTaskRequest {
 
 export interface DeleteTaskRequest {
   taskId: string
+}
+
+export interface UpdateTaskParticipantRequest extends TaskResultRequest {
+  participantProfile: ParticipantProfile
 }
 
 export interface MotionDataService {
@@ -85,11 +93,13 @@ export interface MotionDataService {
   getMovementDetail(request: MovementDetailRequest): Promise<MovementDetail>
   exportMovement(request: MovementExportRequest): Promise<MovementExport>
   exportTask(request: TaskResultRequest): Promise<TaskArchiveExport>
+  exportTasks(request: TaskBatchExportRequest): Promise<TaskArchiveExport>
 
   getCurrentTask(request: DeviceRequest): Promise<TaskSummary | null>
   listParticipants(): Promise<ParticipantProfile[]>
   startTask(request: StartTaskRequest): Promise<TaskSummary>
   finishTask(request: FinishTaskRequest): Promise<TaskSummary>
+  updateTaskParticipant(request: UpdateTaskParticipantRequest): Promise<TaskSummary>
   deleteTask(request: DeleteTaskRequest): Promise<TaskSummary>
   listTasks(): Promise<TaskSummary[]>
   getTaskResult(request: TaskResultRequest): Promise<TaskResult>

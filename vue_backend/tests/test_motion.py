@@ -545,7 +545,7 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(rebased["packet_count"], 1)
         self.assertEqual(rebased["lost_packets"], 0)
 
-    def test_session_change_discards_active_segment_and_recalibrates(self) -> None:
+    def test_session_change_preserves_active_movement_as_new_subsegment(self) -> None:
         store = MotionStore(minimum_movement_seconds=0.0)
         store.set_analysis_mode(1, "device")
         self.assertTrue(
@@ -576,9 +576,14 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot["session_id"], 11)
         self.assertEqual(snapshot["discontinuity_count"], 1)
         self.assertEqual(snapshot["last_discontinuity_reason"], "session_changed")
-        self.assertEqual(snapshot["interrupted_movement_count"], 1)
-        self.assertIsNone(snapshot["current_movement"])
-        self.assertEqual(snapshot["calculated_path"], [])
+        self.assertEqual(snapshot["interrupted_movement_count"], 0)
+        self.assertIsNotNone(snapshot["current_movement"])
+        self.assertEqual(snapshot["current_movement"]["segment_count"], 2)
+        self.assertEqual(snapshot["current_movement"]["gap_count"], 1)
+        self.assertGreater(len(snapshot["calculated_path"]), 0)
+        signal_times = [row[0] for row in snapshot["accel"]]
+        self.assertEqual(signal_times, sorted(signal_times))
+        self.assertLess(signal_times[-1], 1.0)
 
     def test_duplicate_and_out_of_order_packets_are_rejected(self) -> None:
         store = MotionStore()
@@ -594,7 +599,7 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot["duplicate_packet_count"], 1)
         self.assertEqual(snapshot["out_of_order_packet_count"], 1)
 
-    def test_packet_gap_breaks_active_segment_before_new_samples(self) -> None:
+    def test_short_packet_gap_is_interpolated_without_breaking_movement(self) -> None:
         store = MotionStore(minimum_movement_seconds=0.0)
         store.set_analysis_mode(1, "device")
         self.assertTrue(store.process(make_frame(10, 0x0002, 0)))
@@ -607,11 +612,22 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(after["packet_count"], 2)
         self.assertEqual(after["lost_packets"], 1)
         self.assertEqual(after["continuity_gap_count"], 1)
-        self.assertEqual(after["last_discontinuity_reason"], "packet_gap")
-        self.assertEqual(after["interrupted_movement_count"], 1)
-        self.assertEqual(after["current_movement"]["sample_count"], 4)
+        self.assertEqual(after["last_discontinuity_reason"], "sample_gap")
+        self.assertEqual(after["interrupted_movement_count"], 0)
+        self.assertEqual(after["interpolated_sample_count"], 4)
+        self.assertEqual(after["current_movement"]["sample_count"], 12)
+        self.assertEqual(after["current_movement"]["observed_sample_count"], 8)
+        self.assertEqual(
+            after["current_movement"]["interpolated_sample_count"], 4
+        )
+        self.assertEqual(after["current_movement"]["segment_count"], 1)
+        records = store._devices[1].analyses["device"].current_movement.sample_records
+        self.assertEqual(
+            [row["sequence"] for row in records if row["interpolated"]],
+            [44, 45, 46, 47],
+        )
 
-    def test_transport_disconnect_restarts_stream_without_stitching(self) -> None:
+    def test_transport_disconnect_preserves_path_and_resumes_new_subsegment(self) -> None:
         store = MotionStore(minimum_movement_seconds=0.0)
         store.set_analysis_mode(1, "device")
         self.assertTrue(store.process(make_frame(0, 0x0002, 0)))
@@ -621,17 +637,19 @@ class MotionProtocolTests(unittest.TestCase):
 
         self.assertFalse(disconnected["online"])
         self.assertIsNone(disconnected["session_id"])
-        self.assertIsNone(disconnected["current_movement"])
-        self.assertEqual(disconnected["calculated_path"], [])
+        self.assertIsNotNone(disconnected["current_movement"])
+        self.assertGreater(len(disconnected["calculated_path"]), 0)
         self.assertEqual(disconnected["last_discontinuity_reason"], "serial_closed")
-        self.assertEqual(disconnected["interrupted_movement_count"], 1)
+        self.assertEqual(disconnected["interrupted_movement_count"], 0)
+        self.assertEqual(disconnected["current_movement"]["segment_count"], 2)
 
         self.assertTrue(store.process(make_frame(1, 0x0002, 100000)))
         resumed = store.snapshot(1)
         self.assertEqual(resumed["session_id"], 1)
-        self.assertEqual(resumed["current_movement"]["sample_count"], 4)
+        self.assertEqual(resumed["current_movement"]["sample_count"], 8)
+        self.assertEqual(resumed["current_movement"]["segment_count"], 2)
 
-    def test_rtc_time_gap_breaks_segment_even_when_sequences_are_continuous(self) -> None:
+    def test_long_time_gap_resumes_as_new_subsegment_without_interpolation(self) -> None:
         store = MotionStore(minimum_movement_seconds=0.0)
         store.set_analysis_mode(1, "device")
         self.assertTrue(store.process(make_frame(0, 0x0002, 0)))
@@ -641,10 +659,34 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot["lost_packets"], 0)
         self.assertEqual(snapshot["continuity_gap_count"], 1)
         self.assertEqual(snapshot["last_discontinuity_reason"], "sample_time_gap")
-        self.assertEqual(snapshot["interrupted_movement_count"], 1)
-        self.assertEqual(snapshot["current_movement"]["sample_count"], 4)
+        self.assertEqual(snapshot["interrupted_movement_count"], 0)
+        self.assertEqual(snapshot["interpolated_sample_count"], 0)
+        self.assertEqual(snapshot["current_movement"]["sample_count"], 8)
+        self.assertEqual(snapshot["current_movement"]["segment_count"], 2)
+        self.assertEqual(snapshot["current_movement"]["gap_count"], 1)
 
-    def test_host_arrival_gap_breaks_even_when_buffered_data_is_continuous(self) -> None:
+    def test_long_gap_preserves_pc_calibration_baseline(self) -> None:
+        store = MotionStore(minimum_movement_seconds=0.0)
+        store.set_analysis_mode(1, "pc")
+        packet = 0
+        tick = 0
+        for _ in range(25):
+            self.assertTrue(store.process(make_frame(packet, 0x0001, tick)))
+            packet += 1
+            tick += 4 * 328
+        calibrated = store.snapshot(1)
+        self.assertEqual(calibrated["pc_mode_state"], "静止")
+
+        self.assertTrue(
+            store.process(make_frame(packet, 0x0001, tick + 100000))
+        )
+        after = store.snapshot(1)
+
+        self.assertEqual(after["last_discontinuity_reason"], "sample_time_gap")
+        self.assertEqual(after["pc_mode_state"], "静止")
+        self.assertEqual(after["pc_detector"]["state"], "stationary")
+
+    def test_host_arrival_gap_resumes_without_clearing_visible_movement(self) -> None:
         store = MotionStore(minimum_movement_seconds=0.0)
         store.set_analysis_mode(1, "device")
         self.assertTrue(store.process(make_frame(0, 0x0002, 0)))
@@ -656,8 +698,10 @@ class MotionProtocolTests(unittest.TestCase):
         self.assertEqual(snapshot["lost_packets"], 0)
         self.assertEqual(snapshot["continuity_gap_count"], 1)
         self.assertEqual(snapshot["last_discontinuity_reason"], "host_arrival_gap")
-        self.assertEqual(snapshot["interrupted_movement_count"], 1)
-        self.assertEqual(snapshot["current_movement"]["sample_count"], 4)
+        self.assertEqual(snapshot["interrupted_movement_count"], 0)
+        self.assertEqual(snapshot["current_movement"]["sample_count"], 8)
+        self.assertEqual(snapshot["current_movement"]["segment_count"], 2)
+        self.assertGreater(len(snapshot["calculated_path"]), 0)
 
     def test_host_arrival_gap_accepts_same_session_sequence_restart(self) -> None:
         store = MotionStore(minimum_movement_seconds=0.0)

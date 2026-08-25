@@ -1,21 +1,76 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import StatusBadge from '@/shared/components/StatusBadge.vue'
 import type { TaskSummary } from '@/types/task'
 import { filterTasks } from '../history.filters'
 
-const props = defineProps<{ tasks: TaskSummary[]; deletingTaskId?: string | null }>()
-const emit = defineEmits<{ open: [taskId: string]; delete: [task: TaskSummary] }>()
+const props = defineProps<{
+  tasks: TaskSummary[]
+  deletingTaskId?: string | null
+  exporting?: boolean
+}>()
+const emit = defineEmits<{
+  open: [taskId: string]
+  delete: [task: TaskSummary]
+  export: [taskIds: string[]]
+}>()
 
 const taskKeyword = ref('')
 const participantKeyword = ref('')
+const participantNameKeyword = ref('')
 const dateKeyword = ref('')
+const selectedTaskIds = ref(new Set<string>())
 
 const filtered = computed(() => filterTasks(props.tasks, {
   taskId: taskKeyword.value,
   participantId: participantKeyword.value,
+  participantName: participantNameKeyword.value,
   date: dateKeyword.value,
 }))
+const selectableFiltered = computed(() => filtered.value.filter((task) => task.status !== 'collecting'))
+const selectedCount = computed(() => selectedTaskIds.value.size)
+const allFilteredSelected = computed(() => (
+  selectableFiltered.value.length > 0
+  && selectableFiltered.value.every((task) => selectedTaskIds.value.has(task.taskId))
+))
+const someFilteredSelected = computed(() => (
+  !allFilteredSelected.value
+  && selectableFiltered.value.some((task) => selectedTaskIds.value.has(task.taskId))
+))
+
+watch(
+  () => props.tasks.map((task) => task.taskId),
+  (taskIds) => {
+    const valid = new Set(taskIds)
+    selectedTaskIds.value = new Set(
+      [...selectedTaskIds.value].filter((taskId) => valid.has(taskId)),
+    )
+  },
+)
+
+function toggleTask(taskId: string): void {
+  const next = new Set(selectedTaskIds.value)
+  if (next.has(taskId)) next.delete(taskId)
+  else next.add(taskId)
+  selectedTaskIds.value = next
+}
+
+function toggleAllFiltered(): void {
+  const next = new Set(selectedTaskIds.value)
+  if (allFilteredSelected.value) {
+    selectableFiltered.value.forEach((task) => next.delete(task.taskId))
+  } else {
+    selectableFiltered.value.forEach((task) => next.add(task.taskId))
+  }
+  selectedTaskIds.value = next
+}
+
+function exportSelected(): void {
+  if (!selectedTaskIds.value.size || props.exporting) return
+  emit('export', props.tasks
+    .filter((task) => task.status !== 'collecting' && selectedTaskIds.value.has(task.taskId))
+    .map((task) => task.taskId))
+}
 
 function taskStatus(value: TaskSummary['status']): string {
   return ({ collecting: '采集中', completed: '已完成', abnormal: '待复核', cancelled: '已取消' })[value]
@@ -33,26 +88,33 @@ function movedBlocks(task: TaskSummary): string {
 <template>
   <section class="card filter-section">
     <div class="section-head">
-      <div><div class="card-title">任务筛选</div><div class="card-subtitle">按任务、体验者和日期查找采集记录</div></div>
+      <div><div class="card-title">任务筛选</div><div class="card-subtitle">按任务、体验者编号、姓名和日期查找采集记录</div></div>
       <StatusBadge tone="blue" text="任务记录" />
     </div>
     <div class="filters compact">
       <label>任务编号<input v-model="taskKeyword" placeholder="请输入任务编号" /></label>
       <label>体验者编号<input v-model="participantKeyword" placeholder="请输入体验者编号" /></label>
+      <label>体验者姓名<input v-model="participantNameKeyword" placeholder="请输入体验者姓名" /></label>
       <label>日期<input v-model="dateKeyword" type="date" /></label>
     </div>
   </section>
 
   <section class="card table-card">
     <div class="section-head">
-      <div><div class="card-title">历史任务列表</div></div>
-      <StatusBadge tone="blue" text="任务记录" />
+      <div><div class="card-title">历史任务列表</div><div class="card-subtitle">选择任务后可批量导出完整数据记录</div></div>
+      <div class="table-head-actions">
+        <span v-if="selectedCount" class="selected-count">已选 {{ selectedCount }} 条</span>
+        <button class="btn secondary batch-export" :disabled="!selectedCount || exporting" @click="exportSelected">
+          {{ exporting ? '正在打包…' : '批量导出' }}
+        </button>
+      </div>
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>任务编号</th><th>体验者编号</th><th>姓名</th><th>性别</th><th>年龄</th><th>备注</th><th>体验开始时间</th><th>体验结束时间</th><th>持续时间</th><th>移动积木</th><th>移动次数</th><th>综合评分</th><th>状态</th><th>操作</th></tr></thead>
+        <thead><tr><th class="selection-column"><input class="selection-checkbox" type="checkbox" aria-label="全选当前筛选结果" :checked="allFilteredSelected" :indeterminate="someFilteredSelected" :disabled="!selectableFiltered.length" @change="toggleAllFiltered" /></th><th>任务编号</th><th>体验者编号</th><th>姓名</th><th>性别</th><th>年龄</th><th>备注</th><th>体验开始时间</th><th>体验结束时间</th><th>持续时间</th><th>移动积木</th><th>移动次数</th><th>综合评分</th><th>状态</th><th>操作</th></tr></thead>
         <tbody>
-          <tr v-for="task in filtered" :key="task.taskId">
+          <tr v-for="task in filtered" :key="task.taskId" :class="{ selectedRow: selectedTaskIds.has(task.taskId) }">
+            <td class="selection-column"><input class="selection-checkbox" type="checkbox" :aria-label="`选择任务 ${task.taskId}`" :checked="selectedTaskIds.has(task.taskId)" :disabled="task.status === 'collecting'" @change="toggleTask(task.taskId)" /></td>
             <td><button class="link" @click="emit('open', task.taskId)">{{ task.taskId }}</button></td>
             <td>{{ task.participantId }}</td>
             <td>{{ task.participantSnapshot?.name || '—' }}</td>
@@ -68,7 +130,7 @@ function movedBlocks(task: TaskSummary): string {
             <td><StatusBadge :tone="task.status === 'completed' ? 'green' : 'gray'" :text="taskStatus(task.status)" /></td>
             <td><div class="row-actions"><button class="link" @click="emit('open', task.taskId)">查看详情</button><button class="link danger" :disabled="task.status === 'collecting' || deletingTaskId === task.taskId" @click="emit('delete', task)">{{ deletingTaskId === task.taskId ? '删除中…' : '删除' }}</button></div></td>
           </tr>
-          <tr v-if="!filtered.length"><td class="empty-cell" colspan="14">没有符合筛选条件的任务记录</td></tr>
+          <tr v-if="!filtered.length"><td class="empty-cell" colspan="15">没有符合筛选条件的任务记录</td></tr>
         </tbody>
       </table>
     </div>
@@ -77,5 +139,5 @@ function movedBlocks(task: TaskSummary): string {
 </template>
 
 <style scoped>
-.filter-section{padding:18px}.filter-section .filters{padding:16px 0 0}.table-card .table-wrap{max-height:430px;overflow:auto;scrollbar-gutter:stable}.table-card th{position:sticky;top:0;z-index:1}.empty-cell{text-align:center;color:#7b879a;padding:28px}.row-actions{display:flex;align-items:center;gap:12px;white-space:nowrap}.link.danger{color:#d14343}.link:disabled{cursor:not-allowed;opacity:.45}
+.filter-section{padding:18px}.filter-section .filters{padding:16px 0 0}.filter-section .filters.compact{grid-template-columns:repeat(4,minmax(0,1fr))}.table-card .table-wrap{max-height:430px;overflow:auto;scrollbar-gutter:stable}.table-card th{position:sticky;top:0;z-index:1}.table-head-actions{display:flex;align-items:center;gap:10px}.selected-count{color:#59667a;font-size:11px}.batch-export{padding:8px 13px;font-size:11px}.batch-export:disabled{cursor:not-allowed;opacity:.5}.selection-column{width:38px;padding-right:6px;text-align:center}.selection-checkbox{width:16px;height:16px;margin:0;padding:0;accent-color:var(--primary);cursor:pointer}.selection-checkbox:disabled{cursor:not-allowed;opacity:.45}.empty-cell{text-align:center;color:#7b879a;padding:28px}.row-actions{display:flex;align-items:center;gap:12px;white-space:nowrap}.link.danger{color:#d14343}.link:disabled{cursor:not-allowed;opacity:.45}@media(max-width:1000px){.filter-section .filters.compact{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:680px){.filter-section .filters.compact{grid-template-columns:1fr}.table-card .section-head{align-items:flex-start}.table-head-actions{width:100%;justify-content:space-between}}
 </style>

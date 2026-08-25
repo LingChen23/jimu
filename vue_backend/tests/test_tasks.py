@@ -480,6 +480,60 @@ class TaskServiceTests(unittest.TestCase):
                     "name": "",
                 })
 
+    def test_result_page_profile_update_changes_task_snapshot_and_exports(self) -> None:
+        snapshot = lambda device_id: {
+            "device_id": device_id,
+            "block_id": "A",
+            "analysis_mode": "pc",
+            "completed_movements": [],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tasks.json"
+            service = TaskService(
+                path,
+                snapshot,
+                device_ids=(1,),
+                require_participant_profile=True,
+            )
+            started = service.start(1, "P001", "档案修正", {
+                "participant_id": "P001",
+                "name": "原姓名",
+                "phone": "10000",
+            })
+            service.finish(started["task_id"])
+
+            updated = service.update_task_participant(started["task_id"], {
+                "participant_id": "不能更改的编号",
+                "name": "新姓名",
+                "phone": "13800138000",
+                "vision_status": "佩戴眼镜",
+                "profile_note": "复核后修正",
+            })
+
+            self.assertEqual(updated["participant_id"], "P001")
+            self.assertEqual(updated["participant_snapshot"]["participant_id"], "P001")
+            self.assertEqual(updated["participant_snapshot"]["name"], "新姓名")
+            self.assertEqual(service.participant("P001")["phone"], "13800138000")
+
+            archive_bytes = service.task_export_archive(started["task_id"])
+            self.assertIsNotNone(archive_bytes)
+            with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+                manifest = json.loads(archive.read("task.json"))
+            self.assertEqual(manifest["participant_snapshot"]["name"], "新姓名")
+            self.assertEqual(
+                manifest["participant_snapshot"]["vision_status"],
+                "佩戴眼镜",
+            )
+
+            reloaded = TaskService(
+                path,
+                snapshot,
+                device_ids=(1,),
+                require_participant_profile=True,
+            )
+            restored = reloaded.result(started["task_id"])["task"]
+            self.assertEqual(restored["participant_snapshot"]["profile_note"], "复核后修正")
+
     def test_task_exports_include_profile_task_and_full_movement_context(self) -> None:
         class SnapshotProvider:
             def __init__(self) -> None:
@@ -563,6 +617,39 @@ class TaskServiceTests(unittest.TestCase):
                 self.assertEqual(
                     json.loads(archive.read(detail_name))["movement_id"], 1
                 )
+
+            second = service.start(1, "P002", "第二次导出", {
+                "participant_id": "P002", "name": "张某",
+            })
+            provider.movement_ids.append(2)
+            service.finish(second["task_id"])
+            batch_archive = service.tasks_export_archive([
+                started["task_id"],
+                second["task_id"],
+                started["task_id"],
+            ])
+            with zipfile.ZipFile(io.BytesIO(batch_archive)) as archive:
+                names = archive.namelist()
+                batch_manifest = json.loads(archive.read("batch.json"))
+                task_manifests = [
+                    json.loads(archive.read(name))
+                    for name in names
+                    if name.endswith("/task.json")
+                ]
+
+                self.assertEqual(batch_manifest["task_count"], 2)
+                self.assertEqual(len(task_manifests), 2)
+                self.assertEqual(
+                    {item["task"]["task_id"] for item in task_manifests},
+                    {started["task_id"], second["task_id"]},
+                )
+                self.assertTrue(any(name.endswith("/samples.csv") for name in names))
+                self.assertTrue(any(name.endswith("/samples.json") for name in names))
+
+            with self.assertRaisesRegex(ValueError, "至少选择一个"):
+                service.tasks_export_archive([])
+            with self.assertRaisesRegex(ValueError, "未找到任务"):
+                service.tasks_export_archive(["missing-task"])
 
     def test_finished_task_persists_movement_detail(self) -> None:
         class SnapshotProvider:

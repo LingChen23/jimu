@@ -446,6 +446,31 @@ class ApiHandler(SimpleHTTPRequestHandler):
                     }
                 )
                 return
+            if self.path == "/api/tasks/export-batch.zip":
+                task_ids = body.get("task_ids")
+                if not isinstance(task_ids, list):
+                    raise ValueError("task_ids 必须是数组")
+                content = TASKS.tasks_export_archive(task_ids)
+                self._download_response(
+                    content,
+                    "application/zip",
+                    "tasks_batch.zip",
+                )
+                return
+            if self.path == "/api/tasks/participant":
+                profile = body.get("participant_profile")
+                if not isinstance(profile, dict):
+                    raise ValueError("participant_profile 必须是对象")
+                self._json_response(
+                    {
+                        "ok": True,
+                        "task": TASKS.update_task_participant(
+                            str(body.get("task_id", "")),
+                            profile,
+                        ),
+                    }
+                )
+                return
             if self.path == "/api/tasks/delete":
                 self._json_response(
                     {

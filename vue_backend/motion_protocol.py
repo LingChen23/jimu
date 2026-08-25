@@ -78,6 +78,10 @@ class ImuSample:
     tick_32k: int
     accel_raw: tuple[int, int, int]
     gyro_raw: tuple[int, int, int]
+    # Host-side gap recovery may synthesize a bounded number of samples.  The
+    # wire decoder always leaves this false, so interpolated values can never
+    # be mistaken for measurements received from the sensor.
+    interpolated: bool = False
 
 
 @dataclass(frozen=True)

@@ -3,6 +3,7 @@ import type { TaskSummary } from '@/types/task'
 export interface TaskHistoryFilters {
   taskId: string
   participantId: string
+  participantName: string
   date: string
 }
 
@@ -19,9 +20,11 @@ export function taskDate(startTime: string): string {
 }
 
 export function filterTasks(tasks: TaskSummary[], filters: TaskHistoryFilters): TaskSummary[] {
+  const nameKeyword = filters.participantName.trim().toLocaleLowerCase()
   return tasks.filter((task) => (
     task.taskId.includes(filters.taskId.trim())
     && task.participantId.includes(filters.participantId.trim())
+    && (task.participantSnapshot?.name ?? '').toLocaleLowerCase().includes(nameKeyword)
     && (!filters.date || taskDate(task.startTime) === filters.date)
   ))
 }

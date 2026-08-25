@@ -35,6 +35,7 @@ import type {
   RealtimeDataRequest,
   StartTaskRequest,
   TaskResultRequest,
+  UpdateTaskParticipantRequest,
 } from './motion-data.service'
 import { fetchWithTimeout } from './http-client'
 import { estimateAngularEventStart } from '@/utils/motion-event-interval'
@@ -286,6 +287,24 @@ function participantProfile(raw: JsonObject): ParticipantProfile {
     upperLimbStatus: String(raw.upper_limb_status ?? ''),
     cognitiveStatus: String(raw.cognitive_status ?? ''),
     profileNote: String(raw.profile_note ?? ''),
+  }
+}
+
+function participantProfilePayload(profile: ParticipantProfile): JsonObject {
+  return {
+    participant_id: profile.participantId,
+    name: profile.name,
+    gender: profile.gender,
+    age: profile.age,
+    birth_date: profile.birthDate,
+    education_level: profile.educationLevel,
+    dominant_hand: profile.dominantHand,
+    phone: profile.phone,
+    vision_status: profile.visionStatus,
+    hearing_status: profile.hearingStatus,
+    upper_limb_status: profile.upperLimbStatus,
+    cognitive_status: profile.cognitiveStatus,
+    profile_note: profile.profileNote,
   }
 }
 
@@ -756,28 +775,53 @@ export class MotionSystemDataService implements MotionDataService {
     }
   }
 
+  async exportTasks(request: { taskIds: string[] }) {
+    const response = await fetchWithTimeout(
+      '/api/tasks/export-batch.zip',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ task_ids: request.taskIds }),
+      },
+      120_000,
+    )
+    if (!response.ok) {
+      let message = `批量导出失败：${response.status}`
+      try {
+        const payload = await response.json()
+        if (payload?.error) message = String(payload.error)
+      } catch {
+        // Keep the status-based fallback for non-JSON server errors.
+      }
+      throw new Error(message)
+    }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+    return {
+      fileName: `tasks_batch_${stamp}.zip`,
+      mimeType: 'application/zip' as const,
+      content: await response.blob(),
+    }
+  }
+
   async startTask(request: StartTaskRequest): Promise<TaskSummary> {
     const raw = await this.json('/api/tasks/start', {
       method: 'POST',
       body: JSON.stringify({
         device_id: request.deviceId,
         participant_id: request.participantId,
-        participant_profile: {
-          participant_id: request.participantProfile.participantId,
-          name: request.participantProfile.name,
-          gender: request.participantProfile.gender,
-          age: request.participantProfile.age,
-          birth_date: request.participantProfile.birthDate,
-          education_level: request.participantProfile.educationLevel,
-          dominant_hand: request.participantProfile.dominantHand,
-          phone: request.participantProfile.phone,
-          vision_status: request.participantProfile.visionStatus,
-          hearing_status: request.participantProfile.hearingStatus,
-          upper_limb_status: request.participantProfile.upperLimbStatus,
-          cognitive_status: request.participantProfile.cognitiveStatus,
-          profile_note: request.participantProfile.profileNote,
-        },
+        participant_profile: participantProfilePayload(request.participantProfile),
         note: request.note,
+      }),
+    })
+    return taskSummary(raw.task)
+  }
+
+  async updateTaskParticipant(request: UpdateTaskParticipantRequest): Promise<TaskSummary> {
+    const raw = await this.json('/api/tasks/participant', {
+      method: 'POST',
+      body: JSON.stringify({
+        task_id: request.taskId,
+        participant_profile: participantProfilePayload(request.participantProfile),
       }),
     })
     return taskSummary(raw.task)

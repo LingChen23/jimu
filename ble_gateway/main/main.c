@@ -28,7 +28,8 @@
 #define SCAN_INTERVAL_MS         100
 #define SCAN_WINDOW_MS           10
 #define SCAN_RETRY_DELAY_MS      4000
-#define CONNECT_TIMEOUT_MS       30000
+#define READY_SCAN_GUARD_MS      1500
+#define CONNECT_TIMEOUT_MS       5000
 #define MAX_MAHJONG_CONNECTIONS  4U
 #define INVALID_PEER_INDEX       UINT8_MAX
 #define GATEWAY_FRAME_VERSION    1U
@@ -123,6 +124,7 @@ typedef struct {
     uint16_t status_def_handle;
     uint16_t status_value_handle;
     uint16_t status_cccd_handle;
+    bool mtu_exchange_started;
     bool command_in_flight;
     uint8_t pending_command;
     uint8_t pending_request_id;
@@ -176,8 +178,10 @@ typedef struct {
 static uint8_t s_own_addr_type;
 static const gateway_profile_t *s_profile;
 static bool s_scanning;
+static bool s_scan_resume_pending;
 static uint8_t s_connecting_peer = INVALID_PEER_INDEX;
 static esp_timer_handle_t s_scan_retry_timer;
+static struct ble_npl_event s_scan_resume_event;
 static mahjong_peer_t s_peers[MAX_MAHJONG_CONNECTIONS];
 static QueueHandle_t s_gateway_tx_queue;
 static uint32_t s_gateway_sequence;
@@ -196,10 +200,15 @@ typedef struct {
 
 static int gap_event_handler(struct ble_gap_event *event, void *arg);
 static void start_scan(void);
+static void schedule_scan_resume(uint32_t delay_ms);
 static void schedule_scan_retry(void);
 static void restart_after_discovery_error(mahjong_peer_t *peer,
                                           const char *stage,
                                           int status);
+static int mtu_exchange_cb(uint16_t conn_handle,
+                           const struct ble_gatt_error *error,
+                           uint16_t mtu,
+                           void *arg);
 static int service_discovery_cb(uint16_t conn_handle,
                                 const struct ble_gatt_error *error,
                                 const struct ble_gatt_svc *service,
@@ -845,6 +854,18 @@ static uint8_t ready_peer_count(void)
     return count;
 }
 
+static bool discovery_in_progress(void)
+{
+    uint8_t index;
+
+    for (index = 0; index < MAX_MAHJONG_CONNECTIONS; index++) {
+        if (s_peers[index].state == PEER_DISCOVERING) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static mahjong_peer_t *find_ready_peer_by_device_id(uint8_t device_id)
 {
     uint8_t index;
@@ -1153,6 +1174,22 @@ static void consume_status_notification(mahjong_peer_t *peer,
                               (uint16_t)(response_length + 1U));
 }
 
+static void start_mtu_exchange(mahjong_peer_t *peer)
+{
+    int rc;
+
+    if (peer == NULL || peer->state != PEER_DISCOVERING ||
+        peer->mtu_exchange_started) {
+        return;
+    }
+
+    peer->mtu_exchange_started = true;
+    rc = ble_gattc_exchange_mtu(peer->conn_handle, mtu_exchange_cb, peer);
+    if (rc != 0) {
+        restart_after_discovery_error(peer, "MTU exchange start", rc);
+    }
+}
+
 static int mtu_exchange_cb(uint16_t conn_handle,
                            const struct ble_gatt_error *error,
                            uint16_t mtu,
@@ -1246,6 +1283,7 @@ static int status_subscribe_write_cb(uint16_t conn_handle,
              TARGETS[peer->target_index].expected_device_id,
              ready_peer_count(),
              gateway_profile_enabled_target_count(s_profile));
+    schedule_scan_resume(READY_SCAN_GUARD_MS);
     return 0;
 }
 
@@ -1504,8 +1542,9 @@ static void build_target_conn_params(struct ble_gap_conn_params *params,
                                      uint8_t target_index)
 {
     memset(params, 0, sizeof(*params));
-    params->scan_itvl = BLE_GAP_SCAN_FAST_INTERVAL_MIN;
-    params->scan_window = BLE_GAP_SCAN_FAST_WINDOW;
+    /* Preserve established connection events while initiating a new link. */
+    params->scan_itvl = BLE_GAP_SCAN_ITVL_MS(SCAN_INTERVAL_MS);
+    params->scan_window = BLE_GAP_SCAN_WIN_MS(SCAN_WINDOW_MS);
     params->itvl_min = s_profile->preferred_conn_interval_units;
     params->itvl_max = s_profile->preferred_conn_interval_units;
     params->latency = 0U;
@@ -1570,7 +1609,8 @@ static void start_scan(void)
     struct ble_gap_disc_params params;
     int rc;
 
-    if (s_scanning || s_connecting_peer != INVALID_PEER_INDEX ||
+    if (s_scanning || s_scan_resume_pending ||
+        s_connecting_peer != INVALID_PEER_INDEX || discovery_in_progress() ||
         !has_available_target()) {
         return;
     }
@@ -1605,26 +1645,40 @@ static void start_scan(void)
 static void scan_retry_timer_callback(void *arg)
 {
     (void)arg;
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_scan_resume_event);
+}
+
+static void scan_resume_event_callback(struct ble_npl_event *event)
+{
+    (void)event;
+    s_scan_resume_pending = false;
     start_scan();
 }
 
-static void schedule_scan_retry(void)
+static void schedule_scan_resume(uint32_t delay_ms)
 {
     esp_err_t err;
 
     if (s_scan_retry_timer == NULL || s_scanning ||
-        s_connecting_peer != INVALID_PEER_INDEX ||
+        s_connecting_peer != INVALID_PEER_INDEX || discovery_in_progress() ||
         !has_available_target()) {
         return;
     }
 
     (void)esp_timer_stop(s_scan_retry_timer);
+    s_scan_resume_pending = true;
     err = esp_timer_start_once(
         s_scan_retry_timer,
-        (uint64_t)SCAN_RETRY_DELAY_MS * 1000ULL);
+        (uint64_t)delay_ms * 1000ULL);
     if (err != ESP_OK) {
+        s_scan_resume_pending = false;
         ESP_LOGE(TAG, "Failed to schedule BLE scan retry: err=%d", err);
     }
+}
+
+static void schedule_scan_retry(void)
+{
+    schedule_scan_resume(SCAN_RETRY_DELAY_MS);
 }
 
 static int gap_event_handler(struct ble_gap_event *event, void *arg)
@@ -1674,6 +1728,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
         link_stats_on_connect(peer->target_index,
                               peer->conn_handle,
                               rc == 0 ? desc.conn_itvl : 0U);
+        peer->state = PEER_DISCOVERING;
         dle_rc = ble_gap_set_data_len(peer->conn_handle,
                                       LINK_DLE_TX_OCTETS,
                                       LINK_DLE_TX_TIME_US);
@@ -1696,15 +1751,12 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
                  active_peer_count(),
                  gateway_profile_enabled_target_count(s_profile));
 
-        peer->state = PEER_DISCOVERING;
-        rc = ble_gattc_exchange_mtu(peer->conn_handle,
-                                    mtu_exchange_cb,
-                                    peer);
-        if (rc != 0) {
-            restart_after_discovery_error(peer,
-                                          "MTU exchange start", rc);
-        }
-        start_scan();
+        /*
+         * Submit MTU after DLE.  On ESP32-S3 the data-length-change event can
+         * require ATT traffic before it is reported, so waiting for that event
+         * here would deadlock discovery.  Scanning remains blocked until READY.
+         */
+        start_mtu_exchange(peer);
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
@@ -1823,6 +1875,7 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg)
                      event->data_len_chg.max_tx_time,
                      event->data_len_chg.max_rx_octets,
                      event->data_len_chg.max_rx_time);
+            start_mtu_exchange(peer);
         }
         return 0;
 
@@ -1964,6 +2017,8 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(nimble_port_init());
+    ble_npl_event_init(&s_scan_resume_event,
+                       scan_resume_event_callback, NULL);
     ble_svc_gap_init();
 
     rc = ble_svc_gap_device_name_set("ESP32S3-Motion-Gateway");

@@ -416,7 +416,8 @@ class ApiHandler(SimpleHTTPRequestHandler):
             )
             self._download_response(content, content_type, filename)
             return
-        if path == "/":
+        if (path in ("/", "/realtime", "/history", "/devices", "/cloud-history")
+                or path.startswith(("/results/", "/cloud-history/tasks/"))):
             self.path = "/index.html"
         super().do_GET()
 

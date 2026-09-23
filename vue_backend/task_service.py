@@ -95,7 +95,7 @@ class TaskService:
                 and references
                 and task.get("total_score") is None
             ):
-                task["total_score"] = self._new_task_score()
+                task["total_score"] = self._new_task_score(str(task.get("task_id", "")))
                 task["score_model_version"] = self.TEMPORARY_SCORE_MODEL_VERSION
                 changed = True
             elif (
@@ -322,7 +322,8 @@ class TaskService:
                     self._movement_key(reference) not in movement_files
                     for reference in references
                 )):
-                    self._diagnostic_sink("task_result_incomplete", "warning", "task_finish")
+                    self._diagnostic_sink("task_result_incomplete", "warning", "task_finish",
+                                          task_id=task_id)
                 ended = datetime.now().astimezone()
                 started = datetime.fromisoformat(str(task["start_time"]))
                 task["end_time"] = ended.isoformat(timespec="seconds")
@@ -332,7 +333,7 @@ class TaskService:
                 task["status"] = "completed"
                 task["data_quality"] = "complete" if references else "normal"
                 task["movement_references"] = references
-                task["total_score"] = self._new_task_score() if references else None
+                task["total_score"] = self._new_task_score(task_id) if references else None
                 task["score_model_version"] = (
                     self.TEMPORARY_SCORE_MODEL_VERSION if references else None
                 )
@@ -545,16 +546,18 @@ class TaskService:
             reference["device_movement_index"] = per_device_indexes[target_id]
         return references
 
-    def _new_task_score(self) -> int:
+    def _new_task_score(self, task_id: str = '') -> int:
         try:
             score = int(self._score_provider())
         except Exception as error:
             if self._diagnostic_sink is not None:
-                self._diagnostic_sink("task_result_failed", "error", "task_scoring", error=error)
+                self._diagnostic_sink("task_result_failed", "error", "task_scoring",
+                                      error=error, task_id=task_id)
             raise
         if not 60 <= score <= 95:
             if self._diagnostic_sink is not None:
-                self._diagnostic_sink("task_result_failed", "error", "task_scoring")
+                self._diagnostic_sink("task_result_failed", "error", "task_scoring",
+                                      task_id=task_id)
             raise ValueError("任务评分必须在 60～95 分之间")
         return score
 

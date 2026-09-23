@@ -76,7 +76,7 @@ class SerialService:
         store: MotionStore,
         device_ids: tuple[int, ...] | list[int] = tuple(range(1, 11)),
         diagnostic_sink: Callable[..., None] | None = None,
-        task_collecting: Callable[[], bool] | None = None,
+        task_collecting: Callable[[], str | None] | None = None,
     ) -> None:
         self._store = store
         self._diagnostic_sink = diagnostic_sink
@@ -798,9 +798,9 @@ class SerialService:
                 if active_connection:
                     self._store.transport_discontinuity("serial_error")
                     if self._diagnostic_sink is not None:
-                        collecting = self._task_collecting() if self._task_collecting else False
+                        task_id = self._task_collecting() if self._task_collecting else None
                         self._diagnostic_sink(
-                            "serial_disconnected_during_task" if collecting else "serial_disconnected",
-                            "error" if collecting else "warning",
-                                              "serial_read", error=error)
+                            "serial_disconnected_during_task" if task_id else "serial_disconnected",
+                            "error" if task_id else "warning",
+                            "serial_read", error=error, task_id=task_id or "")
                 return

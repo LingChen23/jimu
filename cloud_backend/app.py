@@ -193,9 +193,15 @@ def create_app(settings=None, storage=None, repository=None):
                 raise ValueError
             for event in events:
                 if (not isinstance(event, dict)
-                        or set(event) != {'code', 'severity', 'operation', 'device_id',
-                                          'error_type', 'reason_code', 'first_seen', 'last_seen', 'count'}
+                        or not {'code', 'severity', 'operation', 'device_id', 'error_type',
+                                'reason_code', 'first_seen', 'last_seen', 'count'} <= set(event)
+                        or set(event) - {'code', 'severity', 'operation', 'device_id',
+                                         'error_type', 'reason_code', 'task_id',
+                                         'first_seen', 'last_seen', 'count'}
                         or event.get('severity') not in ('warning', 'error')
+                        or not isinstance(event.get('task_id', ''), str)
+                        or bool(event.get('task_id')) and not re.fullmatch(
+                            '[A-Za-z0-9_-]{1,96}', event['task_id'])
                         or not isinstance(event.get('reason_code'), str)
                         or len(event['reason_code']) > 64
                         or bool(event['reason_code']) and not re.fullmatch('[A-Za-z0-9_-]+', event['reason_code'])

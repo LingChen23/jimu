@@ -167,6 +167,7 @@ class ArchiveTests(unittest.TestCase):
 
     def test_diagnostics_batch_is_authenticated_idempotent_and_saved_to_oss(self):
         event = dict(code='serial_open_failed', severity='error', operation='serial_open',
+                     task_id='T20260921-TEST',
                      device_id=None, error_type='PermissionError', reason_code='', count=3,
                      first_seen='2026-09-23T01:00:00+00:00',
                      last_seen='2026-09-23T01:01:00+00:00')

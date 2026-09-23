@@ -59,7 +59,8 @@ STORE = MotionStore(
 DIAGNOSTICS = Diagnostics(RUNTIME_ROOT)
 SERIAL = SerialService(
     STORE, device_ids=DEVICE_IDS, diagnostic_sink=DIAGNOSTICS.record,
-    task_collecting=lambda: any(task.get("status") == "collecting" for task in TASKS.list()),
+    task_collecting=lambda: next((str(task.get("task_id", "")) for task in TASKS.list()
+                                  if task.get("status") == "collecting"), None),
 )
 TASKS = TaskService(
     TASK_RECORDS_PATH,
@@ -92,7 +93,11 @@ CLOUD_UPLOADER = CloudUploader(
 )
 
 
-def _record_api_error(path: str, error: BaseException) -> None:
+def _record_api_error(path: str, error: BaseException, task_id: str = "") -> None:
+    parsed = urlsplit(path)
+    path = parsed.path
+    query = parse_qs(parsed.query)
+    task_id = task_id or (query.get("task") or query.get("task_id") or [""])[0]
     if path == "/api/serial/open" and isinstance(error, OSError):
         DIAGNOSTICS.record("serial_open_failed", "error", "serial_open", error=error)
     elif path == "/api/tasks/start" and not isinstance(error, ValueError):
@@ -100,13 +105,16 @@ def _record_api_error(path: str, error: BaseException) -> None:
         DIAGNOSTICS.record(code, "error", "task_start", error=error)
     elif path == "/api/tasks/finish" and not isinstance(error, ValueError):
         code = "task_save_failed" if isinstance(error, (OSError, sqlite3.Error)) else "task_finish_failed"
-        DIAGNOSTICS.record(code, "error", "task_finish", error=error)
+        DIAGNOSTICS.record(code, "error", "task_finish", error=error, task_id=task_id)
     elif path.startswith("/api/tasks/export"):
-        DIAGNOSTICS.record("zip_export_failed", "error", "task_export", error=error)
+        DIAGNOSTICS.record("zip_export_failed", "error", "task_export",
+                           error=error, task_id=task_id)
     elif isinstance(error, TransportError):
-        DIAGNOSTICS.record("cloud_read_failed", "warning", "cloud_read", error=error)
+        DIAGNOSTICS.record("cloud_read_failed", "warning", "cloud_read",
+                           error=error, task_id=task_id)
     elif not isinstance(error, ValueError):
-        DIAGNOSTICS.record("unexpected_backend_error", "error", "http_request", error=error)
+        DIAGNOSTICS.record("unexpected_backend_error", "error", "http_request",
+                           error=error, task_id=task_id)
 
 
 def _cloud_json(path: str) -> dict:
@@ -188,7 +196,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
         try:
             self._do_GET()
         except Exception as error:
-            _record_api_error(urlsplit(self.path).path, error)
+            _record_api_error(self.path, error)
             raise
 
     def _do_GET(self) -> None:
@@ -413,6 +421,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
         super().do_GET()
 
     def do_POST(self) -> None:
+        body = {}
         try:
             body = self._read_json()
             if self.path == "/api/diagnostics/event":
@@ -423,7 +432,7 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 if code in ("page_render_failed", "page_request_timeout"):
                     DIAGNOSTICS.record(
                         code, "error" if code == "page_render_failed" else "warning",
-                        operation,
+                        operation, task_id=body.get("task_id", ""),
                     )
                     self._json_response({"ok": True})
                 else:
@@ -565,7 +574,8 @@ class ApiHandler(SimpleHTTPRequestHandler):
                     CLOUD_UPLOADER.enqueue([task_id])
                 except (OSError, sqlite3.Error) as error:
                     # Cloud queue availability must never undo a completed task.
-                    DIAGNOSTICS.record("cloud_archive_failed", "error", "queue_task", error=error)
+                    DIAGNOSTICS.record("cloud_archive_failed", "error", "queue_task",
+                                       error=error, task_id=task_id)
                 self._json_response(
                     {
                         "ok": True,
@@ -622,15 +632,18 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 {"error": "unknown endpoint"}, HTTPStatus.NOT_FOUND
             )
         except TransportError as error:
-            _record_api_error(self.path, error)
+            _record_api_error(self.path, error,
+                              str(body.get("task_id", "")) if isinstance(body, dict) else "")
             self._json_response({"error": error.code}, HTTPStatus.SERVICE_UNAVAILABLE)
         except (ValueError, OSError, TypeError) as error:
-            _record_api_error(self.path, error)
+            _record_api_error(self.path, error,
+                              str(body.get("task_id", "")) if isinstance(body, dict) else "")
             self._json_response(
                 {"error": str(error)}, HTTPStatus.BAD_REQUEST
             )
         except Exception as error:
-            _record_api_error(self.path, error)
+            _record_api_error(self.path, error,
+                              str(body.get("task_id", "")) if isinstance(body, dict) else "")
             raise
 
 

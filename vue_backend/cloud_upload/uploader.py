@@ -159,7 +159,8 @@ class CloudUploader:
                 code = "cloud_auth_failed" if error.code == "unauthorized" else (
                     "cloud_request_failed" if error.retryable else "cloud_archive_failed")
                 self._diagnostic_sink(code, "warning" if error.retryable else "error",
-                                      "archive_task", error=error, reason_code=error.code)
+                                      "archive_task", error=error, reason_code=error.code,
+                                      task_id=task_id)
             delay = (15, 60, 300)[min(max(int(row["attempts"]) - 1, 0), 2)]
             self._queue.mark_failed(
                 task_id, error.code, time.time() + delay if error.retryable else None
@@ -167,12 +168,14 @@ class CloudUploader:
         except (OSError, sqlite3.Error) as error:
             if self._diagnostic_sink is not None:
                 self._diagnostic_sink("task_save_failed", "error", "upload_cache",
-                                      error=error, reason_code="local_storage_error")
+                                      error=error, reason_code="local_storage_error",
+                                      task_id=task_id)
             self._queue.mark_failed(task_id, "local_storage_error", time.time() + 60)
         except Exception as error:
             if self._diagnostic_sink is not None:
                 self._diagnostic_sink("unexpected_backend_error", "error", "archive_task",
-                                      error=error, reason_code="upload_internal_error")
+                                      error=error, reason_code="upload_internal_error",
+                                      task_id=task_id)
             self._queue.mark_failed(task_id, "upload_internal_error", time.time() + 60)
 
     def _cleanup_temporary_files(self) -> None:

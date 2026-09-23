@@ -39,6 +39,7 @@ class Diagnostics:
                     severity TEXT NOT NULL,
                     operation TEXT NOT NULL,
                     reason_code TEXT NOT NULL DEFAULT '',
+                    task_id TEXT NOT NULL DEFAULT '',
                     device_id INTEGER,
                     error_type TEXT,
                     first_seen TEXT NOT NULL,
@@ -56,8 +57,11 @@ class Diagnostics:
                     value TEXT NOT NULL
                 );
             """)
-            if 'reason_code' not in {row[1] for row in db.execute('PRAGMA table_info(events)')}:
+            columns = {row[1] for row in db.execute('PRAGMA table_info(events)')}
+            if 'reason_code' not in columns:
                 db.execute("ALTER TABLE events ADD COLUMN reason_code TEXT NOT NULL DEFAULT ''")
+            if 'task_id' not in columns:
+                db.execute("ALTER TABLE events ADD COLUMN task_id TEXT NOT NULL DEFAULT ''")
             db.execute("INSERT OR IGNORE INTO metadata VALUES ('client_id', ?)",
                        (uuid4().hex,))
             self.client_id = db.execute(
@@ -78,7 +82,7 @@ class Diagnostics:
 
     def record(self, code: str, severity: str, operation: str,
                *, device_id: int | None = None, error: BaseException | None = None,
-               occurrences: int = 1, reason_code: str = '') -> None:
+               occurrences: int = 1, reason_code: str = '', task_id: str = '') -> None:
         if severity not in ("warning", "error"):
             return
         # Deliberately avoid exception messages, URLs, task contents and personal data.
@@ -87,22 +91,25 @@ class Diagnostics:
         reason_code = str(reason_code)[:64]
         if reason_code and not re.fullmatch(r'[A-Za-z0-9_-]+', reason_code):
             reason_code = 'invalid_reason_code'
+        task_id = str(task_id)
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,96}', task_id):
+            task_id = ''
         error_type = type(error).__name__ if error is not None else None
         occurrences = max(1, min(int(occurrences), 1_000_000))
-        fingerprint = json.dumps([code, operation, reason_code, device_id, error_type],
+        fingerprint = json.dumps([code, operation, reason_code, task_id, device_id, error_type],
                                  separators=(",", ":"))
         now = datetime.now(timezone.utc).isoformat()
         try:
             with self._lock, self._connect() as db:
                 db.execute("""
-                    INSERT INTO events (fingerprint,code,severity,operation,reason_code,device_id,error_type,
+                    INSERT INTO events (fingerprint,code,severity,operation,reason_code,task_id,device_id,error_type,
                                         first_seen,last_seen,count)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(fingerprint) DO UPDATE SET
                         last_seen=excluded.last_seen,
                         count=count+excluded.count,
                         severity=CASE WHEN severity='error' THEN 'error' ELSE excluded.severity END
-                """, (fingerprint, code, severity, operation, reason_code, device_id,
+                """, (fingerprint, code, severity, operation, reason_code, task_id, device_id,
                       error_type, now, now, occurrences))
                 self._trim(db)
             self._wake.set()
@@ -156,7 +163,8 @@ class Diagnostics:
             batch_id = uuid4().hex
             payload = {"client_id": self.client_id, "batch_id": batch_id,
                        "events": [{key: row[key] for key in (
-                           "code", "severity", "operation", "reason_code", "device_id", "error_type",
+                           "code", "severity", "operation", "reason_code", "task_id",
+                           "device_id", "error_type",
                            "first_seen", "last_seen", "count")}
                           for row in rows]}
             db.execute("INSERT INTO batches VALUES (?,?)",

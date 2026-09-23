@@ -53,3 +53,15 @@ class DiagnosticsTests(unittest.TestCase):
             with closing(sqlite3.connect(logs.path)) as db:
                 rows = db.execute('SELECT reason_code,count FROM events ORDER BY reason_code').fetchall()
             self.assertEqual(rows, [('archive_busy', 2), ('cloud_connection_failed', 1)])
+
+    def test_task_errors_keep_task_ids_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logs = Diagnostics(Path(directory))
+            for task_id in ('T-ONE', 'T-ONE', 'T-TWO'):
+                logs.record('cloud_request_failed', 'warning', 'archive_task',
+                            reason_code='archive_busy', task_id=task_id)
+            payload = logs._prepare(time.time() + 301)
+            self.assertEqual(
+                {(row['task_id'], row['count']) for row in payload['events']},
+                {('T-ONE', 2), ('T-TWO', 1)},
+            )

@@ -507,6 +507,8 @@ class MotionProtocolTests(unittest.TestCase):
 
         movement = completed_snapshot(store)["completed_movements"][0]
         self.assertEqual(movement["pause_count"], 0)
+        self.assertGreater(movement["stationary_seconds"], 0)
+        self.assertLess(movement["stationary_seconds"], 0.8)
         self.assertEqual(
             movement["pause_definition"],
             "stationary_at_least_0.8s_then_resume",
@@ -886,6 +888,8 @@ class MotionProtocolTests(unittest.TestCase):
         movement = completed_snapshot(store)["completed_movements"][0]
         self.assertEqual(movement["pause_count"], 1)
         self.assertGreaterEqual(movement["pause_total_seconds"], 0.8)
+        self.assertGreaterEqual(movement["stationary_seconds"], 0.8)
+        self.assertAlmostEqual(movement["stationary_seconds"], movement["pause_total_seconds"])
         detail = store.movement_detail(
             1, movement["movement_id"], mode="device"
         )
@@ -925,6 +929,7 @@ class MotionProtocolTests(unittest.TestCase):
         movement = completed_snapshot(store)["completed_movements"][0]
         self.assertEqual(movement["pause_count"], 1)
         self.assertGreaterEqual(movement["pause_total_seconds"], 0.8)
+        self.assertAlmostEqual(movement["stationary_seconds"], movement["pause_total_seconds"])
 
     def test_pc_isolated_motion_candidate_does_not_strand_stopped_movement(self) -> None:
         store = MotionStore(minimum_movement_seconds=0.0)

@@ -171,6 +171,7 @@ function movement(raw: JsonObject, deviceId: number, mode: AnalysisMode): Moveme
     statistics: {
       ...emptyStatistics(),
       movingSeconds: number(raw.moving_seconds),
+      stationarySeconds: number(raw.stationary_seconds ?? raw.pause_total_seconds),
       pauseCount: number(raw.pause_count),
       pauseTotalSeconds: number(raw.pause_total_seconds),
       strongShakeCount: number(raw.shake_count),

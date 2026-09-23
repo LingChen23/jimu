@@ -886,6 +886,7 @@ class MovementStats:
     start_sequence: int = 0
     start_epoch: float | None = None
     moving_seconds: float = 0.0
+    stationary_seconds: float = 0.0
     end_tick: int | None = None
     end_sequence: int | None = None
     end_epoch: float | None = None
@@ -1478,6 +1479,7 @@ class MovementStats:
         end_epoch: float | None,
     ) -> None:
         duration = _tick_seconds(end_tick, start_tick)
+        self.stationary_seconds += duration
         if duration + 1e-9 < PAUSE_MIN_SECONDS:
             return
         self.pause_count += 1
@@ -1869,6 +1871,7 @@ class MovementStats:
             "mapping_version": self.mapping_version,
             "state": state,
             "moving_seconds": self.moving_seconds,
+            "stationary_seconds": self.stationary_seconds,
             "segment_seconds": segment_seconds,
             "accel_mean": accel_mean,
             "accel_min": self.accel_min if self.accel_count else 0.0,

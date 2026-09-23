@@ -4,6 +4,7 @@ const RealtimePage = () => import('@/pages/realtime/RealtimePage.vue')
 const HistoryPage = () => import('@/pages/history/HistoryPage.vue')
 const DeviceStatusPage = () => import('@/pages/devices/DeviceStatusPage.vue')
 const ResultPage = () => import('@/pages/results/ResultPage.vue')
+const CloudHistoryPage = () => import('@/pages/cloud/CloudHistoryPage.vue')
 
 export default createRouter({
   history: createWebHistory(),
@@ -23,6 +24,18 @@ export default createRouter({
       name: 'task-result',
       component: ResultPage,
       meta: { title: '任务结果详情' },
-    }
+    },
+    {
+      path: '/cloud-history',
+      name: 'cloud-history',
+      component: CloudHistoryPage,
+      meta: { title: '云端历史记录', standalone: true },
+    },
+    {
+      path: '/cloud-history/tasks/:taskId',
+      name: 'cloud-task-result',
+      component: ResultPage,
+      meta: { title: '云端任务结果详情', standalone: true, cloud: true },
+    },
   ]
 })

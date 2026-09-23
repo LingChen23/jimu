@@ -54,6 +54,13 @@ vue_frontend/.env.*
 # Vue backend runtime state
 vue_backend/runtime/
 
+# Isolated cloud runtime and credentials
+cloud_backend/.venv/
+cloud_backend/runtime/
+cloud_backend/.env
+deploy/cloud/*.env
+deploy/cloud/*.tar.gz
+
 # Local editor and operating-system files
 .vscode/
 .idea/

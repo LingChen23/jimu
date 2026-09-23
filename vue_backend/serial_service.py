@@ -7,7 +7,7 @@ import secrets
 import struct
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import serial
 from serial.tools import list_ports
@@ -75,8 +75,12 @@ class SerialService:
         self,
         store: MotionStore,
         device_ids: tuple[int, ...] | list[int] = tuple(range(1, 11)),
+        diagnostic_sink: Callable[..., None] | None = None,
+        task_collecting: Callable[[], bool] | None = None,
     ) -> None:
         self._store = store
+        self._diagnostic_sink = diagnostic_sink
+        self._task_collecting = task_collecting
         self._device_ids = tuple(int(device_id) for device_id in device_ids)
         self._serial: serial.Serial | None = None
         self._thread: threading.Thread | None = None
@@ -570,6 +574,9 @@ class SerialService:
                 while key not in self._responses:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
+                        if self._diagnostic_sink is not None:
+                            self._diagnostic_sink("device_command_timeout", "warning",
+                                                  command.name, device_id=device_id)
                         raise TimeoutError(f"{command.name} 等待响应超时")
                     self._response_condition.wait(remaining)
                     if self._serial is not connection:
@@ -673,6 +680,9 @@ class SerialService:
         decoder: GatewayStreamDecoder | None = None,
     ) -> None:
         stream_decoder = decoder or GatewayStreamDecoder()
+        previous_invalid = 0
+        pending_invalid = 0
+        last_invalid_report = time.monotonic()
         while not stop_event.is_set():
             with self._lock:
                 if self._serial is not connection:
@@ -684,7 +694,18 @@ class SerialService:
                     continue
                 with self._lock:
                     self._byte_count += len(raw)
-                for gateway_frame in stream_decoder.feed(raw):
+                frames = stream_decoder.feed(raw)
+                invalid = (stream_decoder.cobs_error_count + stream_decoder.crc_error_count
+                           + stream_decoder.frame_error_count + stream_decoder.overflow_count)
+                pending_invalid += max(0, invalid - previous_invalid)
+                previous_invalid = invalid
+                if pending_invalid and time.monotonic() - last_invalid_report >= 1:
+                    if self._diagnostic_sink is not None:
+                        self._diagnostic_sink("device_data_invalid", "warning", "serial_decode",
+                                              occurrences=pending_invalid)
+                    pending_invalid = 0
+                    last_invalid_report = time.monotonic()
+                for gateway_frame in frames:
                     host_control = gateway_frame.aggregator_host_control
                     if host_control is not None:
                         with self._response_condition:
@@ -776,4 +797,10 @@ class SerialService:
                     pass
                 if active_connection:
                     self._store.transport_discontinuity("serial_error")
+                    if self._diagnostic_sink is not None:
+                        collecting = self._task_collecting() if self._task_collecting else False
+                        self._diagnostic_sink(
+                            "serial_disconnected_during_task" if collecting else "serial_disconnected",
+                            "error" if collecting else "warning",
+                                              "serial_read", error=error)
                 return

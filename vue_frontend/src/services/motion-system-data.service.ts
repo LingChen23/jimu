@@ -21,7 +21,13 @@ import type {
   LinkDiagnostics,
   SerialStatus,
 } from '@/types/serial'
-import type { ParticipantProfile, TaskResult, TaskSummary } from '@/types/task'
+import type {
+  CloudUploadSnapshot,
+  CloudUploadState,
+  ParticipantProfile,
+  TaskResult,
+  TaskSummary,
+} from '@/types/task'
 import { gatewayNameForDevice } from '@/config/system'
 import type {
   DeviceCommandRequest,
@@ -232,7 +238,7 @@ function serialStatus(raw: JsonObject): SerialStatus {
   }
 }
 
-function taskSummary(raw: JsonObject): TaskSummary {
+export function taskSummary(raw: JsonObject): TaskSummary {
   const note = String(raw.note ?? '')
   return {
     taskId: String(raw.task_id),
@@ -837,7 +843,55 @@ export class MotionSystemDataService implements MotionDataService {
 
   async listTasks(): Promise<TaskSummary[]> {
     const raw = await this.json('/api/tasks')
-    return (raw.tasks ?? []).map((task: JsonObject) => taskSummary(task))
+    return (raw.tasks ?? []).map((task: JsonObject) => ({ ...taskSummary(task), localAvailable: true }))
+  }
+
+  async listCloudTasks(page = 1, pageSize = 10): Promise<{
+    tasks: TaskSummary[]
+    total: number
+    page: number
+    pageSize: number
+  }> {
+    const query = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
+    const raw = await this.json(`/api/cloud-history/tasks?${query}`)
+    return {
+      tasks: (raw.tasks ?? []).map((task: JsonObject) => ({
+        ...taskSummary(task), localAvailable: false, cloudArchived: true,
+      })),
+      total: number(raw.total),
+      page: number(raw.page, page),
+      pageSize: number(raw.page_size, pageSize),
+    }
+  }
+
+  async getCloudUploadStatus(): Promise<CloudUploadSnapshot> {
+    const raw = await this.json('/api/cloud-upload/status')
+    const tasks = Object.fromEntries(Object.entries(raw.tasks ?? {}).map(([taskId, value]) => {
+      const item = value as JsonObject
+      const status: CloudUploadState = item.status === 'uploading'
+        || item.status === 'failed'
+        || item.status === 'uploaded'
+        ? item.status
+        : 'pending'
+      return [taskId, {
+        status,
+        errorCode: item.error_code ? String(item.error_code) : null,
+        retryAt: nullableNumber(item.retry_at),
+      }]
+    }))
+    const connection = raw.connection === 'connected' || raw.connection === 'disconnected'
+      ? raw.connection
+      : 'disabled'
+    return { connection, tasks }
+  }
+
+  async enqueueCloudUpload(taskIds: string[]): Promise<void> {
+    const raw = await this.json('/api/cloud-upload/enqueue', {
+      method: 'POST',
+      body: JSON.stringify({ task_ids: taskIds }),
+    })
+    const failed = Object.values(raw.tasks ?? {}).find((item: any) => !item?.ok) as JsonObject | undefined
+    if (failed) throw new Error(String(failed.error_code ?? '加入上传队列失败'))
   }
 
   async getTaskResult(request: TaskResultRequest): Promise<TaskResult> {

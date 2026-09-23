@@ -32,6 +32,7 @@ class TaskService:
         movement_root: str | Path | None = None,
         require_participant_profile: bool = False,
         movement_archived_callback: Callable[[int, int, str], Any] | None = None,
+        diagnostic_sink: Callable[..., None] | None = None,
     ) -> None:
         self._path = Path(path)
         self._snapshot_provider = snapshot_provider
@@ -48,6 +49,7 @@ class TaskService:
         self._score_provider = score_provider or (lambda: 60 + secrets.randbelow(36))
         self._require_participant_profile = bool(require_participant_profile)
         self._movement_archived_callback = movement_archived_callback
+        self._diagnostic_sink = diagnostic_sink
         if not self._device_ids:
             raise ValueError("采集任务至少需要一个设备")
         self._lock = threading.Lock()
@@ -316,6 +318,11 @@ class TaskService:
                     references,
                     created_files,
                 )
+                if (self._diagnostic_sink is not None and any(
+                    self._movement_key(reference) not in movement_files
+                    for reference in references
+                )):
+                    self._diagnostic_sink("task_result_incomplete", "warning", "task_finish")
                 ended = datetime.now().astimezone()
                 started = datetime.fromisoformat(str(task["start_time"]))
                 task["end_time"] = ended.isoformat(timespec="seconds")
@@ -539,8 +546,15 @@ class TaskService:
         return references
 
     def _new_task_score(self) -> int:
-        score = int(self._score_provider())
+        try:
+            score = int(self._score_provider())
+        except Exception as error:
+            if self._diagnostic_sink is not None:
+                self._diagnostic_sink("task_result_failed", "error", "task_scoring", error=error)
+            raise
         if not 60 <= score <= 95:
+            if self._diagnostic_sink is not None:
+                self._diagnostic_sink("task_result_failed", "error", "task_scoring")
             raise ValueError("任务评分必须在 60～95 分之间")
         return score
 
@@ -811,7 +825,7 @@ class TaskService:
             )
         return buffer.getvalue()
 
-    def tasks_export_archive(self, task_ids: list[str]) -> bytes:
+    def tasks_export_archive(self, task_ids: list[str], fallback=None) -> bytes:
         """Build one ZIP containing the full export of multiple tasks.
 
         Every task directory contains exactly the files produced by
@@ -843,7 +857,7 @@ class TaskService:
                 if str(task.get("task_id")) in seen
             }
         missing = [identifier for identifier in identifiers if identifier not in existing]
-        if missing:
+        if missing and fallback is None:
             raise ValueError(f"未找到任务：{'、'.join(missing)}")
         collecting = [
             identifier
@@ -865,6 +879,8 @@ class TaskService:
         ) as archive:
             for index, identifier in enumerate(identifiers, start=1):
                 task_archive = self.task_export_archive(identifier)
+                if task_archive is None and fallback is not None:
+                    task_archive = fallback(identifier)
                 if task_archive is None:
                     raise ValueError(f"导出任务失败：{identifier}")
                 directory = f"tasks/{index:03d}_{identifier}"

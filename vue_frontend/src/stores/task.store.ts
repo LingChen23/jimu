@@ -8,7 +8,12 @@ export const useTaskStore = defineStore('task', () => {
   const tasks = ref<TaskSummary[]>([])
   const taskResults = ref<Record<string, TaskResult>>({})
   const participants = ref<ParticipantProfile[]>([])
+  const cloudLoading = ref(false)
+  const cloudLoadedCount = ref(0)
+  const cloudTotal = ref(0)
   let currentTaskRequest = 0
+  let cloudTaskRequest = 0
+  const taskResultRequests = new Map<string, Promise<TaskResult>>()
 
   const completedCount = computed(() => tasks.value.filter((task) => task.status === 'completed').length)
   const averageScore = computed(() => {
@@ -78,19 +83,77 @@ export const useTaskStore = defineStore('task', () => {
 
   async function loadTasks(): Promise<void> {
     tasks.value = await motionDataService.listTasks()
+    cloudLoadedCount.value = 0
+    cloudTotal.value = 0
   }
 
-  async function deleteTask(taskId: string): Promise<void> {
+  async function mergeCloudTasks(): Promise<void> {
+    const requestId = ++cloudTaskRequest
+    const batchSize = 10
+    let page = 1
+    let loaded = 0
+    cloudLoading.value = true
+    cloudLoadedCount.value = 0
+    cloudTotal.value = 0
+    try {
+      while (requestId === cloudTaskRequest) {
+        const remote = await motionDataService.listCloudTasks(page, batchSize)
+        if (requestId !== cloudTaskRequest) return
+        const merged = new Map(tasks.value.map(task => [task.taskId, task]))
+        remote.tasks.forEach((task) => {
+          const existing = merged.get(task.taskId)
+          merged.set(task.taskId, existing
+            ? { ...existing, cloudArchived: true }
+            : task)
+        })
+        tasks.value = [...merged.values()]
+          .sort((left, right) => right.startTime.localeCompare(left.startTime))
+        void prefetchTaskResults(tasks.value.slice(0, 5).map(task => task.taskId))
+        loaded += remote.tasks.length
+        cloudLoadedCount.value = loaded
+        cloudTotal.value = remote.total
+        if (!remote.tasks.length || loaded >= remote.total) return
+        page += 1
+      }
+    } finally {
+      if (requestId === cloudTaskRequest) cloudLoading.value = false
+    }
+  }
+
+  function cancelCloudTaskLoading(): void {
+    cloudTaskRequest += 1
+    cloudLoading.value = false
+  }
+
+  async function deleteTask(taskId: string, keepCloudRecord = false): Promise<void> {
+    const existing = tasks.value.find((task) => task.taskId === taskId)
     await motionDataService.deleteTask({ taskId })
-    tasks.value = tasks.value.filter((task) => task.taskId !== taskId)
+    tasks.value = keepCloudRecord && existing
+      ? tasks.value.map((task) => task.taskId === taskId
+        ? { ...task, localAvailable: false, cloudArchived: true }
+        : task)
+      : tasks.value.filter((task) => task.taskId !== taskId)
     delete taskResults.value[taskId]
     if (currentTask.value?.taskId === taskId) currentTask.value = null
   }
 
   async function loadTaskResult(taskId: string): Promise<TaskResult> {
-    const result = await motionDataService.getTaskResult({ taskId })
-    taskResults.value[taskId] = result
-    return result
+    const cached = taskResults.value[taskId]
+    if (cached) return cached
+    const pending = taskResultRequests.get(taskId)
+    if (pending) return pending
+    const request = motionDataService.getTaskResult({ taskId })
+      .then((result) => {
+        taskResults.value[taskId] = result
+        return result
+      })
+      .finally(() => { taskResultRequests.delete(taskId) })
+    taskResultRequests.set(taskId, request)
+    return request
+  }
+
+  async function prefetchTaskResults(taskIds: string[]): Promise<void> {
+    await Promise.allSettled([...new Set(taskIds)].slice(0, 5).map(loadTaskResult))
   }
 
   async function exportTask(taskId: string) {
@@ -109,6 +172,9 @@ export const useTaskStore = defineStore('task', () => {
     currentTask,
     tasks,
     participants,
+    cloudLoading,
+    cloudLoadedCount,
+    cloudTotal,
     completedCount,
     averageScore,
     loadCurrentTask,
@@ -117,8 +183,11 @@ export const useTaskStore = defineStore('task', () => {
     finishTask,
     updateTaskParticipant,
     loadTasks,
+    mergeCloudTasks,
+    cancelCloudTaskLoading,
     deleteTask,
     loadTaskResult,
+    prefetchTaskResults,
     exportTask,
     exportTasks,
     resultById,

@@ -1,0 +1,31 @@
+[Unit]
+Description=Jimu task archive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jimu-cloud
+Group=jimu-cloud
+WorkingDirectory=/opt/jimu-cloud/app
+EnvironmentFile=/etc/jimu-cloud/service.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/jimu-cloud/venv/bin/python -m cloud_backend.app
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=180
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/jimu-cloud /var/tmp/jimu-cloud /var/log/jimu-cloud
+LimitNOFILE=1024
+MemoryMax=768M
+TasksMax=64
+StandardOutput=null
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=20
+
+[Install]
+WantedBy=multi-user.target

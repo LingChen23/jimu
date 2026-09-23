@@ -3,6 +3,18 @@ import type { AnalysisMode } from './motion'
 
 export type TaskStatus = 'collecting' | 'completed' | 'abnormal' | 'cancelled'
 export type DataQuality = 'complete' | 'good' | 'normal' | 'poor'
+export type CloudUploadState = 'pending' | 'uploading' | 'failed' | 'uploaded'
+
+export interface CloudUploadTaskStatus {
+  status: CloudUploadState
+  errorCode: string | null
+  retryAt: number | null
+}
+
+export interface CloudUploadSnapshot {
+  connection: 'connected' | 'disconnected' | 'disabled'
+  tasks: Record<string, CloudUploadTaskStatus>
+}
 
 export interface ParticipantProfile {
   participantId: string
@@ -55,6 +67,8 @@ export interface TaskSummary {
   dataQuality: DataQuality
   status: TaskStatus
   movementReferences?: TaskMovementReference[]
+  localAvailable?: boolean
+  cloudArchived?: boolean
 }
 
 export interface TaskResult {

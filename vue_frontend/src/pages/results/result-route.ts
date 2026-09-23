@@ -24,7 +24,7 @@ export function parseResultRoute(
   name: unknown,
   params: Record<string, unknown>,
 ): ResultRouteReference {
-  if (name === 'task-result') {
+  if (name === 'task-result' || name === 'cloud-task-result') {
     const taskId = routeParam(params.taskId)
     if (!taskId) throw new Error('任务编号无效')
     return { kind: 'task', taskId }

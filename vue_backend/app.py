@@ -5,19 +5,24 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import sqlite3
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import threading
 import time
-from urllib.parse import parse_qs, urlsplit
+from typing import Callable
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 import webbrowser
 
 from motion_model import ANALYSIS_MODE_PC, MotionStore
 from serial_service import SerialService
 from system_config import DEVICE_COUNT, DEVICE_IDS
 from task_service import TaskService
+from cloud_upload import CloudUploader
+from cloud_upload.transport import HttpTransport, TransportError
+from diagnostics import Diagnostics
 
 
 ROOT = Path(__file__).resolve().parent
@@ -51,7 +56,11 @@ STORE = MotionStore(
     settings_path=SETTINGS_PATH,
     mapping_path=BLOCK_MAPPING_PATH,
 )
-SERIAL = SerialService(STORE, device_ids=DEVICE_IDS)
+DIAGNOSTICS = Diagnostics(RUNTIME_ROOT)
+SERIAL = SerialService(
+    STORE, device_ids=DEVICE_IDS, diagnostic_sink=DIAGNOSTICS.record,
+    task_collecting=lambda: any(task.get("status") == "collecting" for task in TASKS.list()),
+)
 TASKS = TaskService(
     TASK_RECORDS_PATH,
     STORE.snapshot,
@@ -60,10 +69,68 @@ TASKS = TaskService(
     movement_root=MOVEMENT_ARCHIVE_ROOT,
     require_participant_profile=True,
     movement_archived_callback=STORE.mark_movement_archived,
+    diagnostic_sink=DIAGNOSTICS.record,
 )
 
 
+def _cloud_transport():
+    try:
+        return HttpTransport.from_file(RUNTIME_ROOT / "cloud_upload.json")
+    except ValueError as error:
+        print(f"Cloud upload disabled: {error}")
+        return None
+
+
+CLOUD_TRANSPORT = _cloud_transport()
+DIAGNOSTICS.transport = CLOUD_TRANSPORT
+CLOUD_UPLOADER = CloudUploader(
+    list_tasks=TASKS.list,
+    export_zip=TASKS.task_export_archive,
+    runtime_root=RUNTIME_ROOT,
+    transport=CLOUD_TRANSPORT,
+    diagnostic_sink=DIAGNOSTICS.record,
+)
+
+
+def _record_api_error(path: str, error: BaseException) -> None:
+    if path == "/api/serial/open" and isinstance(error, OSError):
+        DIAGNOSTICS.record("serial_open_failed", "error", "serial_open", error=error)
+    elif path == "/api/tasks/start" and not isinstance(error, ValueError):
+        code = "task_save_failed" if isinstance(error, (OSError, sqlite3.Error)) else "task_start_failed"
+        DIAGNOSTICS.record(code, "error", "task_start", error=error)
+    elif path == "/api/tasks/finish" and not isinstance(error, ValueError):
+        code = "task_save_failed" if isinstance(error, (OSError, sqlite3.Error)) else "task_finish_failed"
+        DIAGNOSTICS.record(code, "error", "task_finish", error=error)
+    elif path.startswith("/api/tasks/export"):
+        DIAGNOSTICS.record("zip_export_failed", "error", "task_export", error=error)
+    elif isinstance(error, TransportError):
+        DIAGNOSTICS.record("cloud_read_failed", "warning", "cloud_read", error=error)
+    elif not isinstance(error, ValueError):
+        DIAGNOSTICS.record("unexpected_backend_error", "error", "http_request", error=error)
+
+
+def _cloud_json(path: str) -> dict:
+    if CLOUD_TRANSPORT is None:
+        raise TransportError("cloud_upload_disabled", False)
+    return CLOUD_TRANSPORT.json("GET", path)
+
+
+def _cloud_bytes(method: str, path: str, body: dict | None = None) -> tuple[bytes, str]:
+    if CLOUD_TRANSPORT is None:
+        raise TransportError("cloud_upload_disabled", False)
+    return CLOUD_TRANSPORT.bytes(method, path, body)
+
+
 class ApiHandler(SimpleHTTPRequestHandler):
+    extensions_map = {
+        **SimpleHTTPRequestHandler.extensions_map,
+        ".js": "application/javascript",
+        ".mjs": "application/javascript",
+        ".css": "text/css",
+        ".json": "application/json",
+        ".svg": "image/svg+xml",
+    }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(STATIC_ROOT), **kwargs)
 
@@ -118,6 +185,13 @@ class ApiHandler(SimpleHTTPRequestHandler):
             return default
 
     def do_GET(self) -> None:
+        try:
+            self._do_GET()
+        except Exception as error:
+            _record_api_error(urlsplit(self.path).path, error)
+            raise
+
+    def _do_GET(self) -> None:
         parsed = urlsplit(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -150,6 +224,32 @@ class ApiHandler(SimpleHTTPRequestHandler):
         if path == "/api/tasks":
             self._json_response({"tasks": TASKS.list()})
             return
+        if path == "/api/cloud-history/tasks":
+            try:
+                page = max(1, self._integer(query, "page", 1))
+                page_size = max(1, min(10, self._integer(query, "page_size", 10)))
+                payload = _cloud_json(
+                    f"/api/history/tasks?page={page}&page_size={page_size}"
+                )
+                items = [
+                    item.get("task", item) for item in payload.get("items", [])
+                ]
+            except TransportError as error:
+                self._json_response({"error": error.code}, HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            self._json_response(
+                {
+                    "tasks": items,
+                    "total": int(payload.get("total", len(items))),
+                    "page": page,
+                    "page_size": page_size,
+                }
+            )
+            return
+        if path == "/api/cloud-upload/status":
+            task_ids = [str(task.get("task_id", "")) for task in TASKS.list()]
+            self._json_response(CLOUD_UPLOADER.statuses(task_ids))
+            return
         if path == "/api/participants":
             search = query.get("search", [""])[0]
             self._json_response({"participants": TASKS.participants(search)})
@@ -172,10 +272,11 @@ class ApiHandler(SimpleHTTPRequestHandler):
             task_id = query.get("task", [""])[0]
             result = TASKS.result(task_id)
             if result is None:
-                self._json_response(
-                    {"error": "未找到采集任务"}, HTTPStatus.NOT_FOUND
-                )
-                return
+                try:
+                    result = _cloud_json(f"/api/tasks/result?task={quote(task_id)}")
+                except TransportError as error:
+                    self._json_response({"error": error.code}, HTTPStatus.SERVICE_UNAVAILABLE)
+                    return
             self._json_response(result)
             return
         if path == "/api/tasks/movement-detail":
@@ -187,11 +288,14 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 task_id, device_id, movement_id, mode
             )
             if detail is None:
-                self._json_response(
-                    {"error": "未找到任务中保存的移动记录"},
-                    HTTPStatus.NOT_FOUND,
-                )
-                return
+                try:
+                    detail = _cloud_json("/api/tasks/movement-detail?" + urlencode({
+                        "task": task_id, "device": device_id,
+                        "movement": movement_id, "mode": mode,
+                    }))
+                except TransportError as error:
+                    self._json_response({"error": error.code}, HTTPStatus.SERVICE_UNAVAILABLE)
+                    return
             self._json_response(detail)
             return
         if path in {
@@ -207,11 +311,14 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 task_id, device_id, movement_id, mode, export_format
             )
             if content is None:
-                self._json_response(
-                    {"error": "未找到任务中保存的导出数据"},
-                    HTTPStatus.NOT_FOUND,
-                )
-                return
+                try:
+                    content, _ = _cloud_bytes("GET", f"/api/tasks/movement-export.{export_format}?" + urlencode({
+                        "task": task_id, "device": device_id,
+                        "movement": movement_id, "mode": mode,
+                    }))
+                except TransportError as error:
+                    self._json_response({"error": error.code}, HTTPStatus.SERVICE_UNAVAILABLE)
+                    return
             filename = (
                 f"task_{task_id}_device_{device_id}_movement_{movement_id}."
                 f"{export_format}"
@@ -227,10 +334,11 @@ class ApiHandler(SimpleHTTPRequestHandler):
             task_id = query.get("task", [""])[0]
             content = TASKS.task_export_archive(task_id)
             if content is None:
-                self._json_response(
-                    {"error": "未找到采集任务"}, HTTPStatus.NOT_FOUND
-                )
-                return
+                try:
+                    content, _ = _cloud_bytes("GET", f"/api/tasks/export.zip?task={quote(task_id)}")
+                except TransportError as error:
+                    self._json_response({"error": error.code}, HTTPStatus.SERVICE_UNAVAILABLE)
+                    return
             self._download_response(
                 content,
                 "application/zip",
@@ -307,6 +415,20 @@ class ApiHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             body = self._read_json()
+            if self.path == "/api/diagnostics/event":
+                code = body.get("code")
+                operation = body.get("operation", "browser_page")
+                if operation not in ("browser_page", "realtime", "history", "results", "devices"):
+                    operation = "browser_page"
+                if code in ("page_render_failed", "page_request_timeout"):
+                    DIAGNOSTICS.record(
+                        code, "error" if code == "page_render_failed" else "warning",
+                        operation,
+                    )
+                    self._json_response({"ok": True})
+                else:
+                    self._json_response({"error": "invalid_diagnostic_event"}, HTTPStatus.BAD_REQUEST)
+                return
             if self.path == "/api/serial/open":
                 result = SERIAL.open(
                     str(body.get("port", "")),
@@ -439,6 +561,11 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 STORE.wait_for_finalizations(timeout_seconds=5.0)
                 task = TASKS.finish(task_id)
                 STORE.set_task_collection_active(False)
+                try:
+                    CLOUD_UPLOADER.enqueue([task_id])
+                except (OSError, sqlite3.Error) as error:
+                    # Cloud queue availability must never undo a completed task.
+                    DIAGNOSTICS.record("cloud_archive_failed", "error", "queue_task", error=error)
                 self._json_response(
                     {
                         "ok": True,
@@ -446,11 +573,21 @@ class ApiHandler(SimpleHTTPRequestHandler):
                     }
                 )
                 return
+            if self.path == "/api/cloud-upload/enqueue":
+                task_ids = body.get("task_ids")
+                if not isinstance(task_ids, list):
+                    raise ValueError("task_ids 必须是数组")
+                self._json_response(
+                    {"ok": True, "tasks": CLOUD_UPLOADER.enqueue(task_ids)}
+                )
+                return
             if self.path == "/api/tasks/export-batch.zip":
                 task_ids = body.get("task_ids")
                 if not isinstance(task_ids, list):
                     raise ValueError("task_ids 必须是数组")
-                content = TASKS.tasks_export_archive(task_ids)
+                def cloud_archive(identifier: str) -> bytes:
+                    return _cloud_bytes("GET", f"/api/tasks/export.zip?task={quote(identifier)}")[0]
+                content = TASKS.tasks_export_archive(task_ids, fallback=cloud_archive)
                 self._download_response(
                     content,
                     "application/zip",
@@ -472,23 +609,34 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 )
                 return
             if self.path == "/api/tasks/delete":
+                task_id = str(body.get("task_id", ""))
+                CLOUD_UPLOADER.prepare_delete(task_id)
                 self._json_response(
                     {
                         "ok": True,
-                        "task": TASKS.delete(str(body.get("task_id", ""))),
+                        "task": TASKS.delete(task_id),
                     }
                 )
                 return
             self._json_response(
                 {"error": "unknown endpoint"}, HTTPStatus.NOT_FOUND
             )
+        except TransportError as error:
+            _record_api_error(self.path, error)
+            self._json_response({"error": error.code}, HTTPStatus.SERVICE_UNAVAILABLE)
         except (ValueError, OSError, TypeError) as error:
+            _record_api_error(self.path, error)
             self._json_response(
                 {"error": str(error)}, HTTPStatus.BAD_REQUEST
             )
+        except Exception as error:
+            _record_api_error(self.path, error)
+            raise
 
 
-def main() -> None:
+def main(
+    on_started: Callable[[str, ThreadingHTTPServer], None] | None = None,
+) -> None:
     parser = argparse.ArgumentParser(description="Motion V1 PC visualizer")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
@@ -496,8 +644,17 @@ def main() -> None:
     arguments = parser.parse_args()
 
     server = ThreadingHTTPServer((arguments.host, arguments.port), ApiHandler)
+    try:
+        if shutil.disk_usage(RUNTIME_ROOT).free < 2 * 1024 * 1024 * 1024:
+            DIAGNOSTICS.record("disk_space_low", "warning", "app_start")
+    except OSError:
+        pass
+    DIAGNOSTICS.start()
+    CLOUD_UPLOADER.start()
     url = f"http://{arguments.host}:{arguments.port}"
     print(f"Motion visualizer: {url}")
+    if on_started is not None:
+        on_started(url, server)
     if not arguments.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
@@ -505,8 +662,10 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        CLOUD_UPLOADER.close()
         SERIAL.close()
         STORE.wait_for_finalizations(timeout_seconds=2.0)
+        DIAGNOSTICS.close()
         server.server_close()
 
 

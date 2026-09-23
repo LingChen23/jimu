@@ -15,7 +15,13 @@ import type {
   SerialPortInfo,
   SerialStatus,
 } from '@/types/serial'
-import type { ParticipantProfile, TaskArchiveExport, TaskResult, TaskSummary } from '@/types/task'
+import type {
+  CloudUploadSnapshot,
+  ParticipantProfile,
+  TaskArchiveExport,
+  TaskResult,
+  TaskSummary,
+} from '@/types/task'
 
 export interface DeviceRequest {
   deviceId: number
@@ -68,6 +74,13 @@ export interface DeleteTaskRequest {
   taskId: string
 }
 
+export interface CloudTaskPage {
+  tasks: TaskSummary[]
+  total: number
+  page: number
+  pageSize: number
+}
+
 export interface UpdateTaskParticipantRequest extends TaskResultRequest {
   participantProfile: ParticipantProfile
 }
@@ -102,6 +115,9 @@ export interface MotionDataService {
   updateTaskParticipant(request: UpdateTaskParticipantRequest): Promise<TaskSummary>
   deleteTask(request: DeleteTaskRequest): Promise<TaskSummary>
   listTasks(): Promise<TaskSummary[]>
+  listCloudTasks(page?: number, pageSize?: number): Promise<CloudTaskPage>
   getTaskResult(request: TaskResultRequest): Promise<TaskResult>
   getTaskMovementDetail(request: MovementDetailRequest & { taskId: string }): Promise<MovementDetail>
+  getCloudUploadStatus(): Promise<CloudUploadSnapshot>
+  enqueueCloudUpload(taskIds: string[]): Promise<void>
 }

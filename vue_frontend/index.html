@@ -8,6 +8,19 @@
   </head>
   <body>
     <div id="app"></div>
+    <script>
+      // This runs even when the main module cannot load (for example, a bad JS MIME type).
+      if (location.hostname === '127.0.0.1' || location.hostname === 'localhost') {
+        window.addEventListener('error', function (event) {
+          if (!(event.target instanceof HTMLScriptElement)) return;
+          fetch('/api/diagnostics/event', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ code: 'page_render_failed', operation: 'browser_page' }),
+            keepalive: true
+          }).catch(function () {});
+        }, true);
+      }
+    </script>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

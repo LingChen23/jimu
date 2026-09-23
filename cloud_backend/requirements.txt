@@ -1,0 +1,5 @@
+fastapi==0.136.1
+uvicorn==0.46.0
+python-multipart==0.0.22
+alibabacloud-oss-v2==1.4.0
+alibabacloud-credentials==1.0.12

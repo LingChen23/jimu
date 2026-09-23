@@ -14,6 +14,7 @@ const props = defineProps<{
   movement: MovementDetail | null
   movementReference: TaskMovementReference | null
   enrichmentNotice: string | null
+  editableProfile?: boolean
 }>()
 const taskStore = useTaskStore()
 const editingProfile = ref(false)
@@ -122,7 +123,7 @@ async function saveProfile(): Promise<void> {
         <button class="btn secondary" :disabled="savingProfile" @click="cancelProfileEdit">取消</button>
         <button class="btn primary" :disabled="!canSaveProfile || savingProfile" @click="saveProfile">{{ savingProfile ? '保存中…' : '保存修改' }}</button>
       </div>
-      <button v-else class="btn secondary" @click="startProfileEdit">修改档案</button>
+      <button v-else-if="editableProfile !== false" class="btn secondary" @click="startProfileEdit">修改档案</button>
     </div>
     <div v-if="editingProfile && profileDraft" class="profile-edit-grid">
       <label>体验者编号<input v-model="profileDraft.participantId" disabled /></label>

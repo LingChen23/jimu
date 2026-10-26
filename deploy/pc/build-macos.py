@@ -12,7 +12,46 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from urllib.parse import urlsplit
+
+
+def check_startup(app: Path, work: Path) -> None:
+    runtime = work / "startup-check"
+    runtime.mkdir()
+    (runtime / "cloud_upload.json").write_text('{"enabled": false}', encoding="utf-8")
+    log_path = work / "startup.log"
+    with log_path.open("w+") as log:
+        process = subprocess.Popen([
+            str(app / "Contents" / "MacOS" / "JimuMotion"), "--no-browser",
+        ], env={**os.environ, "MOTION_DATA_DIR": str(runtime)}, stdout=log, stderr=log)
+        try:
+            for _ in range(60):
+                if process.poll() is not None:
+                    break
+                try:
+                    with urllib.request.urlopen("http://127.0.0.1:8765/api/devices", timeout=1) as response:
+                        payload = json.load(response)
+                    with urllib.request.urlopen("http://127.0.0.1:8765/realtime", timeout=1) as response:
+                        html = response.read().decode()
+                    if payload.get("devices") and '<div id="app">' in html:
+                        print("Packaged app startup: API and frontend route OK")
+                        return
+                except (OSError, ValueError):
+                    pass
+                time.sleep(1)
+            log.seek(0)
+            raise RuntimeError("Packaged app did not start:\n" + log.read())
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
 
 
 def build() -> None:
@@ -62,6 +101,7 @@ def build() -> None:
         info_path.write_bytes(plistlib.dumps(info))
         subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True)
         subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
+        check_startup(app, work)
         output.mkdir(parents=True)
         name = f"JimuMotion-Mac-{arch}"
         subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent",
@@ -70,8 +110,18 @@ def build() -> None:
         stage.mkdir()
         shutil.move(str(app), stage / app.name)
         (stage / "Applications").symlink_to("/Applications")
-        subprocess.run(["hdiutil", "create", "-volname", "JimuMotion", "-srcfolder",
-                        str(stage), "-format", "UDZO", str(output / f"{name}.dmg")], check=True)
+        for attempt in range(4):
+            result = subprocess.run([
+                "hdiutil", "create", "-volname", "JimuMotion", "-srcfolder", str(stage),
+                "-fs", "HFS+", "-format", "UDZO", "-ov", str(output / f"{name}.dmg"),
+            ], capture_output=True, text=True)
+            if result.returncode == 0:
+                print(result.stdout)
+                break
+            if "Resource busy" not in result.stderr or attempt == 3:
+                raise RuntimeError("DMG creation failed: " + result.stderr)
+            print("macOS disk image resource busy; retrying")
+            time.sleep(3)
     print(f"Packages created: {output}")
 
 

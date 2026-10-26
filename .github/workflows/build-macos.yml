@@ -50,6 +50,7 @@ jobs:
           JIMU_CLOUD_URL: http://39.102.212.53
         run: python deploy/pc/build-macos.py --output dist-macos
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: JimuMotion-Mac-${{ matrix.arch }}
           path: |

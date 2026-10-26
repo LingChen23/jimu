@@ -42,6 +42,8 @@ JLinkSettings.ini
 # Python caches
 __pycache__/
 *.py[cod]
+/.venv/
+/dist-macos/
 
 # Vue frontend generated files
 vue_frontend/node_modules/

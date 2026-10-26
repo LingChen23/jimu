@@ -1,62 +1,20 @@
-"""Windows desktop entry point used by the packaged PC application."""
+"""Desktop entry point used by the Windows and macOS applications."""
 
 from __future__ import annotations
 
-import ctypes
-import os
-from pathlib import Path
-import sys
 import threading
 import webbrowser
 
 from PIL import Image, ImageDraw
 import pystray
+from desktop_runtime import SingleInstance, initialize_runtime
 
 
-def _application_root() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-# Keep databases, exports and upload state beside the executable. PyInstaller's
-# bundled source directory is internal implementation data and must stay read-only.
-os.environ.setdefault("MOTION_DATA_DIR", str(_application_root() / "runtime"))
+RUNTIME_ROOT = initialize_runtime()
 
 from diagnostics import Diagnostics  # noqa: E402
 
-try:
-    from app import DIAGNOSTICS, main  # noqa: E402
-except Exception as error:
-    Diagnostics(_application_root() / "runtime").record(
-        "app_start_failed", "error", "app_import", error=error)
-    raise
-
-
 APP_URL = "http://127.0.0.1:8765/"
-MUTEX_NAME = "Local\\JimuMotionPC"
-ERROR_ALREADY_EXISTS = 183
-
-
-class SingleInstance:
-    """Keep exactly one packaged desktop backend alive per Windows session."""
-
-    def __init__(self) -> None:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
-        kernel32.CreateMutexW.restype = ctypes.c_void_p
-        self._close_handle = kernel32.CloseHandle
-        self._close_handle.argtypes = (ctypes.c_void_p,)
-        self._close_handle.restype = ctypes.c_bool
-        self._handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
-        if not self._handle:
-            raise ctypes.WinError(ctypes.get_last_error())
-        self.already_running = ctypes.get_last_error() == ERROR_ALREADY_EXISTS
-
-    def close(self) -> None:
-        if self._handle:
-            self._close_handle(self._handle)
-            self._handle = None
 
 
 def _tray_image() -> Image.Image:
@@ -123,11 +81,17 @@ class DesktopApplication:
 
 
 if __name__ == "__main__":
-    instance = SingleInstance()
+    instance = SingleInstance(RUNTIME_ROOT)
     try:
         if instance.already_running:
             webbrowser.open(APP_URL)
         else:
+            try:
+                from app import DIAGNOSTICS, main
+            except Exception as error:
+                Diagnostics(RUNTIME_ROOT).record(
+                    "app_start_failed", "error", "app_import", error=error)
+                raise
             DesktopApplication().run()
     finally:
         instance.close()

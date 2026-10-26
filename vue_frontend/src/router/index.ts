@@ -6,7 +6,7 @@ const DeviceStatusPage = () => import('@/pages/devices/DeviceStatusPage.vue')
 const ResultPage = () => import('@/pages/results/ResultPage.vue')
 const CloudHistoryPage = () => import('@/pages/cloud/CloudHistoryPage.vue')
 
-export default createRouter({
+const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', redirect: '/realtime' },
@@ -39,3 +39,11 @@ export default createRouter({
     },
   ]
 })
+
+router.afterEach((to) => {
+  if (to.path === '/history' || to.path === '/cloud-history') {
+    void ResultPage().catch(() => { /* Navigation can retry if background loading fails. */ })
+  }
+})
+
+export default router

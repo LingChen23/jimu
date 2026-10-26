@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, h, onBeforeUnmount, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAppStore } from '@/stores/app'
 import { useMotionStore } from '@/stores/motion.store'
@@ -9,12 +9,21 @@ import type { TaskMovementReference } from '@/types/task'
 import StatusBadge from '@/shared/components/StatusBadge.vue'
 import ResultDiagnosticsSection from './components/ResultDiagnosticsSection.vue'
 import ResultFeatureSummary from './components/ResultFeatureSummary.vue'
-import ResultMotionSection from './components/ResultMotionSection.vue'
 import ResultOverview from './components/ResultOverview.vue'
 import ResultQualitySection from './components/ResultQualitySection.vue'
-import ResultTrajectorySection from './components/ResultTrajectorySection.vue'
 import TaskMovementNavigator from './components/TaskMovementNavigator.vue'
 import { parseResultRoute } from './result-route'
+
+const chartLoading = () => h('section', { class: 'card result-state' }, '正在加载图表…')
+const chartError = () => h('section', { class: 'card result-state result-state--error' }, '图表加载失败，请刷新重试。')
+const ResultMotionSection = defineAsyncComponent({
+  loader: () => import('./components/ResultMotionSection.vue'),
+  loadingComponent: chartLoading, errorComponent: chartError, delay: 0, timeout: 30_000,
+})
+const ResultTrajectorySection = defineAsyncComponent({
+  loader: () => import('./components/ResultTrajectorySection.vue'),
+  loadingComponent: chartLoading, errorComponent: chartError, delay: 0, timeout: 30_000,
+})
 
 const route = useRoute()
 const router = useRouter()

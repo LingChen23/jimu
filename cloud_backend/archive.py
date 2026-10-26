@@ -182,12 +182,13 @@ class Archive:
         settings.temp_dir.mkdir(parents=True, exist_ok=True)
 
     @contextmanager
-    def admission(self):
+    def admission(self, *, require_space=True):
         if not self.gate.acquire(blocking=False):
             raise ArchiveError('archive_busy', 503, True)
         try:
             self.cleanup()
-            self.check_space()
+            if require_space:
+                self.check_space()
             yield
         finally:
             self.gate.release()
@@ -223,9 +224,34 @@ class Archive:
         """Called under admission; no caller needs to know OSS object layout."""
         summary, documents = _validate(path, self.settings)
         row = self.repository.reserve(summary)
+        if row['archive_status'] == 'deleting':
+            raise ArchiveError('task_deleting', 409, True)
         if row['archive_status'] == 'archived':
             return dict(task_id=row['task_id'], status='archived', already_exists=True)
         return self._finish(row, path, summary, documents)
+
+    def delete(self, task_id):
+        if not TASK_ID.fullmatch(task_id):
+            raise ArchiveError('invalid_task_id')
+        if not self.gate.acquire(blocking=False):
+            raise ArchiveError('archive_busy', 503, True)
+        try:
+            row = self.repository.get(task_id)
+            if row is not None:
+                self._delete(row)
+            return dict(task_id=task_id, deleted=True)
+        finally:
+            self.gate.release()
+
+    def _delete(self, row):
+        task_id, prefix = row['task_id'], row['oss_prefix']
+        if not re.fullmatch(r'tasks/\d{4}/(?:0[1-9]|1[0-2])/' + re.escape(task_id) + '/', prefix):
+            raise ArchiveError('invalid_archive_prefix', 503)
+        # Persist intent before touching OSS. Recovery must finish deletion,
+        # never recreate already removed objects from the original ZIP.
+        self.repository.mark_deleting(task_id)
+        self.storage.delete_prefix(prefix)
+        self.repository.delete(task_id)
 
     def _finish(self, row, path=None, summary=None, documents=None):
         task_id, prefix = row['task_id'], row['oss_prefix']
@@ -269,12 +295,15 @@ class Archive:
     def recover(self):
         """Startup/periodic recovery shares the same single-request gate."""
         try:
-            with self.admission():
+            with self.admission(require_space=False):
                 try:
                     for row in self.repository.pending():
                         try:
-                            self.check_space()
-                            self._finish(row)
+                            if row['archive_status'] == 'deleting':
+                                self._delete(row)
+                            else:
+                                self.check_space()
+                                self._finish(row)
                         except (ArchiveError, sqlite3.Error, OSError):
                             LOG.warning('archive_recovery_pending')
                         finally:

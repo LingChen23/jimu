@@ -72,6 +72,7 @@ export interface FinishTaskRequest {
 
 export interface DeleteTaskRequest {
   taskId: string
+  scope?: 'local' | 'cloud'
 }
 
 export interface CloudTaskPage {
@@ -113,7 +114,7 @@ export interface MotionDataService {
   startTask(request: StartTaskRequest): Promise<TaskSummary>
   finishTask(request: FinishTaskRequest): Promise<TaskSummary>
   updateTaskParticipant(request: UpdateTaskParticipantRequest): Promise<TaskSummary>
-  deleteTask(request: DeleteTaskRequest): Promise<TaskSummary>
+  deleteTask(request: DeleteTaskRequest): Promise<void>
   listTasks(): Promise<TaskSummary[]>
   listCloudTasks(page?: number, pageSize?: number): Promise<CloudTaskPage>
   getTaskResult(request: TaskResultRequest): Promise<TaskResult>

@@ -7,16 +7,17 @@ import { useTaskStore } from '@/stores/task.store'
 import type { CloudUploadTaskStatus } from '@/types/task'
 import HistorySummary from './components/HistorySummary.vue'
 import TaskHistorySection from './components/TaskHistorySection.vue'
+import { useTaskDeletion } from './use-task-deletion'
 
 const router = useRouter()
 const taskStore = useTaskStore()
 const loading = ref(true)
 const errorMessage = ref<string | null>(null)
 const cloudMessage = ref<string | null>(null)
-const deletingTaskId = ref<string | null>(null)
 const exportingTasks = ref(false)
 const requestingUploadId = ref<string | null>(null)
 const uploadStatuses = ref<Record<string, CloudUploadTaskStatus>>({})
+const { deletingTaskId, deletionScope, deletedTaskIds, deletionMessage, deletionError, deleteTasks } = useTaskDeletion(taskStore, uploadStatuses)
 let uploadStatusTimer: number | undefined
 
 async function refreshUploadStatuses(reportError = false): Promise<void> {
@@ -61,26 +62,6 @@ const latestCount = computed(() => taskStore.tasks
 
 function openTaskResult(taskId: string): void {
   void router.push({ name: 'task-result', params: { taskId } })
-}
-
-async function deleteTask(task: import('@/types/task').TaskSummary): Promise<void> {
-  if (task.status === 'collecting' || deletingTaskId.value) return
-  const participant = task.participantSnapshot?.name || task.participantId
-  const keepCloudRecord = task.cloudArchived === true
-    || uploadStatuses.value[task.taskId]?.status === 'uploaded'
-  const consequence = keepCloudRecord
-    ? '只删除本机任务和运动文件，云端归档继续保留，删除后仍可从云端查看。'
-    : '该任务尚未归档，删除后本地记录和运动原始数据将无法恢复。'
-  if (!window.confirm(`确定删除任务 ${task.taskId}（${participant}）吗？\n\n${consequence}`)) return
-  deletingTaskId.value = task.taskId
-  errorMessage.value = null
-  try {
-    await taskStore.deleteTask(task.taskId, keepCloudRecord)
-  } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : String(error)
-  } finally {
-    deletingTaskId.value = null
-  }
 }
 
 async function exportTasks(taskIds: string[]): Promise<void> {
@@ -130,12 +111,13 @@ async function uploadTask(taskId: string): Promise<void> {
       </div>
     </section>
 
-    <section v-if="errorMessage" class="card history-notice history-notice--error">
-      <strong>操作失败</strong><span>{{ errorMessage }}</span>
+    <section v-if="errorMessage || deletionError" class="card history-notice history-notice--error">
+      <strong>操作失败</strong><span>{{ errorMessage || deletionError }}</span>
     </section>
     <section v-else-if="loading" class="card history-notice">
       <strong>正在加载历史数据</strong><span>正在获取采集任务记录。</span>
     </section>
+    <section v-if="deletionMessage" class="card history-notice" role="status">{{ deletionMessage }}</section>
     <section v-if="cloudMessage" class="card history-notice"><strong>本地记录已加载</strong><span>{{ cloudMessage }}</span></section>
 
     <section v-if="taskStore.cloudLoading && !cloudMessage" class="card history-notice">
@@ -153,11 +135,14 @@ async function uploadTask(taskId: string): Promise<void> {
     <TaskHistorySection
       :tasks="taskStore.tasks"
       :deleting-task-id="deletingTaskId"
+      :deletion-scope="deletionScope"
+      :deleted-task-ids="deletedTaskIds"
       :exporting="exportingTasks"
       :upload-statuses="uploadStatuses"
       :requesting-upload-id="requestingUploadId"
       @open="openTaskResult"
-      @delete="deleteTask"
+      @delete="(task, scope) => deleteTasks([task.taskId], scope)"
+      @delete-batch="deleteTasks"
       @export="exportTasks"
       @upload="uploadTask"
     />

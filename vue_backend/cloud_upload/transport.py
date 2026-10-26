@@ -65,8 +65,8 @@ class HttpTransport:
         if payload.get("task_id") != task_id:
             raise TransportError("archive_task_mismatch", False)
 
-    def json(self, method: str, path: str, body: dict | None = None) -> dict:
-        status, payload = self._request(method, path, body=body, timeout=20)
+    def json(self, method: str, path: str, body: dict | None = None, *, timeout: int = 20) -> dict:
+        status, payload = self._request(method, path, body=body, timeout=timeout)
         if status >= 400:
             self._raise_response(status, payload)
         return payload

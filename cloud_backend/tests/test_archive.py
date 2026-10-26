@@ -53,8 +53,34 @@ class MemoryStorage:
         data = self.objects[key]
         return (data[index:index + chunk_size] for index in range(0, len(data), chunk_size))
 
+    def delete_prefix(self, prefix):
+        for key in list(self.objects):
+            if key.startswith(prefix):
+                if self.fail_suffix and key.endswith(self.fail_suffix):
+                    raise ArchiveError('oss_delete_failed', 503, True)
+                del self.objects[key]
+
 
 class OssAdapterTests(unittest.TestCase):
+    def test_delete_prefix_pages_and_does_not_touch_other_objects(self):
+        import alibabacloud_oss_v2 as oss
+        deleted, requests = [], []
+        prefix = 'tasks/2026/09/T-TEST/'
+
+        def page(request):
+            requests.append(request)
+            return oss.ListObjectsV2Result(
+                contents=[oss.ObjectProperties(key=prefix + ('task.json' if request.continuation_token else 'task.zip'))],
+                is_truncated=not request.continuation_token, next_continuation_token='next')
+
+        storage = object.__new__(OssStorage)
+        storage.sdk, storage.bucket = oss, 'test'
+        storage.client = SimpleNamespace(list_objects_v2=page, delete_object=lambda request: deleted.append(request.key))
+        storage.delete_prefix(prefix)
+        self.assertEqual(deleted, [prefix + 'task.zip', prefix + 'task.json'])
+        self.assertEqual([request.prefix for request in requests], [prefix, prefix])
+        self.assertEqual([request.continuation_token for request in requests], [None, 'next'])
+
     def test_unwraps_service_error_from_operation_error(self):
         import alibabacloud_oss_v2 as oss
         service = oss.exceptions.ServiceError(
@@ -164,6 +190,60 @@ class ArchiveTests(unittest.TestCase):
 
     def assert_empty(self):
         self.assertEqual(list(self.settings.temp_dir.iterdir()), [])
+
+    def test_public_delete_is_scoped_and_idempotent(self):
+        self.assertEqual(self.upload().status_code, 201)
+        prefix = self.repository.get('T20260921-TEST')['oss_prefix']
+        self.storage.objects[prefix + 'extra.json'] = b'{}'
+        others = {'logs/keep.json.gz': b'log', 'tasks/2026/09/T20260921-TEST-OTHER/task.zip': b'other'}
+        self.storage.objects.update(others)
+        url = '/api/history/tasks/T20260921-TEST'
+        self.assertIsNotNone(self.repository.get('T20260921-TEST'))
+        for _ in range(2):
+            result = self.client.delete(url)
+            self.assertEqual(result.status_code, 200)
+            self.assertTrue(result.json()['deleted'])
+        self.assertEqual(self.storage.objects, others)
+        self.assertIsNone(self.repository.get('T20260921-TEST'))
+        self.assertEqual(self.client.get('/api/history/tasks').json()['total'], 0)
+        self.assertEqual(self.client.get(url + '/result').status_code, 404)
+
+    def test_partial_delete_recovers_without_recreating_archive(self):
+        self.assertEqual(self.upload().status_code, 201)
+        self.storage.fail_suffix = 'detail.json'
+        result = self.client.delete('/api/history/tasks/T20260921-TEST', headers=self.headers)
+        self.assertEqual(result.status_code, 503)
+        self.assertEqual(self.repository.get('T20260921-TEST')['archive_status'], 'deleting')
+        self.assertEqual(self.upload().json()['error']['code'], 'task_deleting')
+        # A fresh module with the same database resumes the persisted deletion.
+        self.storage.fail_suffix = None
+        restarted = create_app(self.settings, self.storage, self.repository)
+        with patch.object(restarted.state.archive, 'check_space', side_effect=AssertionError('deletion needs no ZIP space')):
+            restarted.state.archive.recover()
+        self.assertIsNone(self.repository.get('T20260921-TEST'))
+        self.assertEqual(self.storage.objects, {})
+
+    def test_delete_retries_after_database_failure(self):
+        self.assertEqual(self.upload().status_code, 201)
+        with patch.object(self.repository, 'delete', side_effect=sqlite3.OperationalError('busy')):
+            self.assertEqual(self.client.delete('/api/history/tasks/T20260921-TEST', headers=self.headers).status_code, 503)
+        self.assertEqual(self.storage.objects, {})
+        self.assertEqual(self.repository.get('T20260921-TEST')['archive_status'], 'deleting')
+        self.assertEqual(self.client.delete('/api/history/tasks/T20260921-TEST', headers=self.headers).status_code, 200)
+        self.assertIsNone(self.repository.get('T20260921-TEST'))
+
+    def test_delete_rejects_bad_prefix_and_concurrent_archive(self):
+        self.assertEqual(self.upload().status_code, 201)
+        saved = self.storage.objects.copy()
+        self.app.state.archive.gate.acquire()
+        try:
+            self.assertEqual(self.client.delete('/api/history/tasks/T20260921-TEST', headers=self.headers).json()['error']['code'], 'archive_busy')
+        finally:
+            self.app.state.archive.gate.release()
+        with self.repository.connection() as database:
+            database.execute("UPDATE tasks SET oss_prefix='tasks/'")
+        self.assertEqual(self.client.delete('/api/history/tasks/T20260921-TEST', headers=self.headers).status_code, 503)
+        self.assertEqual(self.storage.objects, saved)
 
     def test_diagnostics_batch_is_authenticated_idempotent_and_saved_to_oss(self):
         event = dict(code='serial_open_failed', severity='error', operation='serial_open',

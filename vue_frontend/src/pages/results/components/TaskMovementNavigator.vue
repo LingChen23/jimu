@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { blockName } from '@/config/system'
 import { computed } from 'vue'
 import type { TaskMovementReference, TaskSummary } from '@/types/task'
 
@@ -35,7 +36,7 @@ function selected(reference: TaskMovementReference): boolean {
     </div>
     <div class="movement-groups">
       <article v-for="group in groups" :key="group.deviceId" class="movement-group">
-        <header><b>积木 {{ group.blockId || '—' }}</b><span>设备 {{ group.deviceId }} · {{ group.movements.length }} 次</span></header>
+        <header><b>{{ blockName(group.blockId) }}</b><span>设备 {{ group.deviceId }} · {{ group.movements.length }} 次</span></header>
         <div v-if="group.movements.length" class="movement-buttons">
           <button
             v-for="(reference, index) in group.movements"

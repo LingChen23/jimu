@@ -1,3 +1,5 @@
+import { fetchWithTimeout } from '@/services/http-client'
+
 export interface CloudHistoryTask {
   taskId: string
   participantId: string
@@ -43,4 +45,31 @@ export function formatBytes(value: number): string {
   if (value < 1024) return `${value} B`
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
   return `${(value / (1024 * 1024)).toFixed(1)} MB`
+}
+
+export async function deleteArchivedTasks(taskIds: string[], onDeleted: (taskId: string) => void) {
+  const deleted: string[] = []
+  const failures: Array<{ taskId: string; message: string }> = []
+  for (const taskId of new Set(taskIds)) {
+    try {
+      const response = await fetchWithTimeout(`/api/history/tasks/${encodeURIComponent(taskId)}`, {
+        method: 'DELETE',
+      }, 130_000)
+      const payload = await response.json().catch(() => ({}))
+      if (!response.ok) {
+        const code = String(payload?.error?.code ?? `HTTP ${response.status}`)
+        throw new Error(({
+          archive_busy: '云端正在归档，请稍后重试',
+          oss_delete_failed: '文件删除失败，请重试',
+        } as Record<string, string>)[code] ?? code)
+      }
+      if (payload.deleted !== true || payload.task_id !== taskId) throw new Error('未确认删除成功，请重试')
+    } catch (error) {
+      failures.push({ taskId, message: error instanceof Error ? error.message : String(error) })
+      continue
+    }
+    deleted.push(taskId)
+    onDeleted(taskId)
+  }
+  return { deleted, failures }
 }

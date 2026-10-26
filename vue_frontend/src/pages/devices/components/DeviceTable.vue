@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { blockName } from '@/config/system'
 import StatusBadge from '@/shared/components/StatusBadge.vue'
 import type { DeviceSnapshot } from '@/types/device'
 import { batteryButtonState } from '../device-operation-state'
@@ -40,7 +41,7 @@ const emit = defineEmits<{
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>硬件设备ID</th><th>积木编号</th><th>接入状态</th><th>连接状态</th><th>使用状态</th><th>电池</th><th>操作</th></tr></thead>
+        <thead><tr><th>硬件设备ID</th><th>积木名称</th><th>接入状态</th><th>连接状态</th><th>使用状态</th><th>电池</th><th>操作</th></tr></thead>
         <tbody>
           <tr
             v-for="device in devices"
@@ -49,7 +50,7 @@ const emit = defineEmits<{
             @click="emit('select', device)"
           >
             <td>{{ device.deviceId }}</td>
-            <td><button class="link" @click.stop="emit('select', device)">{{ device.blockId }}</button></td>
+            <td><button class="link" @click.stop="emit('select', device)">{{ blockName(device.blockId) }}</button></td>
             <td><StatusBadge :tone="device.integrationStatus === 'tested' ? 'green' : 'gray'" :text="integrationText(device)" /></td>
             <td><StatusBadge :tone="connectionTone(device)" :text="connectionText(device)" /></td>
             <td><StatusBadge :tone="usageTone(device)" :text="usageText(device)" /></td>

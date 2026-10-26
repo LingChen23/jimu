@@ -28,7 +28,7 @@ import type {
   TaskResult,
   TaskSummary,
 } from '@/types/task'
-import { gatewayNameForDevice } from '@/config/system'
+import { blockName, gatewayNameForDevice } from '@/config/system'
 import type {
   DeviceCommandRequest,
   DeviceRequest,
@@ -465,7 +465,7 @@ export class MotionSystemDataService implements MotionDataService {
       return {
         blockId: String(raw.block_id),
         deviceId,
-        displayName: `积木 ${raw.block_id}`,
+        displayName: blockName(String(raw.block_id ?? '')),
         integrationStatus: 'tested',
         connectionStatus: online ? 'online' : 'offline',
         usageStatus: online ? 'idle' : 'unavailable',
@@ -931,12 +931,11 @@ export class MotionSystemDataService implements MotionDataService {
     }
   }
 
-  async deleteTask(request: DeleteTaskRequest): Promise<TaskSummary> {
-    const raw = await this.json('/api/tasks/delete', {
+  async deleteTask(request: DeleteTaskRequest): Promise<void> {
+    await this.json('/api/tasks/delete', {
       method: 'POST',
-      body: JSON.stringify({ task_id: request.taskId }),
-    })
-    return taskSummary(raw.task)
+      body: JSON.stringify({ task_id: request.taskId, scope: request.scope ?? 'local' }),
+    }, request.scope === 'cloud' ? 130_000 : undefined)
   }
 
   async getTaskMovementDetail(

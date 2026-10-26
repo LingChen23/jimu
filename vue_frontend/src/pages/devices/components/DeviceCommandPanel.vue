@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { blockName } from '@/config/system'
 import StatusBadge from '@/shared/components/StatusBadge.vue'
 import type { DeviceSnapshot } from '@/types/device'
 import type { DeviceCommand, DeviceCommandResult } from '@/types/serial'
@@ -15,7 +16,7 @@ const commands: Array<{ command: DeviceCommand; label: string; tone?: string }> 
 
 <template>
   <section class="card command-panel">
-    <div class="section-head"><div><div class="card-title">设备控制</div><div class="card-subtitle">设备 {{ device.deviceId }} / 积木 {{ device.blockId }}</div></div><StatusBadge :tone="serialOpen ? 'green' : 'gray'" :text="serialOpen ? '可用' : '请先打开串口'" /></div>
+    <div class="section-head"><div><div class="card-title">设备控制</div><div class="card-subtitle">设备 {{ device.deviceId }} / {{ blockName(device.blockId) }}</div></div><StatusBadge :tone="serialOpen ? 'green' : 'gray'" :text="serialOpen ? '可用' : '请先打开串口'" /></div>
     <div class="command-grid"><button v-for="item in commands" :key="item.command" class="btn" :class="item.tone === 'danger' ? 'danger' : item.command === 'START_STREAM' ? 'primary' : 'secondary'" :disabled="commandButtonState(serialOpen, busy).disabled" @click="emit('command', item.command)">{{ item.label }}</button></div>
     <div class="command-result" :class="{ error: result && !result.ok }">{{ busy ? '正在等待设备响应…' : result ? `${result.command}：${result.message}` : '选择命令后在此显示设备响应。' }}</div>
   </section>

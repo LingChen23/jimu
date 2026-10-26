@@ -24,7 +24,7 @@ function applyExisting(): void {
   <div class="modal-backdrop" @click.self="emit('close')">
     <section class="modal participant-modal">
       <div class="section-head">
-        <div><h2>新建采集任务</h2><p>记录体验者信息，并采集积木 A～J 的全部完整移动。</p></div>
+        <div><h2>新建采集任务</h2><p>记录体验者信息，并采集十种积木的全部完整移动。</p></div>
         <button class="close" @click="emit('close')">×</button>
       </div>
 

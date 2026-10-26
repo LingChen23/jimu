@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { blockName } from '@/config/system'
 import StatusBadge from '@/shared/components/StatusBadge.vue'
 import type { DeviceSnapshot } from '@/types/device'
 import { counterButtonState } from '../device-operation-state'
@@ -52,7 +53,7 @@ const tested = () => props.device.integrationStatus === 'tested'
     <section class="detail-section">
       <div class="detail-section-title">身份与当前状态</div>
       <div class="detail-grid">
-        <div><span>积木编号</span><b>{{ device.blockId }}</b></div>
+        <div><span>积木名称</span><b>{{ blockName(device.blockId) }}</b></div>
         <div><span>硬件设备ID</span><b>{{ device.deviceId }}</b></div>
         <div><span>当前任务</span><b>{{ currentTaskText(device) }}</b></div>
         <div><span>运动状态</span><b>{{ motionText(device) }}</b></div>

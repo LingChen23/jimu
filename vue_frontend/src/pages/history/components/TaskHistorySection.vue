@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { blockName } from '@/config/system'
 import { computed, ref, watch } from 'vue'
 import StatusBadge from '@/shared/components/StatusBadge.vue'
 import type { CloudUploadTaskStatus, TaskSummary } from '@/types/task'
@@ -7,13 +8,16 @@ import { filterTasks } from '../history.filters'
 const props = defineProps<{
   tasks: TaskSummary[]
   deletingTaskId?: string | null
+  deletionScope?: 'local' | 'cloud' | null
+  deletedTaskIds?: string[]
   exporting?: boolean
   uploadStatuses: Record<string, CloudUploadTaskStatus>
   requestingUploadId?: string | null
 }>()
 const emit = defineEmits<{
   open: [taskId: string]
-  delete: [task: TaskSummary]
+  delete: [task: TaskSummary, scope: 'local' | 'cloud']
+  'delete-batch': [taskIds: string[], scope: 'local' | 'cloud']
   export: [taskIds: string[]]
   upload: [taskId: string]
 }>()
@@ -66,6 +70,27 @@ watch(
 watch(totalPages, (pages) => {
   if (currentPage.value > pages) currentPage.value = pages
 })
+
+watch(() => props.deletedTaskIds, (taskIds) => {
+  const deleted = new Set(taskIds)
+  selectedTaskIds.value = new Set([...selectedTaskIds.value].filter(taskId => !deleted.has(taskId)))
+})
+
+function canDelete(task: TaskSummary, scope: 'local' | 'cloud'): boolean {
+  if (task.status === 'collecting' || props.uploadStatuses[task.taskId]?.status === 'uploading') return false
+  return scope === 'local' ? task.localAvailable !== false : cloudStatus(task)?.status === 'uploaded'
+}
+
+function selectedForDelete(scope: 'local' | 'cloud'): string[] {
+  return props.tasks.filter(task => selectedTaskIds.value.has(task.taskId) && canDelete(task, scope))
+    .map(task => task.taskId)
+}
+
+function deleteSelected(scope: 'local' | 'cloud'): void {
+  if (props.deletionScope || props.exporting) return
+  const taskIds = selectedForDelete(scope)
+  if (taskIds.length) emit('delete-batch', taskIds, scope)
+}
 
 function toggleTask(taskId: string): void {
   const next = new Set(selectedTaskIds.value)
@@ -129,7 +154,7 @@ function movedBlocks(task: TaskSummary): string {
       ?? task.blockBindings?.find((binding) => binding.deviceId === reference.deviceId)?.blockId
       ?? String(reference.deviceId)
   )))
-  return blocks.size ? [...blocks].join('、') : '—'
+  return blocks.size ? [...blocks].map(blockName).join('、') : '—'
 }
 </script>
 
@@ -149,12 +174,14 @@ function movedBlocks(task: TaskSummary): string {
 
   <section class="card table-card">
     <div class="section-head">
-      <div><div class="card-title">历史任务列表</div><div class="card-subtitle">选择任务后可批量导出完整数据记录</div></div>
+      <div><div class="card-title">历史任务列表</div><div class="card-subtitle">删除直接执行且不可恢复；删除本地会保留云端归档</div></div>
       <div class="table-head-actions">
         <span v-if="selectedCount" class="selected-count">已选 {{ selectedCount }} 条</span>
-        <button class="btn secondary batch-export" :disabled="!selectedCount || exporting" @click="exportSelected">
+        <button class="btn secondary batch-export" :disabled="!selectedCount || exporting || !!deletionScope" @click="exportSelected">
           {{ exporting ? '正在打包…' : '批量导出' }}
         </button>
+        <button class="link delete-action batch-export" :disabled="!selectedForDelete('cloud').length || !!deletionScope || exporting" @click="deleteSelected('cloud')">{{ deletionScope === 'cloud' ? '删除云端中…' : '批量删除云端' }}</button>
+        <button class="link delete-action batch-export" :disabled="!selectedForDelete('local').length || !!deletionScope || exporting" @click="deleteSelected('local')">{{ deletionScope === 'local' ? '删除本地中…' : '批量删除本地' }}</button>
       </div>
     </div>
     <div class="table-wrap">
@@ -177,7 +204,12 @@ function movedBlocks(task: TaskSummary): string {
             <td><b>{{ task.totalScore ?? '—' }}</b></td>
             <td><StatusBadge :tone="task.status === 'completed' ? 'green' : 'gray'" :text="taskStatus(task.status)" /></td>
             <td><template v-if="cloudStatus(task)"><StatusBadge :tone="cloudStatusTone(cloudStatus(task)!.status)" :text="cloudStatusText(cloudStatus(task)!.status)" /><small v-if="cloudStatus(task)!.status === 'failed'" class="cloud-error">{{ cloudError(cloudStatus(task)!.errorCode) }}</small></template><span v-else>—</span></td>
-            <td><div class="row-actions"><button class="link" @click="emit('open', task.taskId)">查看详情</button><button v-if="task.localAvailable !== false && cloudStatus(task)?.status !== 'uploaded' && cloudStatus(task)" class="link" :disabled="cloudStatus(task)?.status === 'uploading' || requestingUploadId === task.taskId" @click="emit('upload', task.taskId)">{{ cloudStatus(task)?.status === 'failed' ? '重试' : '上传' }}</button><button v-if="task.localAvailable !== false" class="link danger" :disabled="task.status === 'collecting' || cloudStatus(task)?.status === 'uploading' || deletingTaskId === task.taskId" @click="emit('delete', task)">{{ deletingTaskId === task.taskId ? '删除中…' : '删除' }}</button></div></td>
+            <td><div class="row-actions">
+              <button class="link" @click="emit('open', task.taskId)">查看详情</button>
+              <button v-if="task.localAvailable !== false && cloudStatus(task)?.status !== 'uploaded' && cloudStatus(task)" class="link" :disabled="cloudStatus(task)?.status === 'uploading' || requestingUploadId === task.taskId || !!deletionScope" @click="emit('upload', task.taskId)">{{ cloudStatus(task)?.status === 'failed' ? '重试' : '上传' }}</button>
+              <button v-if="cloudStatus(task)?.status === 'uploaded'" class="link delete-action" :disabled="!canDelete(task, 'cloud') || !!deletionScope || exporting || requestingUploadId === task.taskId" @click="emit('delete', task, 'cloud')">{{ deletingTaskId === task.taskId && deletionScope === 'cloud' ? '删除中…' : '删除云端' }}</button>
+              <button v-if="task.localAvailable !== false" class="link delete-action" :disabled="!canDelete(task, 'local') || !!deletionScope || exporting || requestingUploadId === task.taskId" @click="emit('delete', task, 'local')">{{ deletingTaskId === task.taskId && deletionScope === 'local' ? '删除中…' : '删除本地' }}</button>
+            </div></td>
           </tr>
           <tr v-if="!filtered.length"><td class="empty-cell" colspan="16">没有符合筛选条件的任务记录</td></tr>
         </tbody>
@@ -192,5 +224,5 @@ function movedBlocks(task: TaskSummary): string {
 </template>
 
 <style scoped>
-.filter-section{padding:18px}.filter-section .filters{padding:16px 0 0}.filter-section .filters.compact{grid-template-columns:repeat(4,minmax(0,1fr))}.table-card .table-wrap{max-height:430px;overflow:auto;scrollbar-gutter:stable}.table-card th{position:sticky;top:0;z-index:1}.table-head-actions{display:flex;align-items:center;gap:10px}.selected-count{color:#59667a;font-size:11px}.batch-export{padding:8px 13px;font-size:11px}.batch-export:disabled{cursor:not-allowed;opacity:.5}.selection-column{width:38px;padding-right:6px;text-align:center}.selection-checkbox{width:16px;height:16px;margin:0;padding:0;accent-color:var(--primary);cursor:pointer}.selection-checkbox:disabled{cursor:not-allowed;opacity:.45}.cloud-error{display:block;max-width:130px;margin-top:5px;color:#b53f3f;white-space:normal}.empty-cell{text-align:center;color:#7b879a;padding:28px}.row-actions{display:flex;align-items:center;gap:12px;white-space:nowrap}.link.danger{color:#d14343}.link:disabled{cursor:not-allowed;opacity:.45}@media(max-width:1000px){.filter-section .filters.compact{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:680px){.filter-section .filters.compact{grid-template-columns:1fr}.table-card .section-head{align-items:flex-start}.table-head-actions{width:100%;justify-content:space-between}}
+.filter-section{padding:18px}.filter-section .filters{padding:16px 0 0}.filter-section .filters.compact{grid-template-columns:repeat(4,minmax(0,1fr))}.table-card .table-wrap{max-height:430px;overflow:auto;scrollbar-gutter:stable}.table-card th{position:sticky;top:0;z-index:1}.table-head-actions{display:flex;align-items:center;gap:10px}.selected-count{color:#59667a;font-size:11px}.batch-export{padding:8px 13px;font-size:11px}.batch-export:disabled{cursor:not-allowed;opacity:.5}.selection-column{width:38px;padding-right:6px;text-align:center}.selection-checkbox{width:16px;height:16px;margin:0;padding:0;accent-color:var(--primary);cursor:pointer}.selection-checkbox:disabled{cursor:not-allowed;opacity:.45}.cloud-error{display:block;max-width:130px;margin-top:5px;color:#b53f3f;white-space:normal}.empty-cell{text-align:center;color:#7b879a;padding:28px}.row-actions{display:flex;align-items:center;gap:12px;white-space:nowrap}.delete-action{color:#b53f3f}.delete-action:disabled{cursor:not-allowed;opacity:.45}.link:disabled{cursor:not-allowed;opacity:.45}@media(max-width:1000px){.filter-section .filters.compact{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:680px){.filter-section .filters.compact{grid-template-columns:1fr}.table-card .section-head{align-items:flex-start}.table-head-actions{width:100%;justify-content:space-between}}
 </style>

@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import StatusBadge from '@/shared/components/StatusBadge.vue'
 import type { BlockMapping } from '@/types/device'
-import { BLOCK_IDS, DEVICE_COUNT, DEVICE_IDS } from '@/config/system'
+import { blockName, BLOCK_IDS, DEVICE_COUNT, DEVICE_IDS } from '@/config/system'
 
 const props = defineProps<{ mapping: BlockMapping | null; saving: boolean }>()
 const emit = defineEmits<{ save: [mapping: BlockMapping] }>()
@@ -31,11 +31,11 @@ function save(): void {
 <template>
   <section class="card mapping-panel">
     <div class="section-head">
-      <div><div class="card-title">设备与积木绑定</div><div class="card-subtitle">设备 1～10 必须与积木 A～J 一一对应；新映射只影响后续移动</div></div>
+      <div><div class="card-title">设备与积木绑定</div><div class="card-subtitle">设备 1～10 必须与十种积木一一对应；新映射只影响后续移动</div></div>
       <div class="mapping-actions"><StatusBadge v-if="!valid" tone="red" text="存在重复绑定" /><button class="btn primary" :disabled="saving || !valid" @click="save">{{ saving ? '保存中…' : '保存绑定' }}</button></div>
     </div>
     <div class="mapping-grid">
-      <label v-for="deviceId in DEVICE_IDS" :key="deviceId"><span>设备 {{ deviceId }}</span><select v-model="values[deviceId]"><option v-for="block in blocks" :key="block" :value="block">积木 {{ block }}</option></select></label>
+      <label v-for="deviceId in DEVICE_IDS" :key="deviceId"><span>设备 {{ deviceId }}</span><select v-model="values[deviceId]"><option v-for="block in blocks" :key="block" :value="block">{{ blockName(block) }}</option></select></label>
     </div>
   </section>
 </template>

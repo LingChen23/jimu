@@ -235,6 +235,10 @@ def create_app(settings=None, storage=None, repository=None):
         authenticate(request)
         return archiver.status(task_id)
 
+    @app.delete('/api/history/tasks/{task_id}')
+    def delete_task(task_id: str):
+        return archiver.delete(task_id)
+
     @app.get('/api/history/tasks')
     def history(
         task_id: str = Query('', max_length=96),

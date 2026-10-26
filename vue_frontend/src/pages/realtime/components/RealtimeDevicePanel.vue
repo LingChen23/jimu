@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { blockName } from '@/config/system'
 import { computed } from 'vue'
 import StatusBadge from '@/shared/components/StatusBadge.vue'
 import type { DeviceSnapshot } from '@/types/device'
@@ -52,7 +53,7 @@ function connectionText(): string {
       <div class="realtime-info-item--wide"><span>连接 / 任务</span><div class="realtime-status-pair"><StatusBadge :tone="tested && device.connectionStatus !== 'offline' ? 'green' : 'gray'" :text="connectionText()" /><StatusBadge :tone="taskTone" :text="taskState" /></div></div>
       <div><span>任务编号</span><strong>{{ currentTask?.taskId ?? '—' }}</strong></div>
       <div><span>体验者编号</span><strong>{{ currentTask?.participantId ?? '—' }}</strong></div>
-      <div><span>积木编号</span><strong>{{ selectedTaskBlock ?? device.blockId }}</strong></div>
+      <div><span>积木名称</span><strong>{{ blockName(selectedTaskBlock ?? device.blockId) }}</strong></div>
     </div>
   </section>
 </template>

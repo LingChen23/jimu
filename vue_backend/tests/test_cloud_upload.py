@@ -52,6 +52,13 @@ class MemoryTransport:
             raise self.failure
         self.archived.add(task_id)
 
+    def json(self, method, path, *, timeout=20):
+        if self.failure:
+            raise self.failure
+        task_id = path.rsplit('/', 1)[-1]
+        self.archived.discard(task_id)
+        return {'task_id': task_id, 'deleted': True}
+
 
 class CloudUploaderTests(unittest.TestCase):
     def setUp(self):
@@ -154,8 +161,26 @@ class CloudUploaderTests(unittest.TestCase):
         self.assertTrue(transport.entered.wait(2))
         with self.assertRaisesRegex(ValueError, "正在上传"):
             uploader.prepare_delete("T-OLD")
+        with self.assertRaisesRegex(ValueError, "正在上传"):
+            uploader.delete_cloud("T-OLD")
         transport.release.set()
         wait_for(lambda: uploader.statuses(["T-OLD"])["tasks"]["T-OLD"]["status"] == "uploaded")
+        uploader.close()
+
+    def test_cloud_delete_blocks_manual_enqueue_and_local_delete_until_finished(self):
+        transport = MemoryTransport()
+        uploader = self.uploader(transport)
+        original = transport.json
+
+        def deleting(method, path, **kwargs):
+            self.assertEqual(uploader.enqueue(['T-OLD'])['T-OLD']['error_code'], 'task_deleting')
+            with self.assertRaisesRegex(ValueError, '正在删除'):
+                uploader.prepare_delete('T-OLD')
+            return original(method, path, **kwargs)
+
+        transport.json = deleting
+        uploader.delete_cloud('T-OLD')
+        self.assertTrue(uploader.enqueue(['T-OLD'])['T-OLD']['ok'])
         uploader.close()
 
     def test_invalid_or_collecting_task_is_not_queued(self):
@@ -164,6 +189,54 @@ class CloudUploaderTests(unittest.TestCase):
         result = uploader.enqueue(["missing", "T-LIVE"])
         self.assertEqual(result["missing"]["error_code"], "task_not_found")
         self.assertEqual(result["T-LIVE"]["error_code"], "task_not_finished")
+
+    def test_cloud_delete_retains_local_task_and_waits_for_manual_upload_after_restart(self):
+        transport = MemoryTransport()
+        uploader = self.uploader(transport)
+        uploader.start()
+        uploader.enqueue(['T-OLD'])
+        wait_for(lambda: 'T-OLD' in transport.archived)
+        wait_for(lambda: uploader.statuses(['T-OLD'])['tasks']['T-OLD']['status'] == 'uploaded')
+        uploader.delete_cloud('T-OLD')
+        uploader.close()
+        self.assertEqual(len(self.tasks), 1)
+        self.assertEqual(transport.archived, set())
+        restarted = self.uploader(transport)
+        restarted.start()
+        self.assertEqual(restarted.statuses(['T-OLD'])['tasks']['T-OLD']['status'], 'pending')
+        threading.Event().wait(0.05)
+        self.assertEqual(len(transport.calls), 1)
+        restarted.enqueue(['T-OLD'])
+        wait_for(lambda: 'T-OLD' in transport.archived)
+        restarted.close()
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_cloud_delete_failure_does_not_resume_queued_upload(self):
+        transport = MemoryTransport()
+        transport.failure = TransportError('cloud_connection_failed', True)
+        uploader = self.uploader(transport)
+        uploader.enqueue(['T-OLD'])
+        with self.assertRaises(TransportError):
+            uploader.delete_cloud('T-OLD')
+        transport.failure = None
+        uploader.start()
+        threading.Event().wait(0.05)
+        uploader.close()
+        self.assertEqual(transport.calls, [])
+        self.assertEqual(len(self.tasks), 1)
+
+    def test_local_delete_preparation_does_not_auto_upload_if_local_removal_fails(self):
+        transport = MemoryTransport()
+        uploader = self.uploader(transport)
+        uploader.enqueue(['T-OLD'])
+        uploader.prepare_delete('T-OLD')
+        uploader.close()
+        # Simulate the task still existing after a local file/database failure.
+        restarted = self.uploader(transport)
+        restarted.start()
+        threading.Event().wait(0.05)
+        restarted.close()
+        self.assertEqual(transport.calls, [])
 
 
 class HttpTransportTests(unittest.TestCase):

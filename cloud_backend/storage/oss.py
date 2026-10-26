@@ -88,6 +88,29 @@ class OssStorage:
         except Exception:
             raise ArchiveError('oss_unavailable', 503, True) from None
 
+    def delete_prefix(self, prefix):
+        """Delete only the caller's validated task prefix, with bounded pages."""
+        token = None
+        try:
+            while True:
+                page = self.client.list_objects_v2(self.sdk.ListObjectsV2Request(
+                    bucket=self.bucket, prefix=prefix, continuation_token=token, max_keys=1000))
+                for item in page.contents or []:
+                    if not item.key or not item.key.startswith(prefix):
+                        raise ArchiveError('invalid_archive_prefix', 503)
+                    self.client.delete_object(self.sdk.DeleteObjectRequest(
+                        bucket=self.bucket, key=item.key))
+                if not page.is_truncated:
+                    break
+                next_token = page.next_continuation_token
+                if not next_token or next_token == token:
+                    raise ArchiveError('oss_delete_failed', 503, True)
+                token = next_token
+        except ArchiveError:
+            raise
+        except Exception:
+            raise ArchiveError('oss_delete_failed', 503, True) from None
+
     def stream(self, key, chunk_size=1024 * 1024):
         """Open an OSS object now and return a closing byte iterator."""
         try:

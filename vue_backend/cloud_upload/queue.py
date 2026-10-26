@@ -110,11 +110,12 @@ class UploadQueue:
             row = database.execute(
                 """
                 SELECT * FROM uploads
-                WHERE status='pending' OR (status='failed' AND retry_at IS NOT NULL AND retry_at<=?)
+                WHERE (status='pending' AND (retry_at IS NULL OR (retry_at>=0 AND retry_at<=?)))
+                   OR (status='failed' AND retry_at IS NOT NULL AND retry_at<=?)
                 ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, updated_at
                 LIMIT 1
                 """,
-                (now,),
+                (now, now),
             ).fetchone()
         return dict(row) if row else None
 
@@ -122,8 +123,10 @@ class UploadQueue:
         with self._connection() as database:
             cursor = database.execute(
                 "UPDATE uploads SET status='uploading',attempts=attempts+1,error_code=NULL,"
-                "retry_at=NULL,updated_at=? WHERE task_id=? AND status IN ('pending','failed')",
-                (self._now(), task_id),
+                "retry_at=NULL,updated_at=? WHERE task_id=? AND "
+                "((status='pending' AND (retry_at IS NULL OR (retry_at>=0 AND retry_at<=?))) "
+                "OR (status='failed' AND retry_at IS NOT NULL AND retry_at<=?))",
+                (self._now(), task_id, time.time(), time.time()),
             )
             if cursor.rowcount != 1:
                 return None
@@ -166,7 +169,7 @@ class UploadQueue:
             ).fetchall()
         return {row["task_id"]: dict(row) for row in rows}
 
-    def remove_for_delete(self, task_id: str) -> str | None:
+    def pause_for_delete(self, task_id: str) -> str | None:
         with self._connection() as database:
             database.execute("BEGIN IMMEDIATE")
             row = database.execute(
@@ -174,5 +177,12 @@ class UploadQueue:
             ).fetchone()
             if row is not None and row["status"] == "uploading":
                 raise ValueError("任务正在上传，请上传结束后再删除")
-            database.execute("DELETE FROM uploads WHERE task_id=?", (task_id,))
+            # A negative retry_at is a durable manual-only pending task. Keeping
+            # the row also prevents startup recovery from re-uploading it.
+            database.execute(
+                "INSERT INTO uploads(task_id,status,retry_at,updated_at) VALUES(?,'pending',-1,?) "
+                "ON CONFLICT(task_id) DO UPDATE SET status='pending',retry_at=-1,"
+                "error_code=NULL,uploaded_at=NULL,cache_path=NULL,updated_at=excluded.updated_at",
+                (task_id, self._now()),
+            )
         return row["cache_path"] if row else None

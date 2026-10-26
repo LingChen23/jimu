@@ -20,6 +20,7 @@ from motion_model import ANALYSIS_MODE_PC, MotionStore
 from serial_service import SerialService
 from system_config import DEVICE_COUNT, DEVICE_IDS
 from task_service import TaskService
+from task_deletion import TaskDeletion
 from cloud_upload import CloudUploader
 from cloud_upload.transport import HttpTransport, TransportError
 from diagnostics import Diagnostics
@@ -91,6 +92,7 @@ CLOUD_UPLOADER = CloudUploader(
     transport=CLOUD_TRANSPORT,
     diagnostic_sink=DIAGNOSTICS.record,
 )
+TASK_DELETION = TaskDeletion(TASKS, CLOUD_UPLOADER)
 
 
 def _record_api_error(path: str, error: BaseException, task_id: str = "") -> None:
@@ -620,14 +622,8 @@ class ApiHandler(SimpleHTTPRequestHandler):
                 )
                 return
             if self.path == "/api/tasks/delete":
-                task_id = str(body.get("task_id", ""))
-                CLOUD_UPLOADER.prepare_delete(task_id)
-                self._json_response(
-                    {
-                        "ok": True,
-                        "task": TASKS.delete(task_id),
-                    }
-                )
+                self._json_response(TASK_DELETION.delete(
+                    str(body.get("task_id", "")), body.get("scope", "local")))
                 return
             self._json_response(
                 {"error": "unknown endpoint"}, HTTPStatus.NOT_FOUND

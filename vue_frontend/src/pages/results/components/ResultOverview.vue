@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { blockName } from '@/config/system'
 import { computed, ref } from 'vue'
 import StatusBadge from '@/shared/components/StatusBadge.vue'
 import { useTaskStore } from '@/stores/task.store'
@@ -171,7 +172,7 @@ async function saveProfile(): Promise<void> {
       <div><span>任务持续时间</span><b>{{ durationText() }}</b></div>
       <div><span>记录状态</span><b>{{ taskStatus(task?.status) }}</b></div>
       <div><span>当前移动硬件设备ID</span><b>{{ selectedDeviceId ?? '—' }}</b></div>
-      <div><span>当前移动积木编号</span><b>{{ selectedBlockId ?? '—' }}</b></div>
+      <div><span>当前移动积木</span><b>{{ blockName(selectedBlockId) }}</b></div>
       <div><span>当前移动编号</span><b>{{ movement ? `M${movement.movementId}` : '未关联移动' }}</b></div>
       <div><span>分析模式</span><b>{{ analysisMode(movement?.analysisMode) }}</b></div>
       <div class="overview-wide"><span>本次采集备注</span><b>{{ task?.note || '未填写' }}</b></div>

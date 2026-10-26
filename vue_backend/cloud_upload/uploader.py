@@ -26,7 +26,7 @@ class UploadFailure(Exception):
 
 
 class CloudUploader:
-    """Owns queueing, packaging, retry and transport behind five methods."""
+    """Own queueing, packaging, retry and deletion guards behind a small interface."""
 
     def __init__(
         self,
@@ -48,6 +48,8 @@ class CloudUploader:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        self._deletion_lock = threading.Lock()
+        self._deleting: set[str] = set()
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -82,7 +84,11 @@ class CloudUploader:
             if task.get("status") not in ("completed", "abnormal"):
                 result[task_id] = {"ok": False, "error_code": "task_not_finished"}
                 continue
-            stale_cache = self._queue.enqueue(task_id)
+            with self._deletion_lock:
+                if task_id in self._deleting:
+                    result[task_id] = {"ok": False, "error_code": "task_deleting"}
+                    continue
+                stale_cache = self._queue.enqueue(task_id)
             self._unlink(stale_cache)
             current = self._queue.rows([task_id])[task_id]["status"]
             result[task_id] = {"ok": True, "status": current}
@@ -98,14 +104,37 @@ class CloudUploader:
             tasks[task_id] = {
                 "status": row["status"] if row else "pending",
                 "error_code": row["error_code"] if row else None,
-                "retry_at": row["retry_at"] if row else None,
+                "retry_at": row["retry_at"] if row and row["retry_at"] is not None and row["retry_at"] >= 0 else None,
             }
         connection = "disabled" if self._transport is None else self._transport.state()
         return {"connection": connection, "tasks": tasks}
 
     def prepare_delete(self, task_id: str) -> None:
-        stale_cache = self._queue.remove_for_delete(str(task_id))
+        with self._deletion_lock:
+            if task_id in self._deleting:
+                raise ValueError("任务正在删除云端记录，请稍后再试")
+            stale_cache = self._queue.pause_for_delete(str(task_id))
         self._unlink(stale_cache)
+
+    def delete_cloud(self, task_id: str) -> None:
+        if not TASK_ID.fullmatch(task_id):
+            raise ValueError("任务编号无效")
+        if self._transport is None:
+            raise TransportError("cloud_upload_disabled", False)
+        with self._deletion_lock:
+            if task_id in self._deleting:
+                raise ValueError("任务正在删除云端记录，请稍后再试")
+            stale_cache = self._queue.pause_for_delete(task_id)
+            self._deleting.add(task_id)
+        try:
+            result = self._transport.json("DELETE", f"/api/history/tasks/{task_id}", timeout=120)
+            if result.get("deleted") is not True or result.get("task_id") != task_id:
+                raise TransportError("cloud_delete_failed", True)
+            self._unlink(stale_cache)
+            self._unlink(str(self._cache_root / f"{task_id}.zip"))
+        finally:
+            with self._deletion_lock:
+                self._deleting.discard(task_id)
 
     def _recover_missed_tasks(self) -> None:
         enabled_at = self._queue.enabled_at()

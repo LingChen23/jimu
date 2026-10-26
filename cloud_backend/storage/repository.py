@@ -81,6 +81,15 @@ class Repository:
             return [dict(row) for row in db.execute(
                 "SELECT * FROM tasks WHERE archive_status!='archived'")]
 
+    def mark_deleting(self, task_id):
+        with self.connection() as db:
+            db.execute("UPDATE tasks SET archive_status='deleting',error_code=NULL WHERE task_id=?",
+                       (task_id,))
+
+    def delete(self, task_id):
+        with self.connection() as db:
+            db.execute('DELETE FROM tasks WHERE task_id=?', (task_id,))
+
     @staticmethod
     def _like(value):
         return '%' + value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'

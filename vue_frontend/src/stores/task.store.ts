@@ -14,6 +14,7 @@ export const useTaskStore = defineStore('task', () => {
   let currentTaskRequest = 0
   let cloudTaskRequest = 0
   const taskResultRequests = new Map<string, Promise<TaskResult>>()
+  const cloudDeletedTasks = new Set<string>()
 
   const completedCount = computed(() => tasks.value.filter((task) => task.status === 'completed').length)
   const averageScore = computed(() => {
@@ -82,6 +83,7 @@ export const useTaskStore = defineStore('task', () => {
   }
 
   async function loadTasks(): Promise<void> {
+    cloudDeletedTasks.clear()
     tasks.value = await motionDataService.listTasks()
     cloudLoadedCount.value = 0
     cloudTotal.value = 0
@@ -101,6 +103,7 @@ export const useTaskStore = defineStore('task', () => {
         if (requestId !== cloudTaskRequest) return
         const merged = new Map(tasks.value.map(task => [task.taskId, task]))
         remote.tasks.forEach((task) => {
+          if (cloudDeletedTasks.has(task.taskId)) return
           const existing = merged.get(task.taskId)
           merged.set(task.taskId, existing
             ? { ...existing, cloudArchived: true }
@@ -125,16 +128,30 @@ export const useTaskStore = defineStore('task', () => {
     cloudLoading.value = false
   }
 
-  async function deleteTask(taskId: string, keepCloudRecord = false): Promise<void> {
+  async function deleteTask(taskId: string, scope: 'local' | 'cloud', keepCloudRecord = false): Promise<void> {
     const existing = tasks.value.find((task) => task.taskId === taskId)
-    await motionDataService.deleteTask({ taskId })
-    tasks.value = keepCloudRecord && existing
+    await motionDataService.deleteTask({ taskId, scope })
+    const keep = existing && (scope === 'local'
+      ? existing.cloudArchived || keepCloudRecord
+      : existing.localAvailable !== false)
+    if (scope === 'cloud') {
+      cloudDeletedTasks.add(taskId)
+      if (existing?.cloudArchived) cloudTotal.value = Math.max(0, cloudTotal.value - 1)
+    }
+    tasks.value = keep
       ? tasks.value.map((task) => task.taskId === taskId
-        ? { ...task, localAvailable: false, cloudArchived: true }
+        ? scope === 'local'
+          ? { ...task, localAvailable: false, cloudArchived: true }
+          : { ...task, cloudArchived: false }
         : task)
       : tasks.value.filter((task) => task.taskId !== taskId)
+    forgetTaskResult(taskId)
+    if (scope === 'local' && currentTask.value?.taskId === taskId) currentTask.value = null
+  }
+
+  function forgetTaskResult(taskId: string): void {
     delete taskResults.value[taskId]
-    if (currentTask.value?.taskId === taskId) currentTask.value = null
+    taskResultRequests.delete(taskId)
   }
 
   async function loadTaskResult(taskId: string): Promise<TaskResult> {
@@ -144,10 +161,12 @@ export const useTaskStore = defineStore('task', () => {
     if (pending) return pending
     const request = motionDataService.getTaskResult({ taskId })
       .then((result) => {
-        taskResults.value[taskId] = result
+        if (taskResultRequests.get(taskId) === request) taskResults.value[taskId] = result
         return result
       })
-      .finally(() => { taskResultRequests.delete(taskId) })
+      .finally(() => {
+        if (taskResultRequests.get(taskId) === request) taskResultRequests.delete(taskId)
+      })
     taskResultRequests.set(taskId, request)
     return request
   }
@@ -186,6 +205,7 @@ export const useTaskStore = defineStore('task', () => {
     mergeCloudTasks,
     cancelCloudTaskLoading,
     deleteTask,
+    forgetTaskResult,
     loadTaskResult,
     prefetchTaskResults,
     exportTask,

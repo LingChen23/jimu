@@ -12,7 +12,7 @@ export async function fetchWithTimeout(
     return await fetch(input, { ...init, signal: controller.signal })
   } catch (error) {
     if (controller.signal.aborted) {
-      if (['127.0.0.1', 'localhost'].includes(location.hostname)) {
+      if (typeof location !== 'undefined' && ['127.0.0.1', 'localhost'].includes(location.hostname)) {
         let taskId = ''
         try {
           const url = new URL(input instanceof Request ? input.url : String(input), location.href)

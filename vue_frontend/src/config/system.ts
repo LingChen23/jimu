@@ -6,8 +6,8 @@ export const BLOCK_IDS = Array.from(
 )
 
 const BLOCK_NAMES: Record<string, string> = {
-  A: '圆柱块', B: '四面尖块', C: '十字块', D: '扇锥块', E: '三翼块',
-  F: '弧翼块', G: '螺纹筒', H: '弧槽块', I: '双桥块', J: '多半圆块',
+  A: '圆柱块', B: '四面尖块', C: '十字块', D: '扇锥块', E: '四翼块',
+  F: '弧翼块', G: '螺纹筒', H: '弧槽块', I: '阶梯块', J: '多半圆块',
 }
 
 export function blockName(blockId: string | null | undefined): string {

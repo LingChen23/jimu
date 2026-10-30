@@ -2,13 +2,6 @@ name: Build macOS app
 
 on:
   workflow_dispatch:
-  push:
-    branches: [feature/cloud-diagnostics]
-    paths:
-      - .github/workflows/build-macos.yml
-      - deploy/pc/build-macos.py
-      - vue_backend/desktop_entry.py
-      - vue_backend/desktop_runtime.py
 
 permissions:
   contents: read

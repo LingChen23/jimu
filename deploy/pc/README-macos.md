@@ -7,16 +7,19 @@ Windows 仍使用 EXE 同级的 `runtime`。
 ## GitHub Actions 打包
 
 1. 在仓库 Settings → Secrets and variables → Actions 中配置 `JIMU_UPLOAD_TOKEN`，
-   值为现有上传 Token，不能提交到代码中。
-2. 向 `feature/cloud-diagnostics` 分支推送 Mac 启动或打包文件后会自动运行。
-   在 Actions → Build macOS app 查看进度；可在已有运行中选择 Re-run all jobs 重打包。
-   工作流合入默认分支后，也可用 Run workflow 手动选择分支运行。
+   值为现有上传 Token，不能提交到代码中。另配置 `JIMU_ARTIFACT_KEY`，
+   值为随机 32 字节密钥的 Base64；本机副本保存在 Git 忽略的
+   `vue_backend/runtime/mac_artifact_key.txt`，不要提交。
+2. 在 Actions → Build macOS app → Run workflow 选择 `main` 手动运行。
+   普通代码推送不会触发打包。
 3. 成功后在本次运行的 Artifacts 下载对应包：
    - `JimuMotion-Mac-arm64`：Apple M 系列芯片。
    - `JimuMotion-Mac-x86_64`：Intel 芯片。
 
-每个包包含 `.dmg` 和保存应用目录结构的 `.app.zip`，保留 7 天。
-工作流也会在该分支的 Mac 启动或打包文件更新时运行。
+公开产物只包含加密的 `mac-packages.enc`，保留 7 天，避免包内 Token 公开。
+下载后使用本机密钥进行 AES-256-GCM 解密：前 12 字节为 nonce，后面为密文及
+认证标签，附加认证数据为 `JimuMotion-macos-v1`。解密后是 TAR，内含 `.dmg`
+和保存应用目录结构的 `.app.zip`。对外发送解密后的安装包即可。
 当前构建环境为 macOS 15，先支持 macOS 15 及以上；更早版本需要单独验证。
 
 ## Mac 上使用

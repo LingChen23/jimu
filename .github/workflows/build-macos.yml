@@ -33,7 +33,7 @@ jobs:
           cache-dependency-path: vue_backend/requirements.txt
       - name: Install dependencies
         run: |
-          python -m pip install -r vue_backend/requirements.txt 'pyinstaller>=6.16,<7'
+          python -m pip install -r vue_backend/requirements.txt 'pyinstaller>=6.16,<7' cryptography
           npm ci --prefix vue_frontend
       - name: Check desktop startup helpers
         run: python -m unittest discover -s vue_backend/tests -p test_desktop_runtime.py
@@ -42,13 +42,27 @@ jobs:
           JIMU_UPLOAD_TOKEN: ${{ secrets.JIMU_UPLOAD_TOKEN }}
           JIMU_CLOUD_URL: http://39.102.212.53
         run: python deploy/pc/build-macos.py --output dist-macos
+      - name: Encrypt packages before artifact upload
+        env:
+          JIMU_ARTIFACT_KEY: ${{ secrets.JIMU_ARTIFACT_KEY }}
+        run: |
+          python - <<'PY'
+          import base64, io, os, tarfile
+          from pathlib import Path
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          key = base64.b64decode(os.environ['JIMU_ARTIFACT_KEY'], validate=True)
+          payload = io.BytesIO()
+          with tarfile.open(fileobj=payload, mode='w') as archive:
+              for path in sorted(Path('dist-macos').glob('*')):
+                  archive.add(path, arcname=path.name)
+          nonce = os.urandom(12)
+          Path('mac-packages.enc').write_bytes(nonce + AESGCM(key).encrypt(
+              nonce, payload.getvalue(), b'JimuMotion-macos-v1'))
+          PY
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
           name: JimuMotion-Mac-${{ matrix.arch }}
-          path: |
-            dist-macos/*.dmg
-            dist-macos/*.app.zip
+          path: mac-packages.enc
           if-no-files-found: error
           retention-days: 7
           compression-level: 0

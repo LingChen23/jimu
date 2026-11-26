@@ -44,6 +44,9 @@ def _runtime_file(name: str) -> Path:
 
 SETTINGS_PATH = _runtime_file("motion_settings.json")
 BLOCK_MAPPING_PATH = _runtime_file("block_device_mapping.json")
+SCORING_CONFIG_PATH = Path(
+    os.environ.get("MOTION_SCORING_CONFIG_PATH", _runtime_file("scoring_config.json"))
+).resolve()
 TASK_RECORDS_PATH = _runtime_file("task_records.json")
 DATABASE_PATH = Path(
     os.environ.get("MOTION_DATABASE_PATH", RUNTIME_ROOT / "motion_system.sqlite3")
@@ -72,6 +75,7 @@ TASKS = TaskService(
     require_participant_profile=True,
     movement_archived_callback=STORE.mark_movement_archived,
     diagnostic_sink=DIAGNOSTICS.record,
+    scoring_config_path=SCORING_CONFIG_PATH,
 )
 
 
@@ -218,6 +222,9 @@ class ApiHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/block-mapping":
             self._json_response(STORE.block_mapping_snapshot())
+            return
+        if path == "/api/scoring-config":
+            self._json_response(TASKS.scoring_config_snapshot())
             return
         if path == "/api/devices":
             self._json_response(
@@ -396,7 +403,11 @@ class ApiHandler(SimpleHTTPRequestHandler):
                         {"error": "未找到该移动记录"}, HTTPStatus.NOT_FOUND
                     )
                     return
-                self._json_response(detail)
+                detail_out = dict(detail)
+                detail_out["v14_score"] = TASKS.score_live_movement(
+                    device_id, movement_id, mode, detail
+                )
+                self._json_response(detail_out)
                 return
             export_format = "csv" if path.endswith(".csv") else "json"
             content = STORE.movement_export(

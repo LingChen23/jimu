@@ -1,0 +1,379 @@
+{
+  "scoring_version": "v1.4",
+  "weights_version": "v1.3-prior",
+  "calibration_version": "v1.4-provisional-trial",
+  "model_id": "jimu-wall-scoring-v1.4",
+  "calibrated": false,
+  "provisional": true,
+  "description": "智能积木穿墙任务运动表现分配置（V1.4 技术定稿：V1.3 多特征先验权重 + V1.4 评分专用补帧与实际参与积木等权聚合）。当前上下限与目标区间为流程试行参数，待 20–30 次实测任务独立标定后冻结更新。",
+  "quality": {
+    "required_analysis_mode": "pc",
+    "missing_ratio_threshold": 0.10,
+    "nominal_sample_period_seconds": 0.01,
+    "clock_tolerance_min_seconds": 0.03,
+    "clock_tolerance_ratio": 0.02,
+    "max_continuous_gap_seconds": null
+  },
+  "drop_penalty": {
+    "enabled": true,
+    "per_drop": 10.0,
+    "max_penalty": 30.0
+  },
+  "intra_group_weights": {
+    "T": {
+      "moving_seconds": {
+        "weight": 1.0,
+        "direction": "negative",
+        "enabled": true
+      }
+    },
+    "P": {
+      "pause_total_seconds": {
+        "weight": 0.75,
+        "direction": "negative",
+        "enabled": true
+      },
+      "pause_count": {
+        "weight": 0.25,
+        "direction": "negative",
+        "enabled": true
+      }
+    },
+    "V": {
+      "p05": {
+        "weight": 0.15,
+        "direction": "positive",
+        "enabled": true
+      },
+      "max": {
+        "weight": 0.10,
+        "direction": "positive",
+        "enabled": true
+      },
+      "mean": {
+        "weight": 0.35,
+        "direction": "positive",
+        "enabled": true
+      },
+      "median": {
+        "weight": 0.40,
+        "direction": "positive",
+        "enabled": true
+      }
+    },
+    "Q": {
+      "std": {
+        "weight": 0.40,
+        "direction": "negative",
+        "enabled": true
+      },
+      "intensity_dps": {
+        "weight": 0.36,
+        "direction": "negative",
+        "enabled": true
+      },
+      "band_rms_dps": {
+        "weight": 0.24,
+        "direction": "negative",
+        "enabled": true
+      }
+    }
+  },
+  "blocks": {
+    "A": {
+      "name": "圆柱块",
+      "default_device_id": 1,
+      "category": "three_view",
+      "category_label": "三视图定位",
+      "allowed_holes": ["方孔", "圆孔"],
+      "provisional": true,
+      "provisional_note": "试行阈值待实测校准集标定",
+      "dimension_weights": { "T": 0.15, "P": 0.25, "V": 0.20, "Q": 0.25, "R": 0.15 },
+      "posture_weights": {
+        "angle": { "weight": 0.60, "direction": "negative", "enabled": true },
+        "rotation_count": { "weight": 0.20, "direction": "negative", "enabled": true },
+        "flip_count": { "weight": 0.20, "direction": "negative", "enabled": true }
+      },
+      "parameters": {
+        "moving_seconds": [2.0, 12.0],
+        "pause_total_seconds": [0.0, 12.0],
+        "pause_count": [0.0, 8.0],
+        "p05": [0.0, 0.05],
+        "max": [0.05, 0.40],
+        "mean": [0.02, 0.15],
+        "median": [0.02, 0.15],
+        "std": [0.02, 0.15],
+        "intensity_dps": [2.0, 20.0],
+        "band_rms_dps": [5.0, 30.0],
+        "angle": [90.0, 360.0],
+        "rotation_count": [0.0, 2.0],
+        "flip_count": [0.0, 2.0]
+      }
+    },
+    "B": {
+      "name": "四面尖块",
+      "default_device_id": 2,
+      "category": "three_view",
+      "category_label": "三视图定位",
+      "allowed_holes": ["方孔", "圆孔"],
+      "provisional": true,
+      "provisional_note": "试行阈值待实测校准集标定",
+      "dimension_weights": { "T": 0.15, "P": 0.25, "V": 0.20, "Q": 0.25, "R": 0.15 },
+      "posture_weights": {
+        "angle": { "weight": 0.60, "direction": "negative", "enabled": true },
+        "rotation_count": { "weight": 0.20, "direction": "negative", "enabled": true },
+        "flip_count": { "weight": 0.20, "direction": "negative", "enabled": true }
+      },
+      "parameters": {
+        "moving_seconds": [2.0, 12.0],
+        "pause_total_seconds": [0.0, 12.0],
+        "pause_count": [0.0, 8.0],
+        "p05": [0.0, 0.05],
+        "max": [0.05, 0.40],
+        "mean": [0.02, 0.15],
+        "median": [0.02, 0.15],
+        "std": [0.02, 0.15],
+        "intensity_dps": [2.0, 20.0],
+        "band_rms_dps": [5.0, 30.0],
+        "angle": [90.0, 360.0],
+        "rotation_count": [0.0, 2.0],
+        "flip_count": [0.0, 2.0]
+      }
+    },
+    "C": {
+      "name": "十字块",
+      "default_device_id": 3,
+      "category": "three_view",
+      "category_label": "三视图定位",
+      "allowed_holes": ["方孔", "圆孔", "十字孔"],
+      "provisional": true,
+      "provisional_note": "试行阈值待实测校准集标定",
+      "dimension_weights": { "T": 0.15, "P": 0.25, "V": 0.20, "Q": 0.25, "R": 0.15 },
+      "posture_weights": {
+        "angle": { "weight": 0.60, "direction": "negative", "enabled": true },
+        "rotation_count": { "weight": 0.20, "direction": "negative", "enabled": true },
+        "flip_count": { "weight": 0.20, "direction": "negative", "enabled": true }
+      },
+      "parameters": {
+        "moving_seconds": [2.0, 12.0],
+        "pause_total_seconds": [0.0, 12.0],
+        "pause_count": [0.0, 8.0],
+        "p05": [0.0, 0.05],
+        "max": [0.05, 0.40],
+        "mean": [0.02, 0.15],
+        "median": [0.02, 0.15],
+        "std": [0.02, 0.15],
+        "intensity_dps": [2.0, 20.0],
+        "band_rms_dps": [5.0, 30.0],
+        "angle": [90.0, 360.0],
+        "rotation_count": [0.0, 2.0],
+        "flip_count": [0.0, 2.0]
+      }
+    },
+    "D": {
+      "name": "扇锥块",
+      "default_device_id": 4,
+      "category": "three_view",
+      "category_label": "三视图定位",
+      "allowed_holes": ["方孔", "圆孔", "三角孔"],
+      "provisional": true,
+      "provisional_note": "试行阈值待实测校准集标定",
+      "dimension_weights": { "T": 0.15, "P": 0.25, "V": 0.20, "Q": 0.25, "R": 0.15 },
+      "posture_weights": {
+        "angle": { "weight": 0.60, "direction": "negative", "enabled": true },
+        "rotation_count": { "weight": 0.20, "direction": "negative", "enabled": true },
+        "flip_count": { "weight": 0.20, "direction": "negative", "enabled": true }
+      },
+      "parameters": {
+        "moving_seconds": [2.0, 12.0],
+        "pause_total_seconds": [0.0, 12.0],
+        "pause_count": [0.0, 8.0],
+        "p05": [0.0, 0.05],
+        "max": [0.05, 0.40],
+        "mean": [0.02, 0.15],
+        "median": [0.02, 0.15],
+        "std": [0.02, 0.15],
+        "intensity_dps": [2.0, 20.0],
+        "band_rms_dps": [5.0, 30.0],
+        "angle": [90.0, 360.0],
+        "rotation_count": [0.0, 2.0],
+        "flip_count": [0.0, 2.0]
+      }
+    },
+    "E": {
+      "name": "四翼块",
+      "default_device_id": 5,
+      "category": "three_view",
+      "category_label": "三视图定位",
+      "allowed_holes": ["方孔", "三角孔", "十字孔"],
+      "provisional": true,
+      "provisional_note": "试行阈值待实测校准集标定",
+      "dimension_weights": { "T": 0.15, "P": 0.25, "V": 0.20, "Q": 0.25, "R": 0.15 },
+      "posture_weights": {
+        "angle": { "weight": 0.60, "direction": "negative", "enabled": true },
+        "rotation_count": { "weight": 0.20, "direction": "negative", "enabled": true },
+        "flip_count": { "weight": 0.20, "direction": "negative", "enabled": true }
+      },
+      "parameters": {
+        "moving_seconds": [2.0, 12.0],
+        "pause_total_seconds": [0.0, 12.0],
+        "pause_count": [0.0, 8.0],
+        "p05": [0.0, 0.05],
+        "max": [0.05, 0.40],
+        "mean": [0.02, 0.15],
+        "median": [0.02, 0.15],
+        "std": [0.02, 0.15],
+        "intensity_dps": [2.0, 20.0],
+        "band_rms_dps": [5.0, 30.0],
+        "angle": [90.0, 360.0],
+        "rotation_count": [0.0, 2.0],
+        "flip_count": [0.0, 2.0]
+      }
+    },
+    "F": {
+      "name": "弧翼块",
+      "default_device_id": 6,
+      "category": "three_view",
+      "category_label": "三视图定位",
+      "allowed_holes": ["圆孔", "三角孔", "十字孔"],
+      "provisional": true,
+      "provisional_note": "试行阈值待实测校准集标定",
+      "dimension_weights": { "T": 0.15, "P": 0.25, "V": 0.20, "Q": 0.25, "R": 0.15 },
+      "posture_weights": {
+        "angle": { "weight": 0.60, "direction": "negative", "enabled": true },
+        "rotation_count": { "weight": 0.20, "direction": "negative", "enabled": true },
+        "flip_count": { "weight": 0.20, "direction": "negative", "enabled": true }
+      },
+      "parameters": {
+        "moving_seconds": [2.0, 12.0],
+        "pause_total_seconds": [0.0, 12.0],
+        "pause_count": [0.0, 8.0],
+        "p05": [0.0, 0.05],
+        "max": [0.05, 0.40],
+        "mean": [0.02, 0.15],
+        "median": [0.02, 0.15],
+        "std": [0.02, 0.15],
+        "intensity_dps": [2.0, 20.0],
+        "band_rms_dps": [5.0, 30.0],
+        "angle": [90.0, 360.0],
+        "rotation_count": [0.0, 2.0],
+        "flip_count": [0.0, 2.0]
+      }
+    },
+    "G": {
+      "name": "螺纹筒",
+      "default_device_id": 7,
+      "category": "rotation",
+      "category_label": "旋转",
+      "allowed_holes": ["专用圆孔"],
+      "provisional": true,
+      "provisional_note": "试行阈值待实测校准集标定",
+      "dimension_weights": { "T": 0.15, "P": 0.20, "V": 0.15, "Q": 0.20, "R": 0.30 },
+      "posture_weights": {
+        "angle": { "weight": 0.60, "direction": "target", "enabled": true },
+        "rotation_count": { "weight": 0.40, "direction": "target", "enabled": true }
+      },
+      "parameters": {
+        "moving_seconds": [10.0, 45.0],
+        "pause_total_seconds": [0.0, 25.0],
+        "pause_count": [0.0, 15.0],
+        "p05": [0.02, 0.25],
+        "max": [0.30, 3.0],
+        "mean": [0.10, 1.50],
+        "median": [0.10, 1.50],
+        "std": [0.10, 1.20],
+        "intensity_dps": [5.0, 25.0],
+        "band_rms_dps": [10.0, 70.0],
+        "angle": [1800.0, 3000.0, 1800.0],
+        "rotation_count": [2.0, 5.0, 3.0]
+      }
+    },
+    "H": {
+      "name": "弧槽块",
+      "default_device_id": 8,
+      "category": "tumble",
+      "category_label": "翻滚",
+      "allowed_holes": ["专用横向长方孔"],
+      "provisional": true,
+      "fallback_source": "rotation_tumble_provisional",
+      "provisional_note": "弧槽块尚无独立标定阈值，连续特征借用旋转/翻滚试行范围，姿态采用试行目标区间，待实测校准集替换",
+      "dimension_weights": { "T": 0.15, "P": 0.20, "V": 0.15, "Q": 0.20, "R": 0.30 },
+      "posture_weights": {
+        "angle": { "weight": 0.80, "direction": "target", "enabled": true },
+        "flip_count": { "weight": 0.20, "direction": "target", "enabled": true }
+      },
+      "parameters": {
+        "moving_seconds": [4.0, 30.0],
+        "pause_total_seconds": [0.0, 25.0],
+        "pause_count": [0.0, 15.0],
+        "p05": [0.02, 0.25],
+        "max": [0.15, 2.0],
+        "mean": [0.05, 1.0],
+        "median": [0.05, 1.0],
+        "std": [0.05, 0.80],
+        "intensity_dps": [5.0, 25.0],
+        "band_rms_dps": [10.0, 70.0],
+        "angle": [180.0, 900.0, 360.0],
+        "flip_count": [1.0, 4.0, 2.0]
+      }
+    },
+    "I": {
+      "name": "阶梯块",
+      "default_device_id": 9,
+      "category": "translation",
+      "category_label": "平移",
+      "allowed_holes": ["专用阶梯形孔"],
+      "provisional": true,
+      "provisional_note": "试行阈值待实测校准集标定",
+      "dimension_weights": { "T": 0.20, "P": 0.20, "V": 0.25, "Q": 0.25, "R": 0.10 },
+      "posture_weights": {
+        "angle": { "weight": 0.60, "direction": "negative", "enabled": true },
+        "rotation_count": { "weight": 0.20, "direction": "negative", "enabled": true },
+        "flip_count": { "weight": 0.20, "direction": "negative", "enabled": true }
+      },
+      "parameters": {
+        "moving_seconds": [1.0, 8.0],
+        "pause_total_seconds": [0.0, 12.0],
+        "pause_count": [0.0, 8.0],
+        "p05": [0.0, 0.05],
+        "max": [0.05, 0.40],
+        "mean": [0.02, 0.15],
+        "median": [0.02, 0.15],
+        "std": [0.02, 0.15],
+        "intensity_dps": [2.0, 20.0],
+        "band_rms_dps": [5.0, 30.0],
+        "angle": [20.0, 120.0],
+        "rotation_count": [0.0, 2.0],
+        "flip_count": [0.0, 2.0]
+      }
+    },
+    "J": {
+      "name": "多半圆块",
+      "default_device_id": 10,
+      "category": "multi_axis_rotation",
+      "category_label": "多向旋转",
+      "allowed_holes": ["专用多圆弧组合孔"],
+      "provisional": true,
+      "fallback_source": "G",
+      "provisional_note": "多半圆块暂借用螺纹筒试行参数，单轴与翻转次数不限制，待实测校准集独立标定替换",
+      "dimension_weights": { "T": 0.15, "P": 0.20, "V": 0.15, "Q": 0.20, "R": 0.30 },
+      "posture_weights": {
+        "angle": { "weight": 1.0, "direction": "target", "enabled": true }
+      },
+      "parameters": {
+        "moving_seconds": [10.0, 45.0],
+        "pause_total_seconds": [0.0, 25.0],
+        "pause_count": [0.0, 15.0],
+        "p05": [0.02, 0.25],
+        "max": [0.30, 3.0],
+        "mean": [0.10, 1.50],
+        "median": [0.10, 1.50],
+        "std": [0.10, 1.20],
+        "intensity_dps": [5.0, 25.0],
+        "band_rms_dps": [10.0, 70.0],
+        "angle": [1800.0, 3000.0, 1800.0]
+      }
+    }
+  },
+  "hole_overrides": {}
+}

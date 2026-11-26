@@ -155,6 +155,8 @@ export interface MovementDetail extends MovementRecord {
     pcInertial: PcInertialTrajectory
   }
   sessionTremorAverage: SessionTremorAverage
+  score?: number | null
+  scoreInvalidReason?: string | null
 }
 
 export interface MotionSnapshot {

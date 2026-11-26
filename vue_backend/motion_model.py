@@ -281,6 +281,9 @@ def _speed_statistics(records: list[dict[str, Any]]) -> dict[str, Any]:
         "p05_percentile": SPEED_PERCENTILE,
         "p05_sample_count": len(core_speeds),
         "p05_definition": "运动核心区间速度的5%分位数；排除首尾边界与静止样本",
+        "interpolated_indirect_effect": bool(
+            observed and len(observed) < len(records)
+        ),
     })
     return result
 
@@ -318,16 +321,28 @@ def _tremor_fft(records: list[dict[str, Any]]) -> dict[str, Any]:
     # Interpolated samples keep the inertial path causal but are not real
     # high-frequency measurements.  Analyze only the longest uninterrupted
     # observed subsegment so a long gap cannot create artificial FFT energy.
-    observed_segments: dict[int, list[dict[str, Any]]] = {}
+    observed_runs: list[list[dict[str, Any]]] = []
+    current_run: list[dict[str, Any]] = []
+    current_segment: int | None = None
     for row in records:
         if bool(row.get("interpolated", False)):
+            if current_run:
+                observed_runs.append(current_run)
+                current_run = []
+            current_segment = None
             continue
-        observed_segments.setdefault(
-            int(row.get("segment_index", 0)), []
-        ).append(row)
-    if observed_segments:
+        seg = int(row.get("segment_index", 0))
+        if current_segment is not None and seg != current_segment:
+            if current_run:
+                observed_runs.append(current_run)
+                current_run = []
+        current_segment = seg
+        current_run.append(row)
+    if current_run:
+        observed_runs.append(current_run)
+    if observed_runs:
         records = max(
-            observed_segments.values(),
+            observed_runs,
             key=lambda rows: (
                 sum(float(row.get("dt_s", 0.0)) for row in rows),
                 len(rows),
@@ -965,6 +980,12 @@ class MovementStats:
     observed_sample_count: int = 0
     interpolated_sample_count: int = 0
     gap_events: list[dict[str, Any]] = field(default_factory=list)
+    scoring_initial_state: dict[str, Any] | None = field(default=None, repr=False)
+    scoring_raw_samples: list[list[Any]] = field(default_factory=list, repr=False)
+    scoring_discontinuities: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    scoring_raw_truncated: bool = False
+    scoring_end_boundary_observed: bool = False
+    scoring_end_anchor: list[Any] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.flip_reference_up = list(self.start_up)
@@ -1728,6 +1749,20 @@ class MovementStats:
         # already-buffered samples at/after that transition so duration, FFT and
         # speed statistics describe exactly the recorded movement interval.
         if self.end_sequence is not None:
+            self.scoring_end_anchor = next(
+                (
+                    list(row)
+                    for row in self.scoring_raw_samples
+                    if int(row[0]) == self.end_sequence
+                ),
+                None,
+            )
+            self.scoring_end_boundary_observed = self.scoring_end_anchor is not None
+            self.scoring_raw_samples = [
+                row
+                for row in self.scoring_raw_samples
+                if not _sequence_at_or_after(int(row[0]), self.end_sequence)
+            ]
             while self.sample_records and _sequence_at_or_after(
                 int(self.sample_records[-1]["sequence"]), self.end_sequence
             ):
@@ -1800,6 +1835,34 @@ class MovementStats:
         self.live_speed_samples.clear()
         self.finalized = True
 
+    def scoring_input_snapshot(self, mode: str) -> dict[str, Any] | None:
+        if (
+            not self.finalized
+            or self.high_frequency_released
+            or self.scoring_initial_state is None
+        ):
+            return None
+        return {
+            "schema_version": 1,
+            "movement_id": self.movement_id,
+            "block_id": self.block_id,
+            "mapping_version": self.mapping_version,
+            "analysis_mode": mode,
+            "start_tick": self.start_tick,
+            "start_sequence": self.start_sequence,
+            "start_epoch": self.start_epoch,
+            "start_up": list(self.start_up),
+            "end_tick": self.end_tick,
+            "end_sequence": self.end_sequence,
+            "end_epoch": self.end_epoch,
+            "end_boundary_observed": self.scoring_end_boundary_observed,
+            "end_anchor": list(self.scoring_end_anchor) if self.scoring_end_anchor is not None else None,
+            "raw_truncated": self.scoring_raw_truncated or self.samples_truncated,
+            "initial_state": self.scoring_initial_state,
+            "discontinuities": list(self.scoring_discontinuities),
+            "raw_samples": list(self.scoring_raw_samples),
+        }
+
     def release_high_frequency_detail(self) -> bool:
         """Release archived sample payload while preserving every summary.
 
@@ -1815,6 +1878,10 @@ class MovementStats:
         self.calculated_path_final.clear()
         self.received_path_final.clear()
         self.live_speed_samples.clear()
+        self.scoring_initial_state = None
+        self.scoring_end_anchor = None
+        self.scoring_raw_samples.clear()
+        self.scoring_discontinuities.clear()
         self.high_frequency_released = True
         return True
 
@@ -2204,6 +2271,9 @@ class AnalysisPipeline:
     received_segment_offset: list[float] = field(
         default_factory=lambda: [0.0, 0.0, 0.0]
     )
+    pending_start_anchor_sample: list[Any] | None = field(
+        default=None, repr=False
+    )
 
     def __post_init__(self) -> None:
         if self.mode == ANALYSIS_MODE_PC and self.detector is None:
@@ -2248,6 +2318,41 @@ class AnalysisPipeline:
             start_sequence=start_sequence,
             start_epoch=start_epoch,
         )
+        if self.mode == ANALYSIS_MODE_PC and self.detector is not None:
+            anchor = (
+                list(self.pending_start_anchor_sample)
+                if (
+                    self.pending_start_anchor_sample is not None
+                    and int(self.pending_start_anchor_sample[0]) == start_sequence
+                )
+                else None
+            )
+            self.current_movement.scoring_initial_state = {
+                "sparse": False,
+                "start_anchor": anchor,
+                "estimator": {
+                    "quaternion": list(self.estimator.quaternion),
+                    "velocity": list(self.estimator.velocity),
+                    "position": list(self.estimator.position),
+                    "gyro_bias": list(self.estimator.gyro_bias),
+                    "accel_bias": list(self.estimator.accel_bias),
+                    "last_tick": self.estimator.last_tick,
+                    "initialized": bool(self.estimator.initialized),
+                    "stationary_samples": int(self.estimator.stationary_samples),
+                },
+                "detector": {
+                    "state": str(self.detector.state),
+                    "calibration_count": int(self.detector.calibration_count),
+                    "motion_count": int(self.detector.motion_count),
+                    "quiet_count": int(self.detector.quiet_count),
+                    "baseline_accel": (
+                        list(self.detector.baseline_accel)
+                        if self.detector.baseline_accel is not None
+                        else None
+                    ),
+                },
+            }
+        self.pending_start_anchor_sample = None
         self.motion_state = "移动中"
 
     def _translated_calculated_position(
@@ -2304,6 +2409,12 @@ class AnalysisPipeline:
                 event_epoch=event_epoch,
                 start_new_segment=True,
             )
+            movement.scoring_discontinuities.append({
+                "reason": reason,
+                "duration_seconds": duration_seconds,
+                "missing_samples": max(0, int(missing_samples)),
+                "event_epoch": event_epoch,
+            })
             # A gap may hide the end of a candidate event. Keep confirmed
             # totals, but discard all unconfirmed cross-gap state.
             movement._finish_shake_episode()
@@ -2336,6 +2447,7 @@ class AnalysisPipeline:
         self.received_origin = [0.0, 0.0, 0.0]
         self.received_origin_set = False
         self.last_coordinate_source_sequence = None
+        self.pending_start_anchor_sample = None
         if movement is not None:
             self.motion_state = "移动中"
         elif self.mode == ANALYSIS_MODE_PC:
@@ -2690,6 +2802,27 @@ class AnalysisPipeline:
                     sample.tick_32k,
                     sample.sequence,
                 )
+                if self.current_movement is None:
+                    if (
+                        decision.motion_candidate
+                        and not decision.started
+                        and decision.transition_sequence == sample.sequence
+                    ):
+                        self.pending_start_anchor_sample = [
+                            int(sample.sequence),
+                            int(sample.tick_32k),
+                            int(sample.accel_raw[0]),
+                            int(sample.accel_raw[1]),
+                            int(sample.accel_raw[2]),
+                            int(sample.gyro_raw[0]),
+                            int(sample.gyro_raw[1]),
+                            int(sample.gyro_raw[2]),
+                            float(sample_epoch),
+                            int(frame.session_id),
+                            str(frame.source),
+                        ]
+                    elif not decision.motion_candidate:
+                        self.pending_start_anchor_sample = None
 
             if (
                 decision.started
@@ -2785,6 +2918,25 @@ class AnalysisPipeline:
                         interpolated=sample.interpolated,
                         position_offset=self.calculated_segment_offset,
                     )
+                if movement.scoring_initial_state is not None:
+                    movement.scoring_initial_state["sparse"] = bool(sparse)
+                    if not sample.interpolated:
+                        if len(movement.scoring_raw_samples) < MAX_MOVEMENT_SAMPLES * 2:
+                            movement.scoring_raw_samples.append([
+                                int(sample.sequence),
+                                int(sample.tick_32k),
+                                int(sample.accel_raw[0]),
+                                int(sample.accel_raw[1]),
+                                int(sample.accel_raw[2]),
+                                int(sample.gyro_raw[0]),
+                                int(sample.gyro_raw[1]),
+                                int(sample.gyro_raw[2]),
+                                float(sample_epoch),
+                                int(frame.session_id),
+                                str(frame.source),
+                            ])
+                        else:
+                            movement.scoring_raw_truncated = True
                 movement.latest_tick = sample.tick_32k
                 movement.latest_epoch = sample_epoch
 
@@ -2939,6 +3091,12 @@ class AnalysisPipeline:
                 if export_format == "json":
                     return movement.export_json(session)
                 raise ValueError("不支持的导出格式")
+        return None
+
+    def movement_scoring_input(self, movement_id: int) -> dict[str, Any] | None:
+        for movement in self.completed_movements:
+            if movement.movement_id == movement_id:
+                return movement.scoring_input_snapshot(self.mode)
         return None
 
     def finalization_snapshot(self) -> dict[str, Any]:
@@ -3691,6 +3849,14 @@ class DeviceState:
             movement_id, export_format
         )
 
+    def movement_scoring_input(
+        self, movement_id: int, mode: str | None = None
+    ) -> dict[str, Any] | None:
+        selected_mode = mode or self.analysis_mode
+        if selected_mode not in ANALYSIS_MODES:
+            raise ValueError("未知分析模式")
+        return self.analyses[selected_mode].movement_scoring_input(movement_id)
+
     def mark_movement_archived(self, movement_id: int, mode: str) -> int:
         if mode not in ANALYSIS_MODES:
             raise ValueError("未知分析模式")
@@ -4125,3 +4291,447 @@ class MotionStore:
                 received_after,
                 calculated_after,
             )
+
+    def movement_scoring_input(
+        self,
+        device_id: int,
+        movement_id: int,
+        mode: str | None = None,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            self._drain_finalizations_locked()
+            state = self._devices.get(device_id)
+            if state is None:
+                return None
+            return state.movement_scoring_input(movement_id, mode)
+
+
+class ScoringReplayError(ValueError):
+    """Raised when formal scoring-only replay fails a V1.4 quality condition."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        quality: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.quality = quality
+
+
+def _unpack_scoring_raw_row(row: list[Any]) -> dict[str, Any]:
+    return {
+        "sequence": int(row[0]),
+        "tick_32k": int(row[1]),
+        "accel_raw": (int(row[2]), int(row[3]), int(row[4])),
+        "gyro_raw": (int(row[5]), int(row[6]), int(row[7])),
+        "epoch": float(row[8]),
+        "session_id": int(row[9]),
+        "source": str(row[10]),
+    }
+
+
+def replay_pc_movement_for_scoring(
+    scoring_input: dict[str, Any],
+    original_detail: dict[str, Any],
+    *,
+    threshold_ratio: float = 0.10,
+    required_analysis_mode: str | None = "pc",
+    nominal_sample_period_seconds: float = NOMINAL_SAMPLE_PERIOD_SECONDS,
+    clock_tolerance_min_seconds: float = 0.03,
+    clock_tolerance_ratio: float = 0.02,
+    max_continuous_gap_seconds: float | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """Validate raw sample continuity and replay a scoring-only copy when 0 < r < lambda.
+
+    Original archive files, original features, and original exports are never modified.
+    """
+    from copy import deepcopy
+
+    actual_mode = str(
+        scoring_input.get("analysis_mode")
+        or original_detail.get("analysis_mode")
+        or "pc"
+    )
+    if required_analysis_mode and actual_mode != required_analysis_mode:
+        raise ScoringReplayError(
+            "unsupported_analysis_mode",
+            f"仅支持 {required_analysis_mode} 独立判定模式评分，当前为 {actual_mode}",
+        )
+    if (
+        original_detail.get("state") != "已完成"
+        or bool(original_detail.get("samples_truncated"))
+        or bool(scoring_input.get("raw_truncated"))
+    ):
+        raise ScoringReplayError(
+            "incomplete_archive",
+            "移动原始样本不完整或超过缓存上限被截断",
+        )
+
+    recoverable_reasons = {"host_arrival_gap", "sample_gap", "sample_time_gap"}
+    for disc in scoring_input.get("discontinuities", []):
+        reason = str(disc.get("reason") or "")
+        if reason not in recoverable_reasons:
+            raise ScoringReplayError(
+                "session_discontinuity",
+                f"移动期间发生不可恢复的会话或传输中断：{reason}",
+            )
+
+    initial = scoring_input.get("initial_state")
+    raw_rows = scoring_input.get("raw_samples") or []
+    if not isinstance(initial, dict) or not raw_rows:
+        raise ScoringReplayError("missing_replay_state", "缺少评分重放所需的起始状态或原始样本")
+
+    span_samples = [_unpack_scoring_raw_row(row) for row in raw_rows]
+    anchor_raw = initial.get("start_anchor")
+    anchor = _unpack_scoring_raw_row(anchor_raw) if isinstance(anchor_raw, list) else None
+    end_anchor_raw = scoring_input.get("end_anchor")
+    end_anchor = (
+        _unpack_scoring_raw_row(end_anchor_raw)
+        if isinstance(end_anchor_raw, list)
+        else None
+    )
+
+    start_seq = int(scoring_input.get("start_sequence", span_samples[0]["sequence"]))
+    end_seq = scoring_input.get("end_sequence")
+    end_boundary_observed = bool(scoring_input.get("end_boundary_observed", False))
+
+    if anchor is not None:
+        if anchor["sequence"] != start_seq:
+            raise ScoringReplayError("missing_gap_boundary", "起始锚点样本序号不匹配，缺少有效起始边界")
+        chain = [anchor, *span_samples]
+    else:
+        if span_samples[0]["sequence"] != start_seq:
+            raise ScoringReplayError("missing_gap_boundary", "移动起始边界存在采样缺失，无有效起始端点")
+        chain = list(span_samples)
+
+    feed_samples = list(span_samples)
+    if end_seq is not None:
+        end_seq_int = int(end_seq)
+        if end_anchor is not None and end_anchor["sequence"] == end_seq_int:
+            chain.append(end_anchor)
+            feed_samples.append(end_anchor)
+        elif not end_boundary_observed or ((end_seq_int - chain[-1]["sequence"]) & UINT32_MASK) != 1:
+            raise ScoringReplayError("missing_gap_boundary", "移动结束确认边界存在采样缺失，无有效结束端点")
+
+    gaps_by_span_index: dict[int, tuple[int, int]] = {}
+    audit: list[dict[str, Any]] = []
+    offset_in_span = -1 if anchor is not None else 0
+    for pair_idx, (prev_s, curr_s) in enumerate(zip(chain, chain[1:])):
+        if prev_s["session_id"] != curr_s["session_id"] or prev_s["source"] != curr_s["source"]:
+            raise ScoringReplayError("session_discontinuity", "移动期间发生设备会话重启或协议格式切换")
+        delta_seq = (curr_s["sequence"] - prev_s["sequence"]) & UINT32_MASK
+        ticks = (curr_s["tick_32k"] - prev_s["tick_32k"]) & UINT32_MASK
+        seconds = ticks / TICK_HZ
+        tolerance = max(clock_tolerance_min_seconds, clock_tolerance_ratio * seconds)
+        if not 0 < delta_seq < 0x80000000 or abs(seconds - nominal_sample_period_seconds * delta_seq) > tolerance:
+            raise ScoringReplayError(
+                "inconsistent_sample_clock",
+                "相邻真实样本序号跨度与 32.768 kHz 采样时钟不一致（疑似设备重启或时钟异常）",
+            )
+        if delta_seq > 1:
+            missing_n = delta_seq - 1
+            if (
+                max_continuous_gap_seconds is not None
+                and missing_n * nominal_sample_period_seconds > float(max_continuous_gap_seconds) + 1e-6
+            ):
+                raise ScoringReplayError(
+                    "continuous_gap_too_long",
+                    f"单次连续缺口过长（{missing_n * nominal_sample_period_seconds:.2f}s）",
+                )
+            target_span_idx = pair_idx + 1 + offset_in_span
+            gaps_by_span_index[target_span_idx] = (missing_n, ticks)
+            audit.append({
+                "sequence_before": prev_s["sequence"],
+                "sequence_after": curr_s["sequence"],
+                "missing_samples": missing_n,
+                "device_span_seconds": seconds,
+            })
+
+    if end_seq is not None and end_anchor is not None and chain[-1] is end_anchor:
+        expected_frames = (end_anchor["sequence"] - chain[0]["sequence"]) & UINT32_MASK
+        observed_span_samples = len(chain) - 1
+    else:
+        expected_frames = ((chain[-1]["sequence"] - chain[0]["sequence"]) & UINT32_MASK) + 1
+        observed_span_samples = len(chain)
+    if expected_frames <= 0:
+        raise ScoringReplayError("invalid_duration", "移动连续采样序号跨度无效")
+    missing_frames = sum(n for n, _ in gaps_by_span_index.values())
+    ratio = missing_frames / expected_frames
+
+    quality: dict[str, Any] = {
+        "mode": "formal_pipeline_replay",
+        "expected_frames": expected_frames,
+        "observed_span_samples": observed_span_samples,
+        "previous_interpolated_frames": 0,
+        "new_interpolated_frames": missing_frames,
+        "missing_frames_total": missing_frames,
+        "missing_ratio": ratio,
+        "threshold_ratio": threshold_ratio,
+        "gap_events": audit,
+        "velocity_indirect_interpolation_impact": bool(missing_frames > 0),
+        "status": "repaired" if missing_frames > 0 else "observed",
+    }
+    if missing_frames > 0 and ratio >= threshold_ratio:
+        raise ScoringReplayError(
+            "missing_ratio_exceeded",
+            f"缺失帧比例 {ratio * 100:.2f}% 达到或超过阈值 {threshold_ratio * 100:.1f}%",
+            quality={**quality, "status": "invalid"},
+        )
+
+    had_live_discontinuity = (
+        int(original_detail.get("gap_count") or 0) > 0
+        or int(original_detail.get("interpolated_sample_count") or 0) > 0
+        or bool(scoring_input.get("discontinuities"))
+    )
+    if missing_frames == 0 and not had_live_discontinuity:
+        return deepcopy(original_detail), quality, []
+
+    est_init = initial["estimator"]
+    det_init = initial["detector"]
+    sparse = bool(initial.get("sparse", False))
+    estimator = InertialEstimator(
+        quaternion=list(est_init["quaternion"]),
+        velocity=list(est_init["velocity"]),
+        position=list(est_init["position"]),
+        gyro_bias=list(est_init["gyro_bias"]),
+        accel_bias=list(est_init["accel_bias"]),
+        last_tick=est_init["last_tick"],
+        initialized=bool(est_init["initialized"]),
+        stationary_samples=int(est_init["stationary_samples"]),
+    )
+    detector = PcMotionDetector(
+        state=str(det_init["state"]),
+        calibration_count=int(det_init["calibration_count"]),
+        motion_count=int(det_init["motion_count"]),
+        quiet_count=int(det_init["quiet_count"]),
+        baseline_accel=(
+            list(det_init["baseline_accel"])
+            if det_init.get("baseline_accel") is not None
+            else None
+        ),
+    )
+    replayed = MovementStats(
+        movement_id=int(scoring_input["movement_id"]),
+        start_tick=int(scoring_input["start_tick"]),
+        start_up=list(scoring_input["start_up"]),
+        block_id=str(scoring_input.get("block_id") or original_detail.get("block_id") or ""),
+        mapping_version=str(scoring_input.get("mapping_version") or original_detail.get("mapping_version") or ""),
+        start_sequence=start_seq,
+        start_epoch=scoring_input.get("start_epoch"),
+    )
+    calculated_path: list[list[float]] = [[0.0, 0.0, 0.0]]
+    synthetic_records: list[dict[str, Any]] = []
+
+    def _feed_one(
+        imu_sample: ImuSample,
+        sample_epoch: float,
+        override_measurements: tuple[list[float], list[float]] | None = None,
+    ) -> None:
+        measurements = (
+            override_measurements
+            if override_measurements is not None
+            else InertialEstimator.measurements(imu_sample)
+        )
+        if imu_sample.interpolated:
+            if (
+                replayed.pending_stop_tick is not None
+                and _tick_seconds(imu_sample.tick_32k, replayed.pending_stop_tick) + 1e-9
+                < PAUSE_MIN_SECONDS
+            ):
+                replayed.pending_stop_tick = None
+                replayed.pending_stop_sequence = None
+                replayed.pending_stop_epoch = None
+                detector.state = "moving"
+                detector.quiet_count = 0
+                detector.quiet_candidate_tick = None
+                detector.quiet_candidate_sequence = None
+            decision = MotionDecision(
+                detector.state,
+                stationary_hint=detector.state == "stationary",
+            )
+        else:
+            decision = detector.update(
+                measurements[0],
+                measurements[1],
+                imu_sample.tick_32k,
+                imu_sample.sequence,
+            )
+            if decision.started and replayed.pending_stop_tick is not None:
+                resume_tick = (
+                    decision.transition_tick
+                    if decision.transition_tick is not None
+                    else imu_sample.tick_32k
+                )
+                resume_epoch = sample_epoch - _tick_seconds(imu_sample.tick_32k, resume_tick)
+                replayed.add_pause(
+                    replayed.pending_stop_tick,
+                    resume_tick,
+                    replayed.pending_stop_epoch,
+                    resume_epoch,
+                )
+                replayed.pending_stop_tick = None
+                replayed.pending_stop_sequence = None
+                replayed.pending_stop_epoch = None
+
+            if decision.stopped:
+                stop_tick = (
+                    decision.transition_tick
+                    if decision.transition_tick is not None
+                    else imu_sample.tick_32k
+                )
+                stop_seq = (
+                    decision.transition_sequence
+                    if decision.transition_sequence is not None
+                    else imu_sample.sequence
+                )
+                stop_epoch = sample_epoch - _tick_seconds(imu_sample.tick_32k, stop_tick)
+                if replayed.pending_stop_tick is None:
+                    replayed.pending_stop_tick = stop_tick
+                    replayed.pending_stop_sequence = stop_seq
+                    replayed.pending_stop_epoch = stop_epoch
+            elif (
+                decision.state == "stationary"
+                and not decision.motion_candidate
+                and replayed.pending_stop_tick is None
+            ):
+                replayed.pending_stop_tick = imu_sample.tick_32k
+                replayed.pending_stop_sequence = imu_sample.sequence
+                replayed.pending_stop_epoch = sample_epoch
+
+        estimate = estimator.update(
+            imu_sample,
+            sparse_diagnostic=sparse,
+            stationary_hint=decision.stationary_hint,
+            measurements=measurements,
+        )
+        if replayed.pending_stop_tick is None and not decision.quiet_candidate:
+            calculated_path.append(list(estimate.position))
+        if not estimate.stationary:
+            replayed.add_sample(
+                estimate,
+                imu_sample.tick_32k,
+                imu_sample.sequence,
+                sample_epoch,
+                interpolated=imu_sample.interpolated,
+            )
+        replayed.latest_tick = imu_sample.tick_32k
+        replayed.latest_epoch = sample_epoch
+
+    for idx, s_dict in enumerate(feed_samples):
+        if idx in gaps_by_span_index:
+            missing_n, ticks = gaps_by_span_index[idx]
+            prev_s = feed_samples[idx - 1] if idx > 0 else anchor
+            assert prev_s is not None
+            prev_imu = ImuSample(
+                sequence=prev_s["sequence"],
+                tick_32k=prev_s["tick_32k"],
+                accel_raw=prev_s["accel_raw"],
+                gyro_raw=prev_s["gyro_raw"],
+            )
+            curr_imu = ImuSample(
+                sequence=s_dict["sequence"],
+                tick_32k=s_dict["tick_32k"],
+                accel_raw=s_dict["accel_raw"],
+                gyro_raw=s_dict["gyro_raw"],
+            )
+            prev_meas = InertialEstimator.measurements(prev_imu)
+            curr_meas = InertialEstimator.measurements(curr_imu)
+            replayed.record_gap(
+                reason="sample_gap",
+                duration_seconds=max(0.0, ticks / TICK_HZ - nominal_sample_period_seconds),
+                missing_samples=missing_n,
+                interpolated=True,
+                event_epoch=s_dict["epoch"],
+                start_new_segment=False,
+            )
+            dt_bridge = ticks / TICK_HZ / (missing_n + 1)
+            for step in range(1, missing_n + 1):
+                frac = step / (missing_n + 1)
+                syn_seq = (prev_s["sequence"] + step) & UINT32_MASK
+                syn_tick = (prev_s["tick_32k"] + round(ticks * frac)) & UINT32_MASK
+                syn_epoch = prev_s["epoch"] + (s_dict["epoch"] - prev_s["epoch"]) * frac
+                syn_accel_raw = tuple(
+                    round(prev_s["accel_raw"][axis] + frac * (s_dict["accel_raw"][axis] - prev_s["accel_raw"][axis]))
+                    for axis in range(3)
+                )
+                syn_gyro_raw = tuple(
+                    round(prev_s["gyro_raw"][axis] + frac * (s_dict["gyro_raw"][axis] - prev_s["gyro_raw"][axis]))
+                    for axis in range(3)
+                )
+                lerp_accel = [
+                    prev_meas[0][axis] + frac * (curr_meas[0][axis] - prev_meas[0][axis])
+                    for axis in range(3)
+                ]
+                lerp_gyro = [
+                    prev_meas[1][axis] + frac * (curr_meas[1][axis] - prev_meas[1][axis])
+                    for axis in range(3)
+                ]
+                syn_imu = ImuSample(
+                    sequence=syn_seq,
+                    tick_32k=syn_tick,
+                    accel_raw=syn_accel_raw,
+                    gyro_raw=syn_gyro_raw,
+                    interpolated=True,
+                )
+                _feed_one(syn_imu, syn_epoch, (lerp_accel, lerp_gyro))
+                synthetic_records.append({
+                    "sequence": syn_seq,
+                    "tick_32k": syn_tick,
+                    "dt_s": dt_bridge,
+                    "interpolated": True,
+                    "accel_mps2": lerp_accel,
+                    "gyro_dps": lerp_gyro,
+                    "motion_state_assumption": detector.state,
+                    "source": "scoring_only_pipeline_replay",
+                })
+
+        real_imu = ImuSample(
+            sequence=s_dict["sequence"],
+            tick_32k=s_dict["tick_32k"],
+            accel_raw=s_dict["accel_raw"],
+            gyro_raw=s_dict["gyro_raw"],
+            interpolated=False,
+        )
+        _feed_one(real_imu, s_dict["epoch"])
+
+    replayed.end_tick = (
+        int(scoring_input["end_tick"])
+        if scoring_input.get("end_tick") is not None
+        else replayed.latest_tick
+    )
+    replayed.end_sequence = (
+        int(end_seq) if end_seq is not None else replayed.start_sequence
+    )
+    replayed.end_epoch = (
+        float(scoring_input["end_epoch"])
+        if scoring_input.get("end_epoch") is not None
+        else replayed.latest_epoch
+    )
+    replayed.finalize(
+        apply_rest_correction=True,
+        calculated_path=calculated_path,
+        received_path=[],
+    )
+    replayed_detail = replayed.detail_snapshot("已完成")
+    replayed_detail["analysis_mode"] = actual_mode
+    if "device_id" in original_detail:
+        replayed_detail["device_id"] = original_detail["device_id"]
+
+    if not bool(replayed_detail.get("tremor", {}).get("valid")):
+        reason = str(replayed_detail.get("tremor", {}).get("reason") or "FFT 震颤特征不可用")
+        raise ScoringReplayError(
+            "tremor_unavailable_after_repair",
+            f"评分副本重放后连续真实样本不足以提取有效震颤特征：{reason}",
+            quality={**quality, "status": "invalid"},
+        )
+    if int(replayed_detail.get("speed", {}).get("p05_sample_count") or 0) <= 0:
+        raise ScoringReplayError(
+            "speed_p05_unavailable_after_repair",
+            "评分副本重放后有效核心速度样本不足",
+            quality={**quality, "status": "invalid"},
+        )
+    return replayed_detail, quality, synthetic_records

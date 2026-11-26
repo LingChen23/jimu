@@ -23,6 +23,15 @@ function selected(reference: TaskMovementReference): boolean {
     && props.selected?.movementId === reference.movementId
     && props.selected?.analysisMode === reference.analysisMode
 }
+
+function movementButtonLabel(reference: TaskMovementReference, index: number): string {
+  const order = `第 ${reference.deviceMovementIndex ?? index + 1} 次`
+  if (reference.score !== null && reference.score !== undefined && Number.isFinite(reference.score)) {
+    const scoreText = Number.isInteger(reference.score) ? String(reference.score) : reference.score.toFixed(2)
+    return `${order} · ${scoreText}分`
+  }
+  return order
+}
 </script>
 
 <template>
@@ -44,7 +53,7 @@ function selected(reference: TaskMovementReference): boolean {
             type="button"
             :class="{ active: selected(reference) }"
             @click="emit('select', reference)"
-          >第 {{ reference.deviceMovementIndex ?? index + 1 }} 次</button>
+          >{{ movementButtonLabel(reference, index) }}</button>
         </div>
         <span v-else class="empty">本次任务未移动</span>
       </article>

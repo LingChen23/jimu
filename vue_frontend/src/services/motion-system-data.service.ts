@@ -275,6 +275,8 @@ export function taskSummary(raw: JsonObject): TaskSummary {
       deviceMovementIndex: reference.device_movement_index ? number(reference.device_movement_index) : undefined,
       score: nullableNumber(reference.score),
       scoreModelVersion: reference.score_model_version ? String(reference.score_model_version) : null,
+      scoreQualityStatus: reference.score_quality_status ? String(reference.score_quality_status) : null,
+      scoreInvalidReason: reference.score_invalid_reason ? String(reference.score_invalid_reason) : null,
     })) : [],
   }
 }
@@ -735,6 +737,8 @@ export class MotionSystemDataService implements MotionDataService {
           : trajectoryWithSpeed(raw.calculated_path, raw.speed_series),
       },
       sessionTremorAverage: sessionTremor(raw.session_tremor_average),
+      score: nullableNumber(raw.v14_score?.score_display ?? raw.v14_score?.score),
+      scoreInvalidReason: raw.v14_score?.invalid_reason ? String(raw.v14_score.invalid_reason) : null,
     }
   }
 
@@ -910,6 +914,8 @@ export class MotionSystemDataService implements MotionDataService {
       deviceMovementIndex: raw.movement_reference.device_movement_index ? number(raw.movement_reference.device_movement_index) : undefined,
       score: nullableNumber(raw.movement_reference.score),
       scoreModelVersion: raw.movement_reference.score_model_version ? String(raw.movement_reference.score_model_version) : null,
+      scoreQualityStatus: raw.movement_reference.score_quality_status ? String(raw.movement_reference.score_quality_status) : null,
+      scoreInvalidReason: raw.movement_reference.score_invalid_reason ? String(raw.movement_reference.score_invalid_reason) : null,
     } : null
     const rawScore = raw.score ?? {}
     return {
@@ -923,6 +929,8 @@ export class MotionSystemDataService implements MotionDataService {
         modelVersion: rawScore.model_version ? String(rawScore.model_version) : null,
         explanation: Array.isArray(rawScore.explanation) ? rawScore.explanation.map(String) : [],
         demoOnly: Boolean(rawScore.demo_only),
+        partial: Boolean(rawScore.partial),
+        completeness: rawScore.completeness ? String(rawScore.completeness) : undefined,
       },
       statistics: emptyStatistics(),
       acceleration: [],

@@ -44,6 +44,8 @@ export interface TaskMovementReference {
   deviceMovementIndex?: number
   score?: number | null
   scoreModelVersion?: string | null
+  scoreQualityStatus?: string | null
+  scoreInvalidReason?: string | null
 }
 
 export interface TaskBlockBinding {
@@ -80,6 +82,8 @@ export interface TaskResult {
     modelVersion: string | null
     explanation: string[]
     demoOnly: boolean
+    partial?: boolean
+    completeness?: string
   }
   statistics: MotionStatistics
   acceleration: AxisPoint[]

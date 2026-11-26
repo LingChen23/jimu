@@ -30,6 +30,11 @@ const movedBlockCount = computed(() => new Set(movements.value.map((item) => ite
 function formatSeconds(value: number): string {
   return `${value.toFixed(1)} 秒`
 }
+
+function formatScore(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—'
+  return Number.isInteger(value) ? String(value) : value.toFixed(2)
+}
 </script>
 
 <template>
@@ -57,7 +62,7 @@ function formatSeconds(value: number): string {
         <div class="result-overview">
           <article class="score-card">
             <span>本次采集评分</span>
-            <div v-if="result.totalScore !== null"><strong>{{ result.totalScore }}</strong><small>分</small></div>
+            <div v-if="result.totalScore !== null"><strong>{{ formatScore(result.totalScore) }}</strong><small>分</small></div>
             <b v-else>暂无评分</b>
           </article>
           <article><span>完整移动</span><b>{{ movements.length }} 次</b></article>

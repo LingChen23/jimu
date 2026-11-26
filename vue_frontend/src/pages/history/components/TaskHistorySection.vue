@@ -116,6 +116,10 @@ function exportSelected(): void {
     .map((task) => task.taskId))
 }
 
+function formatScore(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—'
+  return Number.isInteger(value) ? String(value) : value.toFixed(2)
+}
 function taskStatus(value: TaskSummary['status']): string {
   return ({ collecting: '采集中', completed: '已完成', abnormal: '待复核', cancelled: '已取消' })[value]
 }
@@ -201,7 +205,7 @@ function movedBlocks(task: TaskSummary): string {
             <td>{{ task.durationSeconds === null ? '—' : `${task.durationSeconds}秒` }}</td>
             <td>{{ movedBlocks(task) }}</td>
             <td>{{ task.movementReferences?.length ?? 0 }}次</td>
-            <td><b>{{ task.totalScore ?? '—' }}</b></td>
+            <td><b>{{ formatScore(task.totalScore) }}</b></td>
             <td><StatusBadge :tone="task.status === 'completed' ? 'green' : 'gray'" :text="taskStatus(task.status)" /></td>
             <td><template v-if="cloudStatus(task)"><StatusBadge :tone="cloudStatusTone(cloudStatus(task)!.status)" :text="cloudStatusText(cloudStatus(task)!.status)" /><small v-if="cloudStatus(task)!.status === 'failed'" class="cloud-error">{{ cloudError(cloudStatus(task)!.errorCode) }}</small></template><span v-else>—</span></td>
             <td><div class="row-actions">

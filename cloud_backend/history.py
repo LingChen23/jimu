@@ -76,11 +76,32 @@ class History:
         task = manifest['task']
         references = task.get('movement_references', manifest.get('movements', []))
         score = task.get('total_score')
-        return dict(task=task, movement_reference=references[-1] if references else None,
-            score=dict(total_score=score, score_status='completed' if score is not None else 'pending',
-                model_version=task.get('score_model_version') if score is not None else None,
+        summary = task.get('score_summary')
+        if isinstance(summary, dict):
+            score_payload = {
+                **deepcopy(summary),
+                'total_score': score,
+                'score_status': str(summary.get('score_status') or ('completed' if score is not None else 'pending')),
+                'model_version': task.get('score_model_version') or summary.get('model_version'),
+                'explanation': list(summary.get('explanation') or []),
+                'demo_only': bool(summary.get('demo_only', False)),
+            }
+        else:
+            version = task.get('score_model_version')
+            demo_only = version in (None, 'temporary-random-task-v2', 'custom-score-provider')
+            score_payload = dict(
+                total_score=score,
+                score_status='completed' if score is not None else 'pending',
+                model_version=version if score is not None else None,
                 explanation=[f'评分基于本次任务中 {len(references)} 次完整移动，在任务结束后统一生成。']
-                    if score is not None else ['尚未检测到本任务中的完整移动。'], demo_only=True))
+                if score is not None else ['尚未检测到本任务中的完整移动。'],
+                demo_only=demo_only,
+            )
+        return dict(
+            task=task,
+            movement_reference=references[-1] if references else None,
+            score=score_payload,
+        )
 
     def member(self, task_id, device_id, movement_id, analysis_mode, filename):
         row, manifest = self.manifest(task_id)

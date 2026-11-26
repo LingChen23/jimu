@@ -16,10 +16,12 @@ import zipfile
 from typing import Any, Callable
 
 from data_repository import DataRepository, normalize_participant_profile
+from scoring_engine import ScoringConfig, evaluate_movement, evaluate_task
 
 
 class TaskService:
     TEMPORARY_SCORE_MODEL_VERSION = "temporary-random-task-v2"
+    CUSTOM_SCORE_MODEL_VERSION = "custom-score-provider"
     MAX_BATCH_EXPORT_TASKS = 50
 
     def __init__(
@@ -33,6 +35,7 @@ class TaskService:
         require_participant_profile: bool = False,
         movement_archived_callback: Callable[[int, int, str], Any] | None = None,
         diagnostic_sink: Callable[..., None] | None = None,
+        scoring_config_path: str | Path | None = None,
     ) -> None:
         self._path = Path(path)
         self._snapshot_provider = snapshot_provider
@@ -46,7 +49,9 @@ class TaskService:
             legacy_task_path=self._path,
         )
         self._device_ids = tuple(sorted({int(device_id) for device_id in device_ids}))
+        self._custom_score_provider = score_provider
         self._score_provider = score_provider or (lambda: 60 + secrets.randbelow(36))
+        self._scoring_config = ScoringConfig.from_file(scoring_config_path)
         self._require_participant_profile = bool(require_participant_profile)
         self._movement_archived_callback = movement_archived_callback
         self._diagnostic_sink = diagnostic_sink
@@ -79,34 +84,211 @@ class TaskService:
             references = task.get("movement_references", [])
             if not isinstance(references, list):
                 continue
-            for reference in references:
-                if "score" in reference:
-                    reference.pop("score", None)
+            status = task.get("status")
+            if status == "collecting":
+                for reference in references:
+                    for field in ("score", "score_raw", "score_model_version", "score_quality_status", "score_invalid_reason"):
+                        if field in reference:
+                            reference.pop(field, None)
+                            changed = True
+                if task.get("total_score") is not None or "score_summary" in task:
+                    task["total_score"] = None
+                    task.pop("score_model_version", None)
+                    task.pop("score_summary", None)
                     changed = True
-                if "score_model_version" in reference:
-                    reference.pop("score_model_version", None)
+                continue
+
+            if self._custom_score_provider is not None:
+                for reference in references:
+                    if "score" in reference:
+                        reference.pop("score", None)
+                        changed = True
+                    if "score_model_version" in reference:
+                        reference.pop("score_model_version", None)
+                        changed = True
+                if status == "completed" and references and task.get("total_score") is None:
+                    task["total_score"] = self._new_task_score(str(task.get("task_id", "")))
+                    task["score_model_version"] = self.CUSTOM_SCORE_MODEL_VERSION
                     changed = True
-            if task.get("status") == "collecting" and task.get("total_score") is not None:
-                task["total_score"] = None
-                task.pop("score_model_version", None)
-                changed = True
-            elif (
-                task.get("status") == "completed"
-                and references
-                and task.get("total_score") is None
-            ):
-                task["total_score"] = self._new_task_score(str(task.get("task_id", "")))
-                task["score_model_version"] = self.TEMPORARY_SCORE_MODEL_VERSION
-                changed = True
-            elif (
-                task.get("status") == "completed"
-                and task.get("total_score") is not None
-                and task.get("score_model_version") != self.TEMPORARY_SCORE_MODEL_VERSION
-            ):
-                task["score_model_version"] = self.TEMPORARY_SCORE_MODEL_VERSION
+                continue
+
+            version = task.get("score_model_version")
+            needs_v14_rescore = (
+                status == "completed"
+                and version != self.CUSTOM_SCORE_MODEL_VERSION
+                and (
+                    version == self.TEMPORARY_SCORE_MODEL_VERSION
+                    or (
+                        references
+                        and task.get("score_summary") is None
+                        and task.get("total_score") is None
+                    )
+                )
+            )
+            if needs_v14_rescore:
+                self._apply_v14_task_score(
+                    task,
+                    references,
+                    task.get("movement_files", {}),
+                )
                 changed = True
         if changed:
             self._save_locked()
+
+    def scoring_config_snapshot(self) -> dict[str, Any]:
+        return {
+            "scoring_version": self._scoring_config.scoring_version,
+            "weights_version": self._scoring_config.weights_version,
+            "calibration_version": self._scoring_config.calibration_version,
+            "model_version": self._scoring_config.model_version,
+            "calibrated": self._scoring_config.calibrated,
+            "provisional": self._scoring_config.provisional,
+            "missing_ratio_threshold": self._scoring_config.missing_ratio_threshold,
+            "drop_penalty": deepcopy(self._scoring_config.drop_penalty),
+            "score_scaling": deepcopy(self._scoring_config.score_scaling),
+            "intra_group_weights": deepcopy(self._scoring_config.intra_group_weights),
+            "blocks": deepcopy(self._scoring_config.blocks),
+        }
+
+    def score_live_movement(
+        self,
+        device_id: int,
+        movement_id: int,
+        analysis_mode: str | None,
+        detail: dict[str, Any],
+    ) -> dict[str, Any]:
+        mode = str(analysis_mode or detail.get("analysis_mode") or "pc")
+        scoring_input = self._live_movement_scoring_input(device_id, movement_id, mode)
+        samples_rows: list[dict[str, Any]] | None = None
+        if scoring_input is None:
+            exported = self._live_movement_export(device_id, movement_id, "json", mode)
+            if exported is not None:
+                try:
+                    parsed = json.loads(exported)
+                    if isinstance(parsed, dict) and isinstance(parsed.get("samples"), list):
+                        samples_rows = parsed["samples"]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    samples_rows = None
+        return evaluate_movement(
+            detail,
+            self._scoring_config,
+            samples_rows=samples_rows,
+            scoring_input=scoring_input,
+        )
+
+    def _evaluate_task_v14(
+        self,
+        task: dict[str, Any],
+        references: list[dict[str, Any]],
+        movement_files: dict[str, dict[str, str]],
+    ) -> dict[str, Any]:
+        bindings = {
+            int(item["device_id"]): str(item["block_id"])
+            for item in task.get("block_bindings", [])
+            if isinstance(item, dict)
+            and "device_id" in item
+            and "block_id" in item
+        }
+        movements_input: list[dict[str, Any]] = []
+        for index, reference in enumerate(references, start=1):
+            if "task_movement_index" not in reference:
+                reference["task_movement_index"] = index
+            key = self._movement_key(reference)
+            files = movement_files.get(key, {}) if isinstance(movement_files, dict) else {}
+
+            detail: dict[str, Any] | None = None
+            detail_raw = self._read_movement_file(files.get("detail"))
+            if detail_raw is not None:
+                try:
+                    parsed_detail = json.loads(detail_raw)
+                    if isinstance(parsed_detail, dict):
+                        detail = parsed_detail
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    detail = None
+
+            scoring_input: dict[str, Any] | None = None
+            scoring_raw = self._read_movement_file(files.get("scoring_input"))
+            if scoring_raw is not None:
+                try:
+                    parsed_scoring = json.loads(scoring_raw)
+                    if isinstance(parsed_scoring, dict):
+                        scoring_input = parsed_scoring
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    scoring_input = None
+
+            samples_rows: list[dict[str, Any]] | None = None
+            if scoring_input is None:
+                samples_raw = self._read_movement_file(files.get("json"))
+                if samples_raw is not None:
+                    try:
+                        parsed_samples = json.loads(samples_raw)
+                        if isinstance(parsed_samples, dict) and isinstance(parsed_samples.get("samples"), list):
+                            samples_rows = parsed_samples["samples"]
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        samples_rows = None
+
+            device_id = int(reference.get("device_id", 0))
+            fallback_block = str(
+                reference.get("block_id") or bindings.get(device_id, "")
+            ).strip()
+            movements_input.append({
+                "reference": reference,
+                "detail": detail,
+                "samples_rows": samples_rows,
+                "scoring_input": scoring_input,
+                "fallback_block_id": fallback_block,
+                "hole_id": reference.get("hole_id"),
+            })
+
+        return evaluate_task(
+            movements_input,
+            self._scoring_config,
+            task_status=str(task.get("status", "completed")),
+            include_synthetic_samples=False,
+        )
+
+    def _apply_v14_task_score(
+        self,
+        task: dict[str, Any],
+        references: list[dict[str, Any]],
+        movement_files: dict[str, dict[str, str]],
+    ) -> dict[str, Any]:
+        evaluated = self._evaluate_task_v14(task, references, movement_files)
+        evaluated_movements = evaluated.get("movements", [])
+        model_version = str(evaluated.get("model_version") or self._scoring_config.model_version)
+        for reference, mov in zip(references, evaluated_movements):
+            if mov.get("valid") and mov.get("score_display") is not None:
+                reference["score"] = float(mov["score_display"])
+                reference["score_raw"] = float(mov["score"])
+                reference["score_model_version"] = model_version
+                reference["score_quality_status"] = str(
+                    (mov.get("quality") or {}).get("status") or "observed"
+                )
+                reference.pop("score_invalid_reason", None)
+            else:
+                reference["score"] = None
+                reference.pop("score_raw", None)
+                reference["score_model_version"] = model_version
+                reference["score_quality_status"] = "invalid"
+                if mov.get("invalid_reason"):
+                    reference["score_invalid_reason"] = str(mov["invalid_reason"])
+
+        completeness = str(evaluated.get("completeness") or "empty")
+        if not references or completeness == "empty":
+            task["data_quality"] = "normal"
+            task["total_score"] = None
+            task["score_model_version"] = None
+        else:
+            if completeness == "complete":
+                task["data_quality"] = "complete"
+            elif completeness == "partial":
+                task["data_quality"] = "good"
+            else:
+                task["data_quality"] = "poor"
+            task["total_score"] = evaluated.get("total_score")
+            task["score_model_version"] = model_version
+        task["score_summary"] = evaluated
+        return evaluated
 
     def _recover_interrupted_tasks(self) -> None:
         interrupted = [
@@ -331,13 +513,17 @@ class TaskService:
                     0, int((ended - started).total_seconds())
                 )
                 task["status"] = "completed"
-                task["data_quality"] = "complete" if references else "normal"
                 task["movement_references"] = references
-                task["total_score"] = self._new_task_score(task_id) if references else None
-                task["score_model_version"] = (
-                    self.TEMPORARY_SCORE_MODEL_VERSION if references else None
-                )
                 task["movement_files"] = movement_files
+                if self._custom_score_provider is not None:
+                    task["data_quality"] = "complete" if references else "normal"
+                    task["total_score"] = self._new_task_score(task_id) if references else None
+                    task["score_model_version"] = (
+                        self.CUSTOM_SCORE_MODEL_VERSION if references else None
+                    )
+                    task.pop("score_summary", None)
+                else:
+                    self._apply_v14_task_score(task, references, movement_files)
                 self._save_locked()
             except Exception:
                 task.clear()
@@ -379,6 +565,7 @@ class TaskService:
                     task["movement_references"] = references
                     task["total_score"] = None
                     task.pop("score_model_version", None)
+                    task.pop("score_summary", None)
                     task["movement_files"] = movement_files
                     self._save_locked()
             except Exception:
@@ -462,13 +649,30 @@ class TaskService:
             references = task.get("movement_references", [])
             reference = deepcopy(references[-1]) if references else None
             total_score = task.get("total_score")
-            return {
-                "task": self._public(task),
-                "movement_reference": reference,
-                "score": {
+            summary = task.get("score_summary")
+            if isinstance(summary, dict):
+                score_payload = {
+                    **deepcopy(summary),
+                    "total_score": total_score,
+                    "score_status": str(
+                        summary.get("score_status")
+                        or ("completed" if total_score is not None else "pending")
+                    ),
+                    "model_version": task.get("score_model_version") or summary.get("model_version"),
+                    "explanation": list(summary.get("explanation") or []),
+                    "demo_only": bool(summary.get("demo_only", False)),
+                }
+            else:
+                version = task.get("score_model_version")
+                demo_only = version in (
+                    None,
+                    self.TEMPORARY_SCORE_MODEL_VERSION,
+                    self.CUSTOM_SCORE_MODEL_VERSION,
+                )
+                score_payload = {
                     "total_score": total_score,
                     "score_status": "completed" if total_score is not None else "pending",
-                    "model_version": task.get("score_model_version") if total_score is not None else None,
+                    "model_version": version if total_score is not None else None,
                     "explanation": (
                         [
                             f"评分基于本次任务中 {len(references)} 次完整移动，在任务结束后统一生成。",
@@ -476,8 +680,12 @@ class TaskService:
                         if total_score is not None
                         else ["尚未检测到本任务中的完整移动。"]
                     ),
-                    "demo_only": True,
-                },
+                    "demo_only": demo_only,
+                }
+            return {
+                "task": self._public(task),
+                "movement_reference": reference,
+                "score": score_payload,
             }
 
     def _collect_movement_references(
@@ -538,8 +746,8 @@ class TaskService:
         )
         per_device_indexes: dict[int, int] = {}
         for index, reference in enumerate(references, start=1):
-            reference.pop("score", None)
-            reference.pop("score_model_version", None)
+            for field in ("score", "score_raw", "score_model_version", "score_quality_status", "score_invalid_reason"):
+                reference.pop(field, None)
             reference["task_movement_index"] = index
             target_id = int(reference["device_id"])
             per_device_indexes[target_id] = per_device_indexes.get(target_id, 0) + 1
@@ -604,6 +812,20 @@ class TaskService:
                     )
                     created_files.append(self._movement_root / export_file)
                     files[export_format] = export_file
+            scoring_input = self._live_movement_scoring_input(
+                int(reference["device_id"]),
+                int(reference["movement_id"]),
+                str(reference["analysis_mode"]),
+            )
+            if scoring_input is not None:
+                scoring_file = self._write_movement_file(
+                    task_id,
+                    reference,
+                    "scoring_input.json",
+                    json.dumps(scoring_input, ensure_ascii=False, separators=(",", ":")) + "\n",
+                )
+                created_files.append(self._movement_root / scoring_file)
+                files["scoring_input"] = scoring_file
             movement_files[key] = files
         return movement_files
 
@@ -679,6 +901,21 @@ class TaskService:
                         and isinstance(sample.get("gyro_dps"), list)
                         and len(sample["gyro_dps"]) == 3
                     ]
+            summary = task.get("score_summary")
+            if isinstance(summary, dict):
+                matched_score = next(
+                    (
+                        deepcopy(item)
+                        for item in summary.get("movements", [])
+                        if isinstance(item, dict)
+                        and int(item.get("device_id") or 0) == int(device_id)
+                        and int(item.get("movement_id") or 0) == int(movement_id)
+                        and str(item.get("analysis_mode") or "pc") == str(analysis_mode)
+                    ),
+                    None,
+                )
+                if matched_score is not None:
+                    payload["v14_score"] = matched_score
             return payload
 
     def movement_export(
@@ -1008,6 +1245,18 @@ class TaskService:
         if not callable(provider):
             return None
         return provider(device_id, movement_id, export_format, analysis_mode)
+
+    def _live_movement_scoring_input(
+        self,
+        device_id: int,
+        movement_id: int,
+        analysis_mode: str,
+    ) -> dict[str, Any] | None:
+        provider_owner = getattr(self._snapshot_provider, "__self__", None)
+        provider = getattr(provider_owner, "movement_scoring_input", None)
+        if not callable(provider):
+            return None
+        return provider(device_id, movement_id, analysis_mode)
 
     def _notify_archived_movements(
         self,

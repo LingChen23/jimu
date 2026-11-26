@@ -1,0 +1,1007 @@
+{
+  "scoring_version": "v1.4",
+  "weights_version": "v1.4-imu-drift-adjusted",
+  "calibration_version": "v1.4-cloud28-norm-20261126",
+  "model_id": "jimu-wall-scoring-v1.4",
+  "calibrated": true,
+  "provisional": false,
+  "description": "智能积木穿墙任务运动表现分配置（V1.4 技术定稿 + 云端 28 次有效实测任务标定）：1) 各积木特征上下界采用等权 P10/P90 标定（筛除惯导速度漂移离群值）；2) 下调纯惯导正向积分速度维度权重（V=0.05），消除与移动耗时/平稳度的反向抵消；3) 基于云端实测常模百分位（P10/P35/P65/P90 -> 60/70/80/90）对任务总分做单调分段线性拉伸，保留原始积木均值备查。",
+  "quality": {
+    "required_analysis_mode": "pc",
+    "missing_ratio_threshold": 0.1,
+    "nominal_sample_period_seconds": 0.01,
+    "clock_tolerance_min_seconds": 0.03,
+    "clock_tolerance_ratio": 0.02,
+    "max_continuous_gap_seconds": null
+  },
+  "drop_penalty": {
+    "enabled": true,
+    "per_drop": 10.0,
+    "max_penalty": 30.0
+  },
+  "score_scaling": {
+    "enabled": true,
+    "method": "piecewise_linear_norm_quantiles",
+    "note": "单次移动做温和中心对齐，任务总分按云端 28 任务实测常模 P10/P35/P65/P90 -> 60/70/80/90 单调拉伸以消除多积木均值压缩",
+    "movement_anchors": [
+      [
+        0.0,
+        0.0
+      ],
+      [
+        40.0,
+        46.0
+      ],
+      [
+        68.0,
+        74.0
+      ],
+      [
+        90.0,
+        95.0
+      ],
+      [
+        100.0,
+        100.0
+      ]
+    ],
+    "task_anchors": [
+      [
+        0.0,
+        0.0
+      ],
+      [
+        62.14,
+        60.0
+      ],
+      [
+        69.79,
+        70.0
+      ],
+      [
+        73.34,
+        80.0
+      ],
+      [
+        78.2,
+        90.0
+      ],
+      [
+        100.0,
+        100.0
+      ]
+    ]
+  },
+  "intra_group_weights": {
+    "T": {
+      "moving_seconds": {
+        "weight": 1.0,
+        "direction": "negative",
+        "enabled": true
+      }
+    },
+    "P": {
+      "pause_total_seconds": {
+        "weight": 0.75,
+        "direction": "negative",
+        "enabled": true
+      },
+      "pause_count": {
+        "weight": 0.25,
+        "direction": "negative",
+        "enabled": true
+      }
+    },
+    "V": {
+      "p05": {
+        "weight": 0.15,
+        "direction": "positive",
+        "enabled": true
+      },
+      "max": {
+        "weight": 0.1,
+        "direction": "positive",
+        "enabled": true
+      },
+      "mean": {
+        "weight": 0.35,
+        "direction": "positive",
+        "enabled": true
+      },
+      "median": {
+        "weight": 0.4,
+        "direction": "positive",
+        "enabled": true
+      }
+    },
+    "Q": {
+      "std": {
+        "weight": 0.4,
+        "direction": "negative",
+        "enabled": true
+      },
+      "intensity_dps": {
+        "weight": 0.36,
+        "direction": "negative",
+        "enabled": true
+      },
+      "band_rms_dps": {
+        "weight": 0.24,
+        "direction": "negative",
+        "enabled": true
+      }
+    }
+  },
+  "blocks": {
+    "A": {
+      "name": "圆柱块",
+      "default_device_id": 1,
+      "category": "three_view",
+      "category_label": "三视图定位",
+      "allowed_holes": [
+        "方孔",
+        "圆孔"
+      ],
+      "provisional": false,
+      "provisional_note": "基于云端实测集（n=22 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "dimension_weights": {
+        "T": 0.2,
+        "P": 0.28,
+        "V": 0.05,
+        "Q": 0.29,
+        "R": 0.18
+      },
+      "posture_weights": {
+        "angle": {
+          "weight": 0.6,
+          "direction": "negative",
+          "enabled": true
+        },
+        "rotation_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        },
+        "flip_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        }
+      },
+      "parameters": {
+        "moving_seconds": [
+          2.45,
+          15.82
+        ],
+        "pause_total_seconds": [
+          0.0,
+          17.76
+        ],
+        "pause_count": [
+          0.0,
+          14.0
+        ],
+        "p05": [
+          0.009,
+          0.102
+        ],
+        "max": [
+          0.09,
+          1.171
+        ],
+        "mean": [
+          0.026,
+          0.375
+        ],
+        "median": [
+          0.028,
+          0.316
+        ],
+        "std": [
+          0.011,
+          0.297
+        ],
+        "intensity_dps": [
+          2.83,
+          19.49
+        ],
+        "band_rms_dps": [
+          6.94,
+          39.34
+        ],
+        "angle": [
+          66.5,
+          865.4
+        ],
+        "rotation_count": [
+          0.0,
+          2.0
+        ],
+        "flip_count": [
+          0.0,
+          2.0
+        ]
+      }
+    },
+    "B": {
+      "name": "四面尖块",
+      "default_device_id": 2,
+      "category": "three_view",
+      "category_label": "三视图定位",
+      "allowed_holes": [
+        "方孔",
+        "圆孔"
+      ],
+      "provisional": false,
+      "provisional_note": "基于云端实测集（n=21 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "dimension_weights": {
+        "T": 0.2,
+        "P": 0.28,
+        "V": 0.05,
+        "Q": 0.29,
+        "R": 0.18
+      },
+      "posture_weights": {
+        "angle": {
+          "weight": 0.6,
+          "direction": "negative",
+          "enabled": true
+        },
+        "rotation_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        },
+        "flip_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        }
+      },
+      "parameters": {
+        "moving_seconds": [
+          2.19,
+          20.97
+        ],
+        "pause_total_seconds": [
+          0.0,
+          14.16
+        ],
+        "pause_count": [
+          0.0,
+          9.0
+        ],
+        "p05": [
+          0.008,
+          0.151
+        ],
+        "max": [
+          0.077,
+          1.679
+        ],
+        "mean": [
+          0.029,
+          0.687
+        ],
+        "median": [
+          0.022,
+          0.604
+        ],
+        "std": [
+          0.014,
+          0.416
+        ],
+        "intensity_dps": [
+          3.84,
+          22.56
+        ],
+        "band_rms_dps": [
+          6.38,
+          38.17
+        ],
+        "angle": [
+          70.6,
+          1568.8
+        ],
+        "rotation_count": [
+          0.0,
+          2.0
+        ],
+        "flip_count": [
+          0.0,
+          2.0
+        ]
+      }
+    },
+    "C": {
+      "name": "十字块",
+      "default_device_id": 3,
+      "category": "three_view",
+      "category_label": "三视图定位",
+      "allowed_holes": [
+        "方孔",
+        "圆孔",
+        "十字孔"
+      ],
+      "provisional": false,
+      "provisional_note": "基于云端实测集（n=19 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "dimension_weights": {
+        "T": 0.2,
+        "P": 0.28,
+        "V": 0.05,
+        "Q": 0.29,
+        "R": 0.18
+      },
+      "posture_weights": {
+        "angle": {
+          "weight": 0.6,
+          "direction": "negative",
+          "enabled": true
+        },
+        "rotation_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        },
+        "flip_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        }
+      },
+      "parameters": {
+        "moving_seconds": [
+          2.63,
+          33.2
+        ],
+        "pause_total_seconds": [
+          0.0,
+          13.55
+        ],
+        "pause_count": [
+          0.0,
+          9.0
+        ],
+        "p05": [
+          0.011,
+          0.096
+        ],
+        "max": [
+          0.088,
+          1.345
+        ],
+        "mean": [
+          0.034,
+          0.63
+        ],
+        "median": [
+          0.031,
+          0.607
+        ],
+        "std": [
+          0.018,
+          0.365
+        ],
+        "intensity_dps": [
+          3.94,
+          18.18
+        ],
+        "band_rms_dps": [
+          9.32,
+          37.84
+        ],
+        "angle": [
+          57.2,
+          1803.3
+        ],
+        "rotation_count": [
+          0.0,
+          2.0
+        ],
+        "flip_count": [
+          0.0,
+          2.0
+        ]
+      }
+    },
+    "D": {
+      "name": "扇锥块",
+      "default_device_id": 4,
+      "category": "three_view",
+      "category_label": "三视图定位",
+      "allowed_holes": [
+        "方孔",
+        "圆孔",
+        "三角孔"
+      ],
+      "provisional": false,
+      "provisional_note": "基于云端实测集（n=23 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "dimension_weights": {
+        "T": 0.2,
+        "P": 0.28,
+        "V": 0.05,
+        "Q": 0.29,
+        "R": 0.18
+      },
+      "posture_weights": {
+        "angle": {
+          "weight": 0.6,
+          "direction": "negative",
+          "enabled": true
+        },
+        "rotation_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        },
+        "flip_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        }
+      },
+      "parameters": {
+        "moving_seconds": [
+          2.48,
+          32.01
+        ],
+        "pause_total_seconds": [
+          0.0,
+          12.93
+        ],
+        "pause_count": [
+          0.0,
+          9.0
+        ],
+        "p05": [
+          0.007,
+          0.149
+        ],
+        "max": [
+          0.059,
+          1.403
+        ],
+        "mean": [
+          0.023,
+          0.546
+        ],
+        "median": [
+          0.02,
+          0.512
+        ],
+        "std": [
+          0.012,
+          0.284
+        ],
+        "intensity_dps": [
+          6.09,
+          18.14
+        ],
+        "band_rms_dps": [
+          8.74,
+          45.74
+        ],
+        "angle": [
+          71.7,
+          1748.8
+        ],
+        "rotation_count": [
+          0.0,
+          2.0
+        ],
+        "flip_count": [
+          0.0,
+          2.0
+        ]
+      }
+    },
+    "E": {
+      "name": "四翼块",
+      "default_device_id": 5,
+      "category": "three_view",
+      "category_label": "三视图定位",
+      "allowed_holes": [
+        "方孔",
+        "三角孔",
+        "十字孔"
+      ],
+      "provisional": false,
+      "provisional_note": "基于云端实测集（n=23 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "dimension_weights": {
+        "T": 0.2,
+        "P": 0.28,
+        "V": 0.05,
+        "Q": 0.29,
+        "R": 0.18
+      },
+      "posture_weights": {
+        "angle": {
+          "weight": 0.6,
+          "direction": "negative",
+          "enabled": true
+        },
+        "rotation_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        },
+        "flip_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        }
+      },
+      "parameters": {
+        "moving_seconds": [
+          2.34,
+          35.79
+        ],
+        "pause_total_seconds": [
+          0.0,
+          16.88
+        ],
+        "pause_count": [
+          0.0,
+          11.0
+        ],
+        "p05": [
+          0.014,
+          0.164
+        ],
+        "max": [
+          0.157,
+          1.673
+        ],
+        "mean": [
+          0.042,
+          0.694
+        ],
+        "median": [
+          0.037,
+          0.516
+        ],
+        "std": [
+          0.025,
+          0.36
+        ],
+        "intensity_dps": [
+          5.02,
+          41.29
+        ],
+        "band_rms_dps": [
+          12.19,
+          52.51
+        ],
+        "angle": [
+          144.9,
+          2452.5
+        ],
+        "rotation_count": [
+          0.0,
+          2.0
+        ],
+        "flip_count": [
+          0.0,
+          2.0
+        ]
+      }
+    },
+    "F": {
+      "name": "弧翼块",
+      "default_device_id": 6,
+      "category": "three_view",
+      "category_label": "三视图定位",
+      "allowed_holes": [
+        "圆孔",
+        "三角孔",
+        "十字孔"
+      ],
+      "provisional": false,
+      "provisional_note": "基于云端实测集（n=23 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "dimension_weights": {
+        "T": 0.2,
+        "P": 0.28,
+        "V": 0.05,
+        "Q": 0.29,
+        "R": 0.18
+      },
+      "posture_weights": {
+        "angle": {
+          "weight": 0.6,
+          "direction": "negative",
+          "enabled": true
+        },
+        "rotation_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        },
+        "flip_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        }
+      },
+      "parameters": {
+        "moving_seconds": [
+          2.53,
+          23.73
+        ],
+        "pause_total_seconds": [
+          0.0,
+          9.85
+        ],
+        "pause_count": [
+          0.0,
+          6.0
+        ],
+        "p05": [
+          0.007,
+          0.136
+        ],
+        "max": [
+          0.087,
+          1.829
+        ],
+        "mean": [
+          0.028,
+          0.851
+        ],
+        "median": [
+          0.025,
+          0.823
+        ],
+        "std": [
+          0.016,
+          0.449
+        ],
+        "intensity_dps": [
+          4.74,
+          20.77
+        ],
+        "band_rms_dps": [
+          7.72,
+          41.94
+        ],
+        "angle": [
+          144.2,
+          1664.9
+        ],
+        "rotation_count": [
+          0.0,
+          2.0
+        ],
+        "flip_count": [
+          0.0,
+          2.0
+        ]
+      }
+    },
+    "G": {
+      "name": "螺纹筒",
+      "default_device_id": 7,
+      "category": "rotation",
+      "category_label": "旋转",
+      "allowed_holes": [
+        "专用圆孔"
+      ],
+      "provisional": true,
+      "provisional_note": "连续特征基于云端实测集（n=19 任务）标定；旋转目标区间为无标签实测经验区间",
+      "dimension_weights": {
+        "T": 0.18,
+        "P": 0.22,
+        "V": 0.05,
+        "Q": 0.23,
+        "R": 0.32
+      },
+      "posture_weights": {
+        "angle": {
+          "weight": 0.6,
+          "direction": "target",
+          "enabled": true
+        },
+        "rotation_count": {
+          "weight": 0.4,
+          "direction": "target",
+          "enabled": true
+        }
+      },
+      "parameters": {
+        "moving_seconds": [
+          2.72,
+          56.0
+        ],
+        "pause_total_seconds": [
+          0.0,
+          15.1
+        ],
+        "pause_count": [
+          0.0,
+          11.0
+        ],
+        "p05": [
+          0.005,
+          0.095
+        ],
+        "max": [
+          0.091,
+          1.83
+        ],
+        "mean": [
+          0.038,
+          0.817
+        ],
+        "median": [
+          0.029,
+          0.703
+        ],
+        "std": [
+          0.021,
+          0.472
+        ],
+        "intensity_dps": [
+          3.34,
+          20.1
+        ],
+        "band_rms_dps": [
+          6.55,
+          50.41
+        ],
+        "angle": [
+          300.0,
+          3860.2,
+          2670.1
+        ],
+        "rotation_count": [
+          1.0,
+          4.0,
+          2.0
+        ]
+      }
+    },
+    "H": {
+      "name": "弧槽块",
+      "default_device_id": 8,
+      "category": "tumble",
+      "category_label": "翻滚",
+      "allowed_holes": [
+        "专用横向长方孔"
+      ],
+      "provisional": true,
+      "provisional_note": "基于云端实测集（n=19 任务）独立标定；翻滚目标区间为无标签实测经验区间",
+      "dimension_weights": {
+        "T": 0.18,
+        "P": 0.22,
+        "V": 0.05,
+        "Q": 0.23,
+        "R": 0.32
+      },
+      "posture_weights": {
+        "angle": {
+          "weight": 0.8,
+          "direction": "target",
+          "enabled": true
+        },
+        "flip_count": {
+          "weight": 0.2,
+          "direction": "target",
+          "enabled": true
+        }
+      },
+      "parameters": {
+        "moving_seconds": [
+          2.22,
+          26.62
+        ],
+        "pause_total_seconds": [
+          0.0,
+          16.73
+        ],
+        "pause_count": [
+          0.0,
+          11.0
+        ],
+        "p05": [
+          0.01,
+          0.089
+        ],
+        "max": [
+          0.096,
+          1.343
+        ],
+        "mean": [
+          0.037,
+          0.513
+        ],
+        "median": [
+          0.032,
+          0.529
+        ],
+        "std": [
+          0.019,
+          0.241
+        ],
+        "intensity_dps": [
+          3.83,
+          25.75
+        ],
+        "band_rms_dps": [
+          9.14,
+          56.41
+        ],
+        "angle": [
+          180.0,
+          1953.5,
+          1330.1
+        ],
+        "flip_count": [
+          1.0,
+          2.0,
+          2.0
+        ]
+      }
+    },
+    "I": {
+      "name": "阶梯块",
+      "default_device_id": 9,
+      "category": "translation",
+      "category_label": "平移",
+      "allowed_holes": [
+        "专用阶梯形孔"
+      ],
+      "provisional": false,
+      "provisional_note": "基于云端实测集（n=17 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "dimension_weights": {
+        "T": 0.25,
+        "P": 0.25,
+        "V": 0.05,
+        "Q": 0.3,
+        "R": 0.15
+      },
+      "posture_weights": {
+        "angle": {
+          "weight": 0.6,
+          "direction": "negative",
+          "enabled": true
+        },
+        "rotation_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        },
+        "flip_count": {
+          "weight": 0.2,
+          "direction": "negative",
+          "enabled": true
+        }
+      },
+      "parameters": {
+        "moving_seconds": [
+          2.79,
+          25.27
+        ],
+        "pause_total_seconds": [
+          0.0,
+          24.41
+        ],
+        "pause_count": [
+          0.0,
+          15.0
+        ],
+        "p05": [
+          0.008,
+          0.094
+        ],
+        "max": [
+          0.096,
+          2.258
+        ],
+        "mean": [
+          0.037,
+          1.035
+        ],
+        "median": [
+          0.029,
+          1.162
+        ],
+        "std": [
+          0.021,
+          0.7
+        ],
+        "intensity_dps": [
+          3.16,
+          20.14
+        ],
+        "band_rms_dps": [
+          5.73,
+          41.25
+        ],
+        "angle": [
+          44.3,
+          1697.1
+        ],
+        "rotation_count": [
+          0.0,
+          2.0
+        ],
+        "flip_count": [
+          0.0,
+          2.0
+        ]
+      }
+    },
+    "J": {
+      "name": "多半圆块",
+      "default_device_id": 10,
+      "category": "multi_axis_rotation",
+      "category_label": "多向旋转",
+      "allowed_holes": [
+        "专用多圆弧组合孔"
+      ],
+      "provisional": true,
+      "provisional_note": "基于云端实测集（n=18 任务）独立标定；多向旋转目标区间为无标签实测经验区间",
+      "dimension_weights": {
+        "T": 0.18,
+        "P": 0.22,
+        "V": 0.05,
+        "Q": 0.23,
+        "R": 0.32
+      },
+      "posture_weights": {
+        "angle": {
+          "weight": 1.0,
+          "direction": "target",
+          "enabled": true
+        }
+      },
+      "parameters": {
+        "moving_seconds": [
+          2.56,
+          55.89
+        ],
+        "pause_total_seconds": [
+          0.0,
+          13.64
+        ],
+        "pause_count": [
+          0.0,
+          10.0
+        ],
+        "p05": [
+          0.008,
+          0.06
+        ],
+        "max": [
+          0.07,
+          1.411
+        ],
+        "mean": [
+          0.024,
+          0.436
+        ],
+        "median": [
+          0.022,
+          0.311
+        ],
+        "std": [
+          0.013,
+          0.365
+        ],
+        "intensity_dps": [
+          4.71,
+          21.39
+        ],
+        "band_rms_dps": [
+          13.16,
+          41.48
+        ],
+        "angle": [
+          270.0,
+          3853.9,
+          2687.9
+        ]
+      }
+    }
+  },
+  "hole_overrides": {}
+}

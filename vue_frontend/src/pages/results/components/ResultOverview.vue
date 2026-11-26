@@ -61,9 +61,30 @@ const selectedBlockId = computed(() => {
   }
   return props.task?.blockId || null
 })
+function formatScore(value: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—'
+  return Number.isInteger(value) ? String(value) : value.toFixed(2)
+}
+
+const selectedMovementScore = computed(() => (
+  props.movementReference?.score ?? props.movement?.score ?? null
+))
+
 const displayedScore = computed(() => props.resultKind === 'task'
   ? props.task?.totalScore ?? props.taskResult?.score.totalScore ?? null
-  : props.movementReference?.score ?? null)
+  : selectedMovementScore.value)
+
+const scoreBadgeTone = computed<'green' | 'blue' | 'gray'>(() => {
+  if (displayedScore.value === null) return 'gray'
+  if (props.resultKind === 'task' && props.taskResult?.score.partial) return 'blue'
+  return 'green'
+})
+
+const scoreBadgeText = computed(() => {
+  if (displayedScore.value === null) return '未评分'
+  if (props.resultKind === 'task' && props.taskResult?.score.partial) return '部分有效评分'
+  return '已评分'
+})
 const canSaveProfile = computed(() => Boolean(
   profileDraft.value?.participantId.trim()
   && profileDraft.value?.name.trim(),
@@ -174,6 +195,7 @@ async function saveProfile(): Promise<void> {
       <div><span>当前移动硬件设备ID</span><b>{{ selectedDeviceId ?? '—' }}</b></div>
       <div><span>当前移动积木</span><b>{{ blockName(selectedBlockId) }}</b></div>
       <div><span>当前移动编号</span><b>{{ movement ? `M${movement.movementId}` : '未关联移动' }}</b></div>
+      <div><span>当前移动评分</span><b>{{ selectedMovementScore !== null ? `${formatScore(selectedMovementScore)}分` : '未评分' }}</b></div>
       <div><span>分析模式</span><b>{{ analysisMode(movement?.analysisMode) }}</b></div>
       <div class="overview-wide"><span>本次采集备注</span><b>{{ task?.note || '未填写' }}</b></div>
     </div>
@@ -186,8 +208,8 @@ async function saveProfile(): Promise<void> {
 
   <section class="card score result-score-card">
       <span>{{ resultKind === 'task' ? '本次任务评分' : '本次移动评分' }}</span>
-      <strong>{{ displayedScore ?? '—' }}<small v-if="displayedScore !== null">分</small></strong>
-      <StatusBadge :tone="displayedScore !== null ? 'green' : 'gray'" :text="displayedScore !== null ? '已评分' : '未评分'" />
+      <strong>{{ displayedScore !== null ? formatScore(displayedScore) : '—' }}<small v-if="displayedScore !== null">分</small></strong>
+      <StatusBadge :tone="scoreBadgeTone" :text="scoreBadgeText" />
   </section>
 </template>
 

@@ -513,6 +513,12 @@ class ApiHandler(SimpleHTTPRequestHandler):
             if self.path == "/api/devices/battery-refresh":
                 self._json_response(SERIAL.refresh_batteries())
                 return
+            if self.path in ("/api/scoring-config/profile", "/api/scoring-config"):
+                profile = body.get("profile") or body.get("active_profile")
+                if not profile:
+                    raise ValueError("缺少 profile 参数（可选 calibrated 或 trial）")
+                self._json_response(TASKS.set_scoring_profile(str(profile)))
+                return
             if self.path == "/api/device/mode":
                 device_id = max(1, min(DEVICE_COUNT, int(body.get("device", 1))))
                 mode = str(body.get("mode", ""))

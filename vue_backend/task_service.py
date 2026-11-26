@@ -7,6 +7,7 @@ from datetime import datetime
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import secrets
 import shutil
@@ -16,7 +17,18 @@ import zipfile
 from typing import Any, Callable
 
 from data_repository import DataRepository, normalize_participant_profile
-from scoring_engine import ScoringConfig, evaluate_movement, evaluate_task
+from scoring_engine import (
+    SCORING_PROFILES,
+    SCORING_PROFILE_CALIBRATED,
+    SCORING_PROFILE_LABELS,
+    SCORING_PROFILE_TRIAL,
+    TRIAL_CONFIG_PATH,
+    ScoringConfig,
+    attach_task_profile_metadata,
+    evaluate_movement_profiles,
+    evaluate_task_profiles,
+    normalize_scoring_profile,
+)
 
 
 class TaskService:
@@ -36,6 +48,8 @@ class TaskService:
         movement_archived_callback: Callable[[int, int, str], Any] | None = None,
         diagnostic_sink: Callable[..., None] | None = None,
         scoring_config_path: str | Path | None = None,
+        trial_scoring_config_path: str | Path | None = None,
+        active_scoring_profile: str | None = None,
     ) -> None:
         self._path = Path(path)
         self._snapshot_provider = snapshot_provider
@@ -51,7 +65,16 @@ class TaskService:
         self._device_ids = tuple(sorted({int(device_id) for device_id in device_ids}))
         self._custom_score_provider = score_provider
         self._score_provider = score_provider or (lambda: 60 + secrets.randbelow(36))
-        self._scoring_config = ScoringConfig.from_file(scoring_config_path)
+        self._scoring_configs: dict[str, ScoringConfig] = {
+            SCORING_PROFILE_CALIBRATED: ScoringConfig.from_file(scoring_config_path),
+            SCORING_PROFILE_TRIAL: ScoringConfig.from_file(
+                trial_scoring_config_path or TRIAL_CONFIG_PATH
+            ),
+        }
+        self._profile_state_path = self._path.parent / "scoring_profile.json"
+        self._active_scoring_profile = self._load_initial_scoring_profile(
+            active_scoring_profile
+        )
         self._require_participant_profile = bool(require_participant_profile)
         self._movement_archived_callback = movement_archived_callback
         self._diagnostic_sink = diagnostic_sink
@@ -62,6 +85,39 @@ class TaskService:
         self._backfill_missing_scores()
         self._recover_interrupted_tasks()
         self._cleanup_temporary_files()
+
+    @property
+    def _scoring_config(self) -> ScoringConfig:
+        return self._scoring_configs[self._active_scoring_profile]
+
+    @property
+    def active_scoring_profile(self) -> str:
+        with self._lock:
+            return self._active_scoring_profile
+
+    def _load_initial_scoring_profile(self, explicit_profile: str | None) -> str:
+        if explicit_profile is not None:
+            return normalize_scoring_profile(explicit_profile)
+        env_profile = os.environ.get("MOTION_SCORING_PROFILE")
+        if env_profile:
+            return normalize_scoring_profile(env_profile)
+        if self._profile_state_path.exists():
+            try:
+                raw = json.loads(self._profile_state_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict) and raw.get("active_profile"):
+                    return normalize_scoring_profile(str(raw["active_profile"]))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+        return SCORING_PROFILE_CALIBRATED
+
+    def _persist_scoring_profile_locked(self) -> None:
+        self._profile_state_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self._profile_state_path.with_suffix(".json.tmp")
+        temp_path.write_text(
+            json.dumps({"active_profile": self._active_scoring_profile}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temp_path.replace(self._profile_state_path)
 
     def _cleanup_temporary_files(self) -> None:
         if not self._movement_root.exists():
@@ -91,10 +147,11 @@ class TaskService:
                         if field in reference:
                             reference.pop(field, None)
                             changed = True
-                if task.get("total_score") is not None or "score_summary" in task:
+                if task.get("total_score") is not None or "score_summary" in task or "score_profiles" in task:
                     task["total_score"] = None
                     task.pop("score_model_version", None)
                     task.pop("score_summary", None)
+                    task.pop("score_profiles", None)
                     changed = True
                 continue
 
@@ -113,6 +170,10 @@ class TaskService:
                 continue
 
             version = task.get("score_model_version")
+            stored_profiles = task.get("score_profiles")
+            has_both_profiles = isinstance(stored_profiles, dict) and all(
+                pid in stored_profiles for pid in SCORING_PROFILES
+            )
             needs_v14_rescore = (
                 status == "completed"
                 and version != self.CUSTOM_SCORE_MODEL_VERSION
@@ -120,8 +181,10 @@ class TaskService:
                     version == self.TEMPORARY_SCORE_MODEL_VERSION
                     or (
                         references
-                        and task.get("score_summary") is None
-                        and task.get("total_score") is None
+                        and (
+                            not has_both_profiles
+                            or (task.get("score_summary") is None and task.get("total_score") is None)
+                        )
                     )
                 )
             )
@@ -132,22 +195,77 @@ class TaskService:
                     task.get("movement_files", {}),
                 )
                 changed = True
+            elif status == "completed" and has_both_profiles:
+                summary = task.get("score_summary") or {}
+                if summary.get("active_profile") != self._active_scoring_profile:
+                    self._activate_task_profile_locked(task, self._active_scoring_profile)
+                    changed = True
         if changed:
             self._save_locked()
 
-    def scoring_config_snapshot(self) -> dict[str, Any]:
+    def _scoring_config_snapshot_locked(self) -> dict[str, Any]:
+        active_cfg = self._scoring_config
         return {
-            "scoring_version": self._scoring_config.scoring_version,
-            "weights_version": self._scoring_config.weights_version,
-            "calibration_version": self._scoring_config.calibration_version,
-            "model_version": self._scoring_config.model_version,
-            "calibrated": self._scoring_config.calibrated,
-            "provisional": self._scoring_config.provisional,
-            "missing_ratio_threshold": self._scoring_config.missing_ratio_threshold,
-            "drop_penalty": deepcopy(self._scoring_config.drop_penalty),
-            "intra_group_weights": deepcopy(self._scoring_config.intra_group_weights),
-            "blocks": deepcopy(self._scoring_config.blocks),
+            "active_profile": self._active_scoring_profile,
+            "active_profile_label": SCORING_PROFILE_LABELS.get(
+                self._active_scoring_profile, self._active_scoring_profile
+            ),
+            "available_profiles": [
+                {
+                    "profile": pid,
+                    "label": SCORING_PROFILE_LABELS.get(pid, pid),
+                    "model_version": self._scoring_configs[pid].model_version,
+                    "calibration_version": self._scoring_configs[pid].calibration_version,
+                    "calibrated": self._scoring_configs[pid].calibrated,
+                    "provisional": self._scoring_configs[pid].provisional,
+                }
+                for pid in SCORING_PROFILES
+            ],
+            "scoring_version": active_cfg.scoring_version,
+            "weights_version": active_cfg.weights_version,
+            "calibration_version": active_cfg.calibration_version,
+            "model_version": active_cfg.model_version,
+            "calibrated": active_cfg.calibrated,
+            "provisional": active_cfg.provisional,
+            "missing_ratio_threshold": active_cfg.missing_ratio_threshold,
+            "drop_penalty": deepcopy(active_cfg.drop_penalty),
+            "intra_group_weights": deepcopy(active_cfg.intra_group_weights),
+            "blocks": deepcopy(active_cfg.blocks),
         }
+
+    def scoring_config_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return self._scoring_config_snapshot_locked()
+
+    def set_scoring_profile(self, profile: str) -> dict[str, Any]:
+        selected = normalize_scoring_profile(profile)
+        with self._lock:
+            self._active_scoring_profile = selected
+            self._persist_scoring_profile_locked()
+            tasks_changed = False
+            for task in self._tasks:
+                if task.get("status") != "completed":
+                    continue
+                if task.get("score_model_version") == self.CUSTOM_SCORE_MODEL_VERSION:
+                    continue
+                references = task.get("movement_references", [])
+                if not isinstance(references, list) or not references:
+                    continue
+                stored_profiles = task.get("score_profiles")
+                if isinstance(stored_profiles, dict) and all(
+                    pid in stored_profiles for pid in SCORING_PROFILES
+                ):
+                    self._activate_task_profile_locked(task, selected)
+                else:
+                    self._apply_v14_task_score(
+                        task,
+                        references,
+                        task.get("movement_files", {}),
+                    )
+                tasks_changed = True
+            if tasks_changed:
+                self._save_locked()
+            return self._scoring_config_snapshot_locked()
 
     def score_live_movement(
         self,
@@ -168,9 +286,12 @@ class TaskService:
                         samples_rows = parsed["samples"]
                 except (TypeError, ValueError, json.JSONDecodeError):
                     samples_rows = None
-        return evaluate_movement(
+        with self._lock:
+            active_profile = self._active_scoring_profile
+        return evaluate_movement_profiles(
             detail,
-            self._scoring_config,
+            self._scoring_configs,
+            active_profile=active_profile,
             samples_rows=samples_rows,
             scoring_input=scoring_input,
         )
@@ -239,22 +360,29 @@ class TaskService:
                 "hole_id": reference.get("hole_id"),
             })
 
-        return evaluate_task(
+        return evaluate_task_profiles(
             movements_input,
-            self._scoring_config,
+            self._scoring_configs,
+            active_profile=self._active_scoring_profile,
             task_status=str(task.get("status", "completed")),
             include_synthetic_samples=False,
         )
 
-    def _apply_v14_task_score(
+    def _activate_task_profile_locked(
         self,
         task: dict[str, Any],
-        references: list[dict[str, Any]],
-        movement_files: dict[str, dict[str, str]],
+        profile: str,
     ) -> dict[str, Any]:
-        evaluated = self._evaluate_task_v14(task, references, movement_files)
+        selected = normalize_scoring_profile(profile)
+        stored_profiles = task.get("score_profiles") or {}
+        refreshed = attach_task_profile_metadata(stored_profiles, selected)
+        task["score_profiles"] = refreshed
+        evaluated = deepcopy(refreshed[selected])
+        references = task.get("movement_references", [])
         evaluated_movements = evaluated.get("movements", [])
-        model_version = str(evaluated.get("model_version") or self._scoring_config.model_version)
+        model_version = str(
+            evaluated.get("model_version") or self._scoring_configs[selected].model_version
+        )
         for reference, mov in zip(references, evaluated_movements):
             if mov.get("valid") and mov.get("score_display") is not None:
                 reference["score"] = float(mov["score_display"])
@@ -288,6 +416,16 @@ class TaskService:
             task["score_model_version"] = model_version
         task["score_summary"] = evaluated
         return evaluated
+
+    def _apply_v14_task_score(
+        self,
+        task: dict[str, Any],
+        references: list[dict[str, Any]],
+        movement_files: dict[str, dict[str, str]],
+    ) -> dict[str, Any]:
+        bundle = self._evaluate_task_v14(task, references, movement_files)
+        task["score_profiles"] = bundle["profiles"]
+        return self._activate_task_profile_locked(task, bundle["active_profile"])
 
     def _recover_interrupted_tasks(self) -> None:
         interrupted = [
@@ -336,6 +474,7 @@ class TaskService:
         result.pop("baseline_movement_ids", None)
         result.pop("analysis_modes", None)
         result.pop("movement_files", None)
+        result.pop("score_profiles", None)
         return result
 
     def start(

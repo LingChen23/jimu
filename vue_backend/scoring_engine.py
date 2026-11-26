@@ -24,7 +24,24 @@ import motion_model as mm
 
 BLOCK_ORDER = tuple("ABCDEFGHIJ")
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "defaults" / "scoring_config.json"
+TRIAL_CONFIG_PATH = Path(__file__).resolve().parent / "defaults" / "scoring_config_v14_trial.json"
+SCORING_PROFILE_CALIBRATED = "calibrated"
+SCORING_PROFILE_TRIAL = "trial"
+SCORING_PROFILES = (SCORING_PROFILE_CALIBRATED, SCORING_PROFILE_TRIAL)
+SCORING_PROFILE_LABELS: dict[str, str] = {
+    SCORING_PROFILE_CALIBRATED: "调整后未拉伸均值 (raw)",
+    SCORING_PROFILE_TRIAL: "V1.4 初始试行分（未微调）",
+}
 UINT32_MASK = 0xFFFFFFFF
+
+
+def normalize_scoring_profile(profile: str | None) -> str:
+    value = str(profile or SCORING_PROFILE_CALIBRATED).strip().lower()
+    if value not in SCORING_PROFILES:
+        raise ValueError(
+            f"不支持的评分方案 {profile!r}，可选值为：{', '.join(SCORING_PROFILES)}"
+        )
+    return value
 RECOVERABLE_GAP_REASONS = frozenset({
     "host_arrival_gap",
     "sample_gap",
@@ -908,4 +925,119 @@ def evaluate_task(
         "invalid_movements": invalid_movements,
         "explanation": explanations,
         "movements": evaluated_movements,
+    }
+
+
+def _summarize_profile_task_result(
+    profile_id: str,
+    evaluated: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "profile": profile_id,
+        "label": SCORING_PROFILE_LABELS.get(profile_id, profile_id),
+        "model_version": evaluated.get("model_version"),
+        "calibration_version": evaluated.get("calibration_version"),
+        "calibrated": evaluated.get("calibrated"),
+        "provisional": evaluated.get("provisional"),
+        "completeness": evaluated.get("completeness"),
+        "total_score": evaluated.get("total_score"),
+        "total_score_raw": evaluated.get("total_score_raw"),
+        "block_scores_display": deepcopy(evaluated.get("block_scores_display") or {}),
+    }
+
+
+def attach_task_profile_metadata(
+    profiles: dict[str, dict[str, Any]],
+    active_profile: str,
+) -> dict[str, dict[str, Any]]:
+    """Attach compact cross-profile summaries onto each profile's evaluated payload."""
+    selected = normalize_scoring_profile(active_profile)
+    summary_map = {
+        pid: _summarize_profile_task_result(pid, result)
+        for pid, result in profiles.items()
+    }
+    mov_count = min(
+        (len(result.get("movements", [])) for result in profiles.values()),
+        default=0,
+    )
+    enriched: dict[str, dict[str, Any]] = {}
+    for pid, result in profiles.items():
+        copied = deepcopy(result)
+        copied["scoring_profile"] = pid
+        copied["scoring_profile_label"] = SCORING_PROFILE_LABELS.get(pid, pid)
+        copied["active_profile"] = selected
+        copied["profile_scores"] = deepcopy(summary_map)
+        movements = copied.get("movements", [])
+        for idx in range(min(len(movements), mov_count)):
+            movements[idx]["scoring_profile"] = pid
+            movements[idx]["active_profile"] = selected
+            movements[idx]["profile_scores"] = {
+                other_id: profiles[other_id]["movements"][idx].get("score_display")
+                for other_id in profiles
+            }
+        enriched[pid] = copied
+    return enriched
+
+
+def evaluate_movement_profiles(
+    detail: dict[str, Any],
+    configs: dict[str, ScoringConfig],
+    *,
+    active_profile: str = SCORING_PROFILE_CALIBRATED,
+    samples_rows: list[dict[str, Any]] | None = None,
+    scoring_input: dict[str, Any] | None = None,
+    fallback_block_id: str | None = None,
+    hole_id: str | None = None,
+    include_synthetic_samples: bool = False,
+) -> dict[str, Any]:
+    """Evaluate one movement under both calibrated and trial profiles in backend."""
+    selected = normalize_scoring_profile(active_profile)
+    per_profile = {
+        pid: evaluate_movement(
+            detail,
+            cfg,
+            samples_rows=samples_rows,
+            scoring_input=scoring_input,
+            fallback_block_id=fallback_block_id,
+            hole_id=hole_id,
+            include_synthetic_samples=include_synthetic_samples,
+        )
+        for pid, cfg in configs.items()
+    }
+    profile_scores = {
+        pid: res.get("score_display")
+        for pid, res in per_profile.items()
+    }
+    active_result = deepcopy(per_profile[selected])
+    active_result["scoring_profile"] = selected
+    active_result["scoring_profile_label"] = SCORING_PROFILE_LABELS.get(selected, selected)
+    active_result["active_profile"] = selected
+    active_result["profile_scores"] = profile_scores
+    return active_result
+
+
+def evaluate_task_profiles(
+    movements_input: list[dict[str, Any]],
+    configs: dict[str, ScoringConfig],
+    *,
+    active_profile: str = SCORING_PROFILE_CALIBRATED,
+    task_status: str = "completed",
+    include_synthetic_samples: bool = False,
+) -> dict[str, Any]:
+    """Evaluate a task under both calibrated and trial profiles in backend."""
+    selected = normalize_scoring_profile(active_profile)
+    raw_profiles = {
+        pid: evaluate_task(
+            movements_input,
+            cfg,
+            task_status=task_status,
+            include_synthetic_samples=include_synthetic_samples,
+        )
+        for pid, cfg in configs.items()
+    }
+    enriched_profiles = attach_task_profile_metadata(raw_profiles, selected)
+    return {
+        "active_profile": selected,
+        "active": deepcopy(enriched_profiles[selected]),
+        "profiles": enriched_profiles,
     }

@@ -678,6 +678,76 @@ class ScoringPipelineReplayAndTaskTests(unittest.TestCase):
             self.assertEqual(export_json.read_bytes(), samples_bytes)
             self.assertEqual(export_csv.read_bytes(), csv_bytes)
 
+    def test_backend_computes_both_calibrated_and_trial_profiles_and_switches_single_frontend_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = mm.MotionStore(device_count=10, default_analysis_mode=mm.ANALYSIS_MODE_PC)
+            service = TaskService(
+                root / "task_records.json",
+                store.snapshot,
+                device_ids=tuple(range(1, 11)),
+                database_path=root / "motion.sqlite3",
+                movement_root=root / "task_movements",
+            )
+            # Default profile must be "calibrated" ("暂定输出微调后的")
+            cfg_default = service.scoring_config_snapshot()
+            self.assertEqual(cfg_default["active_profile"], "calibrated")
+            self.assertEqual(len(cfg_default["available_profiles"]), 2)
+
+            store.set_task_collection_active(True)
+            started = service.start(9, "P200", "双方案切换测试")
+            task_id = started["task_id"]
+
+            # Block I (device 9) has distinct calibrated vs trial bounds
+            self._feed_pc_movement(store, 9, moving_frames=220)
+            live_detail = store.movement_detail(9, 1, "pc")
+            live_scored_cal = service.score_live_movement(9, 1, "pc", live_detail)
+            self.assertEqual(live_scored_cal["active_profile"], "calibrated")
+            self.assertIn("calibrated", live_scored_cal["profile_scores"])
+            self.assertIn("trial", live_scored_cal["profile_scores"])
+
+            finished = service.finish(task_id)
+            store.set_task_collection_active(False)
+
+            res_cal = service.result(task_id)
+            cal_total = res_cal["task"]["total_score"]
+            self.assertEqual(res_cal["score"]["active_profile"], "calibrated")
+            both_scores = res_cal["score"]["profile_scores"]
+            self.assertAlmostEqual(cal_total, both_scores["calibrated"]["total_score"], places=2)
+            trial_expected = both_scores["trial"]["total_score"]
+            self.assertIsNotNone(trial_expected)
+            self.assertNotEqual(cal_total, trial_expected)
+
+            # Public task dict only exposes the single active total_score (no duplicate score_profiles blob)
+            listed_cal = service.list()[0]
+            self.assertEqual(listed_cal["total_score"], cal_total)
+            self.assertNotIn("score_profiles", listed_cal)
+
+            # Switch active profile to "trial": frontend-facing single score immediately becomes trial score
+            switched = service.set_scoring_profile("trial")
+            self.assertEqual(switched["active_profile"], "trial")
+            res_trial = service.result(task_id)
+            self.assertEqual(res_trial["score"]["active_profile"], "trial")
+            self.assertEqual(res_trial["task"]["total_score"], trial_expected)
+            self.assertEqual(res_trial["score"]["total_score"], trial_expected)
+            mov_detail_trial = service.movement_detail(task_id, 9, 1, "pc")
+            self.assertEqual(mov_detail_trial["v14_score"]["score_display"], trial_expected)
+
+            # Switching persists across TaskService restarts
+            restarted = TaskService(
+                root / "task_records.json",
+                store.snapshot,
+                device_ids=tuple(range(1, 11)),
+                database_path=root / "motion.sqlite3",
+                movement_root=root / "task_movements",
+            )
+            self.assertEqual(restarted.active_scoring_profile, "trial")
+            self.assertEqual(restarted.result(task_id)["task"]["total_score"], trial_expected)
+
+            # Switch back to "calibrated"
+            restarted.set_scoring_profile("calibrated")
+            self.assertEqual(restarted.result(task_id)["task"]["total_score"], cal_total)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,15 +14,20 @@ from pathlib import Path
 import zipfile
 from typing import Any
 
-from scoring_engine import DEFAULT_CONFIG_PATH, ScoringConfig, evaluate_task
+from scoring_engine import (
+    DEFAULT_CONFIG_PATH,
+    SCORING_PROFILES,
+    SCORING_PROFILE_CALIBRATED,
+    SCORING_PROFILE_TRIAL,
+    TRIAL_CONFIG_PATH,
+    ScoringConfig,
+    evaluate_task,
+    evaluate_task_profiles,
+    normalize_scoring_profile,
+)
 
 
-def score_single_task_zip_bytes(
-    archive_bytes: bytes,
-    config: ScoringConfig,
-    *,
-    include_synthetic_samples: bool = True,
-) -> dict[str, Any]:
+def _extract_archive_movements(archive_bytes: bytes) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     movements_input: list[dict[str, Any]] = []
     task_meta: dict[str, Any] = {}
     with zipfile.ZipFile(io.BytesIO(archive_bytes)) as zf:
@@ -67,18 +72,43 @@ def score_single_task_zip_bytes(
                     "detail": detail,
                     "samples_rows": samples_rows,
                 })
+    return task_meta, movements_input
 
-    evaluated = evaluate_task(
-        movements_input,
-        config,
-        task_status=str(task_meta.get("status", "completed")),
-        include_synthetic_samples=include_synthetic_samples,
-    )
+
+def score_single_task_zip_bytes(
+    archive_bytes: bytes,
+    config: ScoringConfig | dict[str, ScoringConfig],
+    *,
+    active_profile: str = SCORING_PROFILE_CALIBRATED,
+    include_synthetic_samples: bool = True,
+) -> dict[str, Any]:
+    task_meta, movements_input = _extract_archive_movements(archive_bytes)
+    task_status = str(task_meta.get("status", "completed"))
+    if isinstance(config, dict):
+        selected = normalize_scoring_profile(active_profile)
+        bundle = evaluate_task_profiles(
+            movements_input,
+            config,
+            active_profile=selected,
+            task_status=task_status,
+            include_synthetic_samples=include_synthetic_samples,
+        )
+        evaluated = bundle["active"]
+        active_cfg = config[selected]
+    else:
+        evaluated = evaluate_task(
+            movements_input,
+            config,
+            task_status=task_status,
+            include_synthetic_samples=include_synthetic_samples,
+        )
+        active_cfg = config
+
     return {
         "task_id": task_meta.get("task_id"),
         "participant_id": task_meta.get("participant_id"),
         "source_archive_sha256": hashlib.sha256(archive_bytes).hexdigest(),
-        "reference_parameters": config.reference_parameters_snapshot(),
+        "reference_parameters": active_cfg.reference_parameters_snapshot(),
         **evaluated,
         # Aliases matching the offline prototype score_task_v14.py output keys:
         "moved_block_count": evaluated["participation"]["participated_block_count"],
@@ -93,8 +123,14 @@ def main() -> None:
     parser.add_argument("archive_zip", help="Path to task_*.zip or tasks_batch*.zip")
     parser.add_argument(
         "--config",
-        default=str(DEFAULT_CONFIG_PATH),
-        help="Path to scoring_config.json",
+        default=None,
+        help="Optional explicit path to a single scoring_config.json (overrides --profile)",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=list(SCORING_PROFILES),
+        default=SCORING_PROFILE_CALIBRATED,
+        help="Active scoring profile to output when computing both calibrated and trial (default: calibrated)",
     )
     parser.add_argument(
         "--threshold-percent",
@@ -109,11 +145,27 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    config = ScoringConfig.from_file(args.config)
-    if args.threshold_percent is not None:
-        if not 0.0 <= args.threshold_percent <= 100.0:
-            parser.error("--threshold-percent 必须在 0～100 之间")
-        config = config.with_threshold_ratio(args.threshold_percent / 100.0)
+    selected_profile = normalize_scoring_profile(args.profile)
+    if args.config is not None:
+        single_cfg = ScoringConfig.from_file(args.config)
+        if args.threshold_percent is not None:
+            if not 0.0 <= args.threshold_percent <= 100.0:
+                parser.error("--threshold-percent 必须在 0～100 之间")
+            single_cfg = single_cfg.with_threshold_ratio(args.threshold_percent / 100.0)
+        cfg_or_map: ScoringConfig | dict[str, ScoringConfig] = single_cfg
+        model_version = single_cfg.model_version
+    else:
+        cfg_map = {
+            SCORING_PROFILE_CALIBRATED: ScoringConfig.from_file(DEFAULT_CONFIG_PATH),
+            SCORING_PROFILE_TRIAL: ScoringConfig.from_file(TRIAL_CONFIG_PATH),
+        }
+        if args.threshold_percent is not None:
+            if not 0.0 <= args.threshold_percent <= 100.0:
+                parser.error("--threshold-percent 必须在 0～100 之间")
+            ratio = args.threshold_percent / 100.0
+            cfg_map = {pid: cfg.with_threshold_ratio(ratio) for pid, cfg in cfg_map.items()}
+        cfg_or_map = cfg_map
+        model_version = cfg_map[selected_profile].model_version
 
     raw_bytes = Path(args.archive_zip).read_bytes()
     with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
@@ -129,14 +181,25 @@ def main() -> None:
                         if not member.is_dir() and member.filename.startswith(prefix):
                             rel_name = member.filename[len(prefix):]
                             sub_zf.writestr(rel_name, zf.read(member))
-                task_reports.append(score_single_task_zip_bytes(sub_buf.getvalue(), config))
+                task_reports.append(
+                    score_single_task_zip_bytes(
+                        sub_buf.getvalue(),
+                        cfg_or_map,
+                        active_profile=selected_profile,
+                    )
+                )
             report: dict[str, Any] = {
                 "batch_task_count": len(task_reports),
-                "model_version": config.model_version,
+                "active_profile": selected_profile,
+                "model_version": model_version,
                 "tasks": task_reports,
             }
         else:
-            report = score_single_task_zip_bytes(raw_bytes, config)
+            report = score_single_task_zip_bytes(
+                raw_bytes,
+                cfg_or_map,
+                active_profile=selected_profile,
+            )
 
     Path(args.output).write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n",

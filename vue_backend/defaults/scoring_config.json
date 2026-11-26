@@ -1,11 +1,11 @@
 {
   "scoring_version": "v1.4",
   "weights_version": "v1.4-imu-drift-adjusted",
-  "calibration_version": "v1.4-cloud28-norm-20261126",
+  "calibration_version": "v1.4-cloud28-p10p95-raw-20261126",
   "model_id": "jimu-wall-scoring-v1.4",
   "calibrated": true,
   "provisional": false,
-  "description": "智能积木穿墙任务运动表现分配置（V1.4 技术定稿 + 云端 28 次有效实测任务标定）：1) 各积木特征上下界采用等权 P10/P90 标定（筛除惯导速度漂移离群值）；2) 下调纯惯导正向积分速度维度权重（V=0.05），消除与移动耗时/平稳度的反向抵消；3) 基于云端实测常模百分位（P10/P35/P65/P90 -> 60/70/80/90）对任务总分做单调分段线性拉伸，保留原始积木均值备查。",
+  "description": "智能积木穿墙任务运动表现分配置（V1.4 技术定稿 + 云端 28 次有效实测任务纯线性标定，不做任何后置分数拉伸）：1) 各积木负向容忍特征采用等权 P10/P95 区间、正向特征采用等权 P10/P90 区间（筛除惯导速度漂移离群值）；2) 下调纯惯导正向积分速度维度权重（V=0.05），消除与移动耗时/平稳度的反向抵消；3) 任务总分严格等于各参与有效积木得分的直接算术平均。",
   "quality": {
     "required_analysis_mode": "pc",
     "missing_ratio_threshold": 0.1,
@@ -18,59 +18,6 @@
     "enabled": true,
     "per_drop": 10.0,
     "max_penalty": 30.0
-  },
-  "score_scaling": {
-    "enabled": true,
-    "method": "piecewise_linear_norm_quantiles",
-    "note": "单次移动做温和中心对齐，任务总分按云端 28 任务实测常模 P10/P35/P65/P90 -> 60/70/80/90 单调拉伸以消除多积木均值压缩",
-    "movement_anchors": [
-      [
-        0.0,
-        0.0
-      ],
-      [
-        40.0,
-        46.0
-      ],
-      [
-        68.0,
-        74.0
-      ],
-      [
-        90.0,
-        95.0
-      ],
-      [
-        100.0,
-        100.0
-      ]
-    ],
-    "task_anchors": [
-      [
-        0.0,
-        0.0
-      ],
-      [
-        62.14,
-        60.0
-      ],
-      [
-        69.79,
-        70.0
-      ],
-      [
-        73.34,
-        80.0
-      ],
-      [
-        78.2,
-        90.0
-      ],
-      [
-        100.0,
-        100.0
-      ]
-    ]
   },
   "intra_group_weights": {
     "T": {
@@ -143,7 +90,7 @@
         "圆孔"
       ],
       "provisional": false,
-      "provisional_note": "基于云端实测集（n=22 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "provisional_note": "基于云端实测集（n=22 独立任务）等权 P10/P95 纯线性标定（无拉伸）",
       "dimension_weights": {
         "T": 0.2,
         "P": 0.28,
@@ -171,15 +118,15 @@
       "parameters": {
         "moving_seconds": [
           2.45,
-          15.82
+          18.86
         ],
         "pause_total_seconds": [
           0.0,
-          17.76
+          22.36
         ],
         "pause_count": [
           0.0,
-          14.0
+          16.0
         ],
         "p05": [
           0.009,
@@ -199,19 +146,19 @@
         ],
         "std": [
           0.011,
-          0.297
+          0.307
         ],
         "intensity_dps": [
           2.83,
-          19.49
+          23.17
         ],
         "band_rms_dps": [
           6.94,
-          39.34
+          44.33
         ],
         "angle": [
           66.5,
-          865.4
+          1573.8
         ],
         "rotation_count": [
           0.0,
@@ -233,7 +180,7 @@
         "圆孔"
       ],
       "provisional": false,
-      "provisional_note": "基于云端实测集（n=21 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "provisional_note": "基于云端实测集（n=21 独立任务）等权 P10/P95 纯线性标定（无拉伸）",
       "dimension_weights": {
         "T": 0.2,
         "P": 0.28,
@@ -261,15 +208,15 @@
       "parameters": {
         "moving_seconds": [
           2.19,
-          20.97
+          23.3
         ],
         "pause_total_seconds": [
           0.0,
-          14.16
+          17.2
         ],
         "pause_count": [
           0.0,
-          9.0
+          11.0
         ],
         "p05": [
           0.008,
@@ -289,19 +236,19 @@
         ],
         "std": [
           0.014,
-          0.416
+          0.437
         ],
         "intensity_dps": [
           3.84,
-          22.56
+          30.98
         ],
         "band_rms_dps": [
           6.38,
-          38.17
+          49.34
         ],
         "angle": [
           70.6,
-          1568.8
+          1722.0
         ],
         "rotation_count": [
           0.0,
@@ -324,7 +271,7 @@
         "十字孔"
       ],
       "provisional": false,
-      "provisional_note": "基于云端实测集（n=19 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "provisional_note": "基于云端实测集（n=19 独立任务）等权 P10/P95 纯线性标定（无拉伸）",
       "dimension_weights": {
         "T": 0.2,
         "P": 0.28,
@@ -352,15 +299,15 @@
       "parameters": {
         "moving_seconds": [
           2.63,
-          33.2
+          42.76
         ],
         "pause_total_seconds": [
           0.0,
-          13.55
+          20.05
         ],
         "pause_count": [
           0.0,
-          9.0
+          14.0
         ],
         "p05": [
           0.011,
@@ -380,19 +327,19 @@
         ],
         "std": [
           0.018,
-          0.365
+          0.391
         ],
         "intensity_dps": [
           3.94,
-          18.18
+          23.53
         ],
         "band_rms_dps": [
           9.32,
-          37.84
+          43.77
         ],
         "angle": [
           57.2,
-          1803.3
+          1826.2
         ],
         "rotation_count": [
           0.0,
@@ -415,7 +362,7 @@
         "三角孔"
       ],
       "provisional": false,
-      "provisional_note": "基于云端实测集（n=23 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "provisional_note": "基于云端实测集（n=23 独立任务）等权 P10/P95 纯线性标定（无拉伸）",
       "dimension_weights": {
         "T": 0.2,
         "P": 0.28,
@@ -443,15 +390,15 @@
       "parameters": {
         "moving_seconds": [
           2.48,
-          32.01
+          36.21
         ],
         "pause_total_seconds": [
           0.0,
-          12.93
+          14.2
         ],
         "pause_count": [
           0.0,
-          9.0
+          10.0
         ],
         "p05": [
           0.007,
@@ -471,19 +418,19 @@
         ],
         "std": [
           0.012,
-          0.284
+          0.473
         ],
         "intensity_dps": [
           6.09,
-          18.14
+          20.61
         ],
         "band_rms_dps": [
           8.74,
-          45.74
+          51.1
         ],
         "angle": [
           71.7,
-          1748.8
+          1916.4
         ],
         "rotation_count": [
           0.0,
@@ -506,7 +453,7 @@
         "十字孔"
       ],
       "provisional": false,
-      "provisional_note": "基于云端实测集（n=23 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "provisional_note": "基于云端实测集（n=23 独立任务）等权 P10/P95 纯线性标定（无拉伸）",
       "dimension_weights": {
         "T": 0.2,
         "P": 0.28,
@@ -534,15 +481,15 @@
       "parameters": {
         "moving_seconds": [
           2.34,
-          35.79
+          41.86
         ],
         "pause_total_seconds": [
           0.0,
-          16.88
+          18.5
         ],
         "pause_count": [
           0.0,
-          11.0
+          12.0
         ],
         "p05": [
           0.014,
@@ -562,19 +509,19 @@
         ],
         "std": [
           0.025,
-          0.36
+          0.453
         ],
         "intensity_dps": [
           5.02,
-          41.29
+          54.95
         ],
         "band_rms_dps": [
           12.19,
-          52.51
+          58.55
         ],
         "angle": [
           144.9,
-          2452.5
+          2483.6
         ],
         "rotation_count": [
           0.0,
@@ -597,7 +544,7 @@
         "十字孔"
       ],
       "provisional": false,
-      "provisional_note": "基于云端实测集（n=23 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "provisional_note": "基于云端实测集（n=23 独立任务）等权 P10/P95 纯线性标定（无拉伸）",
       "dimension_weights": {
         "T": 0.2,
         "P": 0.28,
@@ -625,15 +572,15 @@
       "parameters": {
         "moving_seconds": [
           2.53,
-          23.73
+          39.14
         ],
         "pause_total_seconds": [
           0.0,
-          9.85
+          12.0
         ],
         "pause_count": [
           0.0,
-          6.0
+          7.0
         ],
         "p05": [
           0.007,
@@ -653,19 +600,19 @@
         ],
         "std": [
           0.016,
-          0.449
+          0.721
         ],
         "intensity_dps": [
           4.74,
-          20.77
+          24.76
         ],
         "band_rms_dps": [
           7.72,
-          41.94
+          49.7
         ],
         "angle": [
           144.2,
-          1664.9
+          2941.1
         ],
         "rotation_count": [
           0.0,
@@ -709,11 +656,11 @@
       "parameters": {
         "moving_seconds": [
           2.72,
-          56.0
+          97.82
         ],
         "pause_total_seconds": [
           0.0,
-          15.1
+          15.88
         ],
         "pause_count": [
           0.0,
@@ -737,15 +684,15 @@
         ],
         "std": [
           0.021,
-          0.472
+          0.576
         ],
         "intensity_dps": [
           3.34,
-          20.1
+          28.62
         ],
         "band_rms_dps": [
           6.55,
-          50.41
+          55.83
         ],
         "angle": [
           300.0,
@@ -791,15 +738,15 @@
       "parameters": {
         "moving_seconds": [
           2.22,
-          26.62
+          39.85
         ],
         "pause_total_seconds": [
           0.0,
-          16.73
+          19.44
         ],
         "pause_count": [
           0.0,
-          11.0
+          12.0
         ],
         "p05": [
           0.01,
@@ -819,15 +766,15 @@
         ],
         "std": [
           0.019,
-          0.241
+          0.306
         ],
         "intensity_dps": [
           3.83,
-          25.75
+          50.37
         ],
         "band_rms_dps": [
           9.14,
-          56.41
+          62.4
         ],
         "angle": [
           180.0,
@@ -850,7 +797,7 @@
         "专用阶梯形孔"
       ],
       "provisional": false,
-      "provisional_note": "基于云端实测集（n=17 独立任务）等权 P10/P90 标定（已筛除惯导速度漂移离群值）",
+      "provisional_note": "基于云端实测集（n=17 独立任务）等权 P10/P95 纯线性标定（无拉伸）",
       "dimension_weights": {
         "T": 0.25,
         "P": 0.25,
@@ -878,15 +825,15 @@
       "parameters": {
         "moving_seconds": [
           2.79,
-          25.27
+          44.06
         ],
         "pause_total_seconds": [
           0.0,
-          24.41
+          27.52
         ],
         "pause_count": [
           0.0,
-          15.0
+          16.0
         ],
         "p05": [
           0.008,
@@ -906,19 +853,19 @@
         ],
         "std": [
           0.021,
-          0.7
+          0.751
         ],
         "intensity_dps": [
           3.16,
-          20.14
+          21.7
         ],
         "band_rms_dps": [
           5.73,
-          41.25
+          42.89
         ],
         "angle": [
           44.3,
-          1697.1
+          2091.4
         ],
         "rotation_count": [
           0.0,
@@ -957,15 +904,15 @@
       "parameters": {
         "moving_seconds": [
           2.56,
-          55.89
+          69.7
         ],
         "pause_total_seconds": [
           0.0,
-          13.64
+          18.87
         ],
         "pause_count": [
           0.0,
-          10.0
+          12.0
         ],
         "p05": [
           0.008,
@@ -985,15 +932,15 @@
         ],
         "std": [
           0.013,
-          0.365
+          0.516
         ],
         "intensity_dps": [
           4.71,
-          21.39
+          25.9
         ],
         "band_rms_dps": [
           13.16,
-          41.48
+          46.31
         ],
         "angle": [
           270.0,

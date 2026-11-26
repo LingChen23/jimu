@@ -145,7 +145,6 @@ class TaskService:
             "provisional": self._scoring_config.provisional,
             "missing_ratio_threshold": self._scoring_config.missing_ratio_threshold,
             "drop_penalty": deepcopy(self._scoring_config.drop_penalty),
-            "score_scaling": deepcopy(self._scoring_config.score_scaling),
             "intra_group_weights": deepcopy(self._scoring_config.intra_group_weights),
             "blocks": deepcopy(self._scoring_config.blocks),
         }

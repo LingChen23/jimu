@@ -249,22 +249,28 @@ class ScoringEngineFormulaTests(unittest.TestCase):
             places=5,
         )
 
-    def test_norm_score_scaling_stretches_monotonically_and_validates_anchors(self) -> None:
-        grid = [float(i) for i in range(0, 101)]
-        scaled_mov = [self.config.scale_movement_score(v) for v in grid]
-        scaled_task = [self.config.scale_task_score(v) for v in grid]
-        self.assertTrue(all(a <= b + 1e-9 for a, b in zip(scaled_mov, scaled_mov[1:])))
-        self.assertTrue(all(a <= b + 1e-9 for a, b in zip(scaled_task, scaled_task[1:])))
-        self.assertAlmostEqual(scaled_task[0], 0.0, places=6)
-        self.assertAlmostEqual(scaled_task[-1], 100.0, places=6)
-
-        bad_payload = json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
-        bad_payload["score_scaling"] = {
-            "enabled": True,
-            "task_anchors": [[0.0, 0.0], [70.0, 85.0], [80.0, 75.0], [100.0, 100.0]],
-        }
-        with self.assertRaises(ValueError):
-            ScoringConfig(bad_payload)
+    def test_task_total_score_is_direct_unscaled_arithmetic_mean_of_blocks(self) -> None:
+        self.assertNotIn("score_scaling", self.config._payload)
+        rows_ok = [
+            {
+                "sequence": i,
+                "tick_32k": i * 328,
+                "segment_index": 0,
+                "interpolated": False,
+                "accel_mps2": [0, 0, 9.8],
+                "gyro_dps": [1, 2, 3],
+            }
+            for i in range(1, 101)
+        ]
+        agg = evaluate_task(
+            [
+                {"reference": {"device_id": 1, "block_id": "A", "movement_id": 1}, "detail": _synthetic_detail("A", device_id=1, moving_seconds=4.0, angle=100.0, rotation_count=0), "samples_rows": rows_ok},
+                {"reference": {"device_id": 7, "block_id": "G", "movement_id": 1}, "detail": _synthetic_detail("G", device_id=7), "samples_rows": rows_ok},
+            ],
+            self.config,
+        )
+        self.assertEqual(agg["total_score"], round(agg["total_score_raw"], 2))
+        self.assertNotIn("total_score_scaled_raw", agg)
 
 
 class ScoringPipelineReplayAndTaskTests(unittest.TestCase):

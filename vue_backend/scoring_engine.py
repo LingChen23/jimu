@@ -46,29 +46,6 @@ def clip01(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
-def apply_piecewise_linear_scaling(
-    value: float,
-    anchors: list[list[float]] | list[tuple[float, float]],
-) -> float:
-    """Monotonically map a 0..100 score through piecewise-linear norm anchors."""
-    if not anchors:
-        return max(0.0, min(100.0, float(value)))
-    x = float(value)
-    if x <= float(anchors[0][0]):
-        return max(0.0, min(100.0, float(anchors[0][1])))
-    if x >= float(anchors[-1][0]):
-        return max(0.0, min(100.0, float(anchors[-1][1])))
-    for (x0_raw, y0_raw), (x1_raw, y1_raw) in zip(anchors, anchors[1:]):
-        x0, y0 = float(x0_raw), float(y0_raw)
-        x1, y1 = float(x1_raw), float(y1_raw)
-        if x0 <= x <= x1:
-            if x1 <= x0:
-                return max(0.0, min(100.0, y1))
-            mapped = y0 + (x - x0) / (x1 - x0) * (y1 - y0)
-            return max(0.0, min(100.0, mapped))
-    return max(0.0, min(100.0, float(anchors[-1][1])))
-
-
 def _require_finite_number(value: Any, field_name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ScoringValidationError(
@@ -160,7 +137,6 @@ class ScoringConfig:
         self.provisional = bool(payload.get("provisional", not self.calibrated))
         self.quality = dict(payload.get("quality", {}))
         self.drop_penalty = dict(payload.get("drop_penalty", {}))
-        self.score_scaling: dict[str, Any] = deepcopy(payload.get("score_scaling", {}))
         self.intra_group_weights: dict[str, dict[str, dict[str, Any]]] = deepcopy(
             payload.get("intra_group_weights", {})
         )
@@ -242,53 +218,10 @@ class ScoringConfig:
             for block_id, spec in sorted(self.blocks.items())
         }
 
-    @property
-    def score_scaling_enabled(self) -> bool:
-        return bool(self.score_scaling.get("enabled", False))
-
-    def scale_movement_score(self, raw_score: float) -> float:
-        if not self.score_scaling_enabled:
-            return max(0.0, min(100.0, float(raw_score)))
-        anchors = self.score_scaling.get("movement_anchors") or []
-        return apply_piecewise_linear_scaling(raw_score, anchors)
-
-    def scale_task_score(self, raw_task_score: float) -> float:
-        if not self.score_scaling_enabled:
-            return max(0.0, min(100.0, float(raw_task_score)))
-        anchors = self.score_scaling.get("task_anchors") or []
-        return apply_piecewise_linear_scaling(raw_task_score, anchors)
-
-    @staticmethod
-    def _validate_anchors(field_name: str, anchors: Any) -> None:
-        if anchors is None:
-            return
-        if not isinstance(anchors, list) or len(anchors) < 2:
-            raise ValueError(f"{field_name} 必须是至少包含 2 个锚点的数组")
-        prev_x = -math.inf
-        prev_y = -math.inf
-        for pair in anchors:
-            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-                raise ValueError(f"{field_name} 每个锚点必须为 [x, y]")
-            x, y = float(pair[0]), float(pair[1])
-            if not (0.0 <= x <= 100.0 and 0.0 <= y <= 100.0):
-                raise ValueError(f"{field_name} 锚点必须在 0～100 范围内：{pair}")
-            if x < prev_x or y < prev_y:
-                raise ValueError(f"{field_name} 锚点必须满足单调非减：{anchors}")
-            prev_x, prev_y = x, y
-
     def _validate(self) -> None:
         ratio = self.missing_ratio_threshold
         if not math.isfinite(ratio) or not 0.0 <= ratio <= 1.0:
             raise ValueError("quality.missing_ratio_threshold 必须在 0～1 之间")
-        if self.score_scaling_enabled:
-            self._validate_anchors(
-                "score_scaling.movement_anchors",
-                self.score_scaling.get("movement_anchors"),
-            )
-            self._validate_anchors(
-                "score_scaling.task_anchors",
-                self.score_scaling.get("task_anchors"),
-            )
         for dim in ("T", "P", "V", "Q"):
             if dim not in self.intra_group_weights:
                 raise ValueError(f"缺少组内权重配置：{dim}")
@@ -396,8 +329,7 @@ def score_movement_features(
     else:
         penalty = 0.0
 
-    unscaled_score = max(0.0, base_score - penalty)
-    final_score = config.scale_movement_score(unscaled_score)
+    final_score = max(0.0, base_score - penalty)
     return {
         "block_id": resolved_block_id,
         "block_name": block_spec["name"],
@@ -419,7 +351,6 @@ def score_movement_features(
         "dimension_weights": {dim: float(dim_weights[dim]) for dim in ("T", "P", "V", "Q", "R")},
         "base_score": base_score,
         "drop_penalty": penalty,
-        "unscaled_score": unscaled_score,
         "score": final_score,
     }
 
@@ -881,13 +812,8 @@ def evaluate_task(
         if valid_block_values
         else None
     )
-    scaled_task_score = (
-        config.scale_task_score(raw_task_score)
-        if raw_task_score is not None
-        else None
-    )
     display_task_score = (
-        round(scaled_task_score, 2) if scaled_task_score is not None else None
+        round(raw_task_score, 2) if raw_task_score is not None else None
     )
 
     has_invalid = (
@@ -929,10 +855,6 @@ def evaluate_task(
             f"实际参与 {participated_count}/10 种积木，有效评分积木 {scored_block_count}/{participated_count} 种，"
             f"有效移动 {valid_movements}/{total_movements} 次；按同积木等权平均后再跨有效积木等权聚合。"
         )
-        if config.score_scaling_enabled:
-            explanations.append(
-                f"已应用实测常模百分位映射拉伸任务总分（积木等权均值 {raw_task_score:.2f} → 展示分 {display_task_score:.2f}）。"
-            )
         if partial:
             explanations.append("存在已移动但未通过质量/有效性判定的记录，本次任务结果标记为 partial。")
         if "repaired" in repair_statuses:
@@ -959,9 +881,7 @@ def evaluate_task(
         "completeness": completeness,
         "partial": partial,
         "score_status": score_status,
-        "score_scaling_enabled": config.score_scaling_enabled,
         "total_score": display_task_score,
-        "total_score_scaled_raw": scaled_task_score,
         "total_score_raw": raw_task_score,
         "participation": {
             "total_block_types": len(BLOCK_ORDER),

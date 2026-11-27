@@ -72,17 +72,58 @@ def _require_finite_number(value: Any, field_name: str) -> float:
     return float(value)
 
 
+def _parse_multi_target_bounds(
+    bounds: Any,
+    field_name: str,
+) -> tuple[list[tuple[float, float]], float]:
+    if isinstance(bounds, dict):
+        raw_intervals = bounds.get("intervals")
+        raw_decay = bounds.get("decay")
+    elif isinstance(bounds, (list, tuple)) and len(bounds) == 2 and isinstance(bounds[0], (list, tuple)):
+        raw_intervals, raw_decay = bounds[0], bounds[1]
+    else:
+        raise ValueError(
+            f"多目标区间参数 {field_name} 必须为 {{'intervals': [[a, b], ...], 'decay': d}}"
+        )
+    if not isinstance(raw_intervals, (list, tuple)) or not raw_intervals:
+        raise ValueError(f"多目标区间参数 {field_name}.intervals 不能为空")
+    decay = float(raw_decay)
+    if not math.isfinite(decay) or decay <= 0.0:
+        raise ValueError(f"多目标区间参数 {field_name}.decay 必须大于 0：{raw_decay}")
+    parsed: list[tuple[float, float]] = []
+    prev_low = -math.inf
+    for pair in raw_intervals:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ValueError(f"多目标区间参数 {field_name} 子区间必须为 [a, b]：{pair}")
+        low, high = float(pair[0]), float(pair[1])
+        if not (math.isfinite(low) and math.isfinite(high)) or low < 0.0 or high < low:
+            raise ValueError(f"多目标区间参数 {field_name} 子区间无效：{pair}")
+        if low < prev_low:
+            raise ValueError(f"多目标区间参数 {field_name}.intervals 必须按起点升序排列")
+        prev_low = low
+        parsed.append((low, high))
+    return parsed, decay
+
+
 def compute_feature_subscore(
     value: Any,
-    bounds: list[float] | tuple[float, ...],
+    bounds: Any,
     direction: str,
     *,
     field_name: str = "feature",
 ) -> float:
     """Compute a 0..100 single-feature subscore following V1.4 section 04."""
     x = _require_finite_number(value, field_name)
+    if direction == "multi_target":
+        intervals, decay = _parse_multi_target_bounds(bounds, field_name)
+        first_low = intervals[0][0]
+        if first_low > 0.0 and x < first_low:
+            return 100.0 * clip01(x / first_low)
+        deviation = min(max(low - x, 0.0, x - high) for low, high in intervals)
+        return 100.0 * clip01(1.0 - deviation / decay)
+
     if direction == "target":
-        if len(bounds) != 3:
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 3:
             raise ValueError(f"目标区间参数 {field_name} 必须包含 [a, b, d]")
         low, high, decay = float(bounds[0]), float(bounds[1]), float(bounds[2])
         if high < low or decay <= 0.0:
@@ -90,7 +131,7 @@ def compute_feature_subscore(
         deviation = max(low - x, 0.0, x - high)
         return 100.0 * clip01(1.0 - deviation / decay)
 
-    if len(bounds) != 2:
+    if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
         raise ValueError(f"上下限参数 {field_name} 必须包含 [L, U]")
     lower, upper = float(bounds[0]), float(bounds[1])
     if upper <= lower:

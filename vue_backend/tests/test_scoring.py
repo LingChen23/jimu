@@ -201,11 +201,15 @@ class ScoringEngineFormulaTests(unittest.TestCase):
             self.assertEqual(scored["block_id"], block_id)
             self.assertGreaterEqual(scored["score"], 0.0)
             self.assertLessEqual(scored["score"], 100.0)
-            if block_id == "J":
-                self.assertEqual(set(scored["feature_scores"]).intersection({"rotation_count", "flip_count"}), set())
+            # Calibrated config uses unified continuous angle only (rotation_count & flip_count recorded only)
+            self.assertEqual(
+                set(scored["feature_scores"]).intersection({"rotation_count", "flip_count"}),
+                set(),
+            )
             if block_id == "H":
-                self.assertTrue(scored["provisional"])
-                self.assertIn("flip_count", scored["feature_scores"])
+                scored_trial = score_movement_features(detail, self.trial_config)
+                self.assertTrue(scored_trial["provisional"])
+                self.assertIn("flip_count", scored_trial["feature_scores"])
 
     def test_missing_or_nan_feature_never_substitutes_zero(self) -> None:
         bad = _synthetic_detail("A", device_id=1, moving_seconds=4.0, angle=100.0, rotation_count=0)
@@ -271,6 +275,43 @@ class ScoringEngineFormulaTests(unittest.TestCase):
         )
         self.assertEqual(agg["total_score"], round(agg["total_score_raw"], 2))
         self.assertNotIn("total_score_scaled_raw", agg)
+
+    def test_multi_interval_posture_and_bounded_speed_behavior(self) -> None:
+        # G (Thread cylinder): both 90-deg pass ([60, 210]) and 5-turn pass ([1700, 2340]) score 100 on R;
+        # 0-deg scores 0; mid-gap 955-deg drops to ~17.2; >3240-deg scores 0.
+        g_fast = score_movement_features(_synthetic_detail("G", angle=90.0), self.config)
+        g_screw = score_movement_features(_synthetic_detail("G", angle=1890.0), self.config)
+        g_zero = score_movement_features(_synthetic_detail("G", angle=0.0), self.config)
+        g_mid = score_movement_features(_synthetic_detail("G", angle=955.0), self.config)
+        g_over = score_movement_features(_synthetic_detail("G", angle=3300.0), self.config)
+        self.assertAlmostEqual(g_fast["dimensions"]["R"], 100.0, places=5)
+        self.assertAlmostEqual(g_screw["dimensions"]["R"], 100.0, places=5)
+        self.assertAlmostEqual(g_zero["dimensions"]["R"], 0.0, places=5)
+        self.assertAlmostEqual(g_mid["dimensions"]["R"], 100.0 * (1.0 - 745.0 / 900.0), places=4)
+        self.assertAlmostEqual(g_over["dimensions"]["R"], 0.0, places=5)
+
+        # J (Multi-semicircle): both 90-deg ([60, 200]) and 540-deg ([480, 750]) score 100; 0-deg scores 0
+        j_90 = score_movement_features(_synthetic_detail("J", device_id=10, angle=90.0), self.config)
+        j_540 = score_movement_features(_synthetic_detail("J", device_id=10, angle=540.0), self.config)
+        j_zero = score_movement_features(_synthetic_detail("J", device_id=10, angle=0.0), self.config)
+        self.assertAlmostEqual(j_90["dimensions"]["R"], 100.0, places=5)
+        self.assertAlmostEqual(j_540["dimensions"]["R"], 100.0, places=5)
+        self.assertAlmostEqual(j_zero["dimensions"]["R"], 0.0, places=5)
+
+        # Abnormal drifted high speed (e.g. mean=1.64, max=3.22, p05=0.15, median=1.65) must NOT score 100 on V
+        drifted = score_movement_features(
+            _synthetic_detail(
+                "J",
+                device_id=10,
+                p05=0.15,
+                max_speed=3.22,
+                mean_speed=1.64,
+                median_speed=1.65,
+                angle=540.0,
+            ),
+            self.config,
+        )
+        self.assertLess(drifted["dimensions"]["V"], 10.0)
 
 
 class ScoringPipelineReplayAndTaskTests(unittest.TestCase):
